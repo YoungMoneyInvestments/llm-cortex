@@ -2,11 +2,8 @@
 # Cortex UserPromptSubmit Hook — captures user intent
 #
 # Called by Claude Code when the user submits a prompt.
+# Claude Code pipes JSON to stdin with prompt and session_id.
 # Registers the session (if new) and logs the user's prompt.
-#
-# Environment variables (set by Claude Code):
-#   USER_PROMPT  — the user's message text
-#   SESSION_ID   — current session identifier
 #
 # Configure:
 #   CORTEX_WORKER_PORT — Worker port (default: 7778)
@@ -14,13 +11,20 @@
 WORKER_PORT="${CORTEX_WORKER_PORT:-7778}"
 WORKER_URL="http://127.0.0.1:$WORKER_PORT"
 
+# Read stdin (Claude Code sends JSON)
+INPUT_JSON=$(cat)
+
 # Skip if worker isn't running
 if ! curl -s --connect-timeout 1 "$WORKER_URL/api/health" > /dev/null 2>&1; then
+    echo "Success"
     exit 0
 fi
 
+# Extract fields from stdin JSON
+PROMPT=$(echo "$INPUT_JSON" | jq -r '.prompt // empty' 2>/dev/null)
+SESSION_ID=$(echo "$INPUT_JSON" | jq -r '.session_id // empty' 2>/dev/null)
+
 SID="${SESSION_ID:-$(date +%Y%m%d-%H%M%S)}"
-PROMPT="${USER_PROMPT:-}"
 
 # Register/update session with user prompt
 curl -s --max-time 2 \
@@ -53,4 +57,5 @@ if [ -n "$PROMPT" ]; then
         )" > /dev/null 2>&1 &
 fi
 
+echo "Success"
 exit 0

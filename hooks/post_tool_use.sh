@@ -2,13 +2,8 @@
 # Cortex PostToolUse Hook — captures tool usage observations
 #
 # Called by Claude Code after every tool execution.
+# Claude Code pipes JSON to stdin with tool_name, tool_input, tool_output, session_id.
 # Sends observation to the background worker via HTTP (fire-and-forget).
-#
-# Environment variables (set by Claude Code):
-#   TOOL_NAME    — name of the tool that was used
-#   TOOL_INPUT   — JSON input to the tool
-#   TOOL_OUTPUT  — output from the tool (may be large)
-#   SESSION_ID   — current session identifier
 #
 # Configure:
 #   CORTEX_WORKER_PORT — Worker port (default: 7778)
@@ -16,20 +11,28 @@
 WORKER_PORT="${CORTEX_WORKER_PORT:-7778}"
 WORKER_URL="http://127.0.0.1:$WORKER_PORT"
 
+# Read stdin (Claude Code sends JSON)
+INPUT_JSON=$(cat)
+
 # Skip if worker isn't running
 if ! curl -s --connect-timeout 1 "$WORKER_URL/api/health" > /dev/null 2>&1; then
     exit 0
 fi
 
-# Use provided session ID or generate one
+# Extract fields from stdin JSON
+TOOL_NAME=$(echo "$INPUT_JSON" | jq -r '.tool_name // empty' 2>/dev/null)
+SESSION_ID=$(echo "$INPUT_JSON" | jq -r '.session_id // empty' 2>/dev/null)
+
+# Skip if no tool name (nothing useful to capture)
+if [ -z "$TOOL_NAME" ]; then
+    exit 0
+fi
+
 SID="${SESSION_ID:-$(date +%Y%m%d-%H%M%S)}"
 
-# Truncate large outputs to avoid overwhelming the worker
-MAX_INPUT=4000
-MAX_OUTPUT=8000
-
-INPUT_TRUNC=$(echo "$TOOL_INPUT" | head -c "$MAX_INPUT" 2>/dev/null || echo "")
-OUTPUT_TRUNC=$(echo "$TOOL_OUTPUT" | head -c "$MAX_OUTPUT" 2>/dev/null || echo "")
+# Extract and truncate input/output
+TOOL_INPUT=$(echo "$INPUT_JSON" | jq -r '.tool_input // empty' 2>/dev/null | head -c 4000)
+TOOL_OUTPUT=$(echo "$INPUT_JSON" | jq -r '.tool_output // empty' 2>/dev/null | head -c 8000)
 
 # Send to worker (fire-and-forget, max 2s timeout)
 curl -s --max-time 2 \
@@ -38,8 +41,8 @@ curl -s --max-time 2 \
     -d "$(jq -n \
         --arg sid "$SID" \
         --arg tool "$TOOL_NAME" \
-        --arg input "$INPUT_TRUNC" \
-        --arg output "$OUTPUT_TRUNC" \
+        --arg input "$TOOL_INPUT" \
+        --arg output "$TOOL_OUTPUT" \
         '{
             session_id: $sid,
             source: "post_tool_use",
@@ -50,5 +53,4 @@ curl -s --max-time 2 \
         }'
     )" > /dev/null 2>&1 &
 
-# Don't wait for curl — return immediately
 exit 0
