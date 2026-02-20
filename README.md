@@ -20,6 +20,7 @@ Neuroscience has identified distinct memory systems in the human brain, each ser
 
 | Human Memory | What It Does | AI Equivalent | This System's Layer |
 |-------------|-------------|---------------|-------------------|
+| **Procedural memory** | Automatic habits and routines | Background observation capture | **Observation Pipeline** |
 | **Long-term memory** | Facts you've committed to permanent storage | Permanent notes always available | **Auto Memory** (MEMORY.md) |
 | **Prospective memory** | Remembering to do things in the future | Session bootstrap that loads pending work | **Session Bootstrap** |
 | **Working memory** | Holding active thoughts while problem-solving | Goals, scratchpad, state tracking | **Working Memory** |
@@ -60,19 +61,23 @@ That's the difference. Zero re-explanation. Instant continuity.
 
 ---
 
-## The 7-Layer Memory Stack
+## The Memory Stack
 
 Each layer solves a different memory problem. They work independently (implement any one without the others) and compound when combined:
 
 ```
-Layer 7: RLM-Graph ──────── When context is too large, partition intelligently
-Layer 6: Knowledge Graph ── Who knows who? What connects to what?
-Layer 5: Hybrid Search ──── Find anything across all memory sources
-Layer 4: Episodic Memory ── "What did I decide about X last month?"
-Layer 3: Working Memory ─── Track goals, notes, and state mid-session
-Layer 2: Session Bootstrap ─ Auto-load recent context on startup
-Layer 1: Auto Memory ────── Permanent notes Claude always sees
+Layer 0: Observation Pipeline ── Background capture of every tool use and prompt
+Layer 7: RLM-Graph ──────────── When context is too large, partition intelligently
+Layer 6: Knowledge Graph ────── Who knows who? What connects to what?
+Layer 5: Hybrid Search ──────── Find anything across all memory sources
+Layer 4: Episodic Memory ────── "What did I decide about X last month?"
+Layer 3: Working Memory ─────── Track goals, notes, and state mid-session
+Layer 2: Session Bootstrap ──── Auto-load recent context on startup
+Layer 1: Auto Memory ────────── Permanent notes Claude always sees
 ```
+
+### Layer 0: Observation Pipeline (NEW)
+Claude's **procedural memory**. A background worker that automatically captures every tool use, user prompt, and session lifecycle event via Claude Code hooks. Observations are queued in SQLite, processed asynchronously (summarized, indexed), and synced to a unified vector store for search. Exposes 4 MCP tools for token-efficient retrieval: search (L1, ~20 tokens/result), timeline (L2, ~100 tokens/item), details (L3, full text), and save (manual memory).
 
 ### Layer 1: Auto Memory
 Claude's **long-term memory**. A markdown file (MEMORY.md) that's always loaded into the system prompt. Confirmed patterns, key decisions, architecture notes. Survives forever.
@@ -144,22 +149,166 @@ The difference isn't incremental. It's the difference between working with someo
 
 ---
 
+## Project Structure
+
+```
+claude-cortex/
+├── scripts/                    # All Python scripts (the brain)
+│   ├── context_loader.py       # Layer 2: Session bootstrap
+│   ├── working_memory.py       # Layer 3: Goals, scratchpad, state
+│   ├── hybrid_search.py        # Layer 5: Multi-source search fusion
+│   ├── knowledge_graph.py      # Layer 6: Entity-relationship graph
+│   ├── query_knowledge_graph.py # Layer 6: Graph query CLI
+│   ├── rlm_graph.py            # Layer 7: Recursive context partitioning
+│   ├── seed_graph.py           # Layer 6: Graph seeding helper
+│   ├── memory_worker.py        # Layer 0: Background observation processor
+│   ├── unified_vector_store.py # Layer 0: SQLite FTS5 + vector search
+│   ├── memory_retriever.py     # Layer 0: 3-layer token-efficient retrieval
+│   ├── mcp_memory_server.py    # Layer 0: MCP server for memory tools
+│   └── start_worker.sh         # Layer 0: Worker lifecycle management
+├── hooks/                      # Claude Code lifecycle hooks
+│   ├── session_start.sh        # Starts worker + runs context loader
+│   ├── post_tool_use.sh        # Captures tool observations
+│   ├── user_prompt_submit.sh   # Captures user prompts
+│   └── session_end.sh          # Finalizes sessions
+├── examples/                   # Example configurations
+│   ├── MEMORY.md               # Example MEMORY.md for Layer 1
+│   ├── settings.json           # Example Claude Code settings.json
+│   └── working_memory_state.json # Example working memory state
+├── docs/                       # Architecture and implementation guides
+│   ├── 01-ARCHITECTURE-OVERVIEW.md
+│   ├── 02-IMPLEMENTATION-GUIDE.md
+│   └── 03-QUICK-START.md
+├── requirements.txt            # Python dependencies
+├── LICENSE
+└── README.md
+```
+
+---
+
 ## Get Started
+
+### Quick Install (5 minutes)
+
+```bash
+# 1. Clone the repo
+git clone https://github.com/YoungMoneyInvestments/claude-cortex.git
+cd claude-cortex
+
+# 2. Install dependencies
+pip install -r requirements.txt
+
+# 3. Set your workspace (or use default ~/cortex)
+export CORTEX_WORKSPACE="$HOME/cortex"
+mkdir -p "$CORTEX_WORKSPACE/memory" "$CORTEX_WORKSPACE/.planning"
+
+# 4. Create your MEMORY.md (Layer 1)
+cp examples/MEMORY.md "$CORTEX_WORKSPACE/MEMORY.md"
+# Edit it with your project's key facts
+
+# 5. Wire up the hooks in Claude Code settings
+# Add to ~/.claude/settings.json (see examples/settings.json):
+```
+
+### Add Session Bootstrap (15 minutes)
+
+```bash
+# Add SessionStart hook to ~/.claude/settings.json:
+# "hooks": {
+#   "SessionStart": [{
+#     "matcher": "",
+#     "hooks": [{"type": "command", "command": "/path/to/cortex/hooks/session_start.sh"}]
+#   }]
+# }
+
+# Test it:
+python3 scripts/context_loader.py --hours 48
+```
+
+### Add Observation Pipeline (30 minutes)
+
+```bash
+# 1. Start the background worker
+./scripts/start_worker.sh
+
+# 2. Add all 4 hooks to ~/.claude/settings.json
+# (see examples/settings.json for the full configuration)
+
+# 3. Add the MCP server to settings.json
+# "mcpServers": {
+#   "cortex-memory": {
+#     "command": "python3",
+#     "args": ["/path/to/scripts/mcp_memory_server.py"]
+#   }
+# }
+
+# 4. Verify
+curl http://127.0.0.1:7778/api/health
+```
+
+### Add Knowledge Graph (30 minutes)
+
+```bash
+# 1. Seed your graph with entities
+# Edit scripts/seed_graph.py with your project's entities
+python3 scripts/seed_graph.py
+
+# 2. Query it
+python3 scripts/query_knowledge_graph.py --stats
+python3 scripts/query_knowledge_graph.py --search "Alice"
+python3 scripts/query_knowledge_graph.py --related-to "my-project"
+python3 scripts/query_knowledge_graph.py --find-path "Alice" "database"
+```
 
 | Time | What You Get |
 |------|-------------|
 | **5 minutes** | Auto Memory - permanent notes across sessions |
 | **15 minutes** | + Session Bootstrap - automatic context loading on startup |
-| **30 minutes** | + Working Memory, Episodic Memory, Knowledge Graph |
-| **Half day** | + Hybrid Search, RLM-Graph for complex queries |
+| **30 minutes** | + Observation Pipeline - automatic capture of everything Claude does |
+| **1 hour** | + Working Memory, Knowledge Graph, Hybrid Search |
+| **Half day** | + RLM-Graph for complex queries, full production setup |
 
 Each layer is independent. Start with Layer 1 and add more as needed.
+
+---
+
+## Configuration
+
+All scripts use environment variables for configuration:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CORTEX_WORKSPACE` | `~/cortex` | Root directory for all Cortex data |
+| `CORTEX_WORKER_PORT` | `7778` | HTTP port for the memory worker |
+| `CORTEX_PYTHON` | `python3` | Python interpreter to use |
+| `CORTEX_GRAPH_FILE` | `$WORKSPACE/.planning/knowledge-graph.json` | Knowledge graph location |
+| `OPENAI_API_KEY` | (none) | Required only for vector similarity search |
+
+### Workspace Layout
+
+```
+$CORTEX_WORKSPACE/
+├── MEMORY.md                          # Layer 1: Auto memory
+├── memory/                            # Daily logs, handoffs
+│   ├── 2026-01-15.md
+│   └── session-handoffs/
+├── .planning/
+│   ├── working-memory.json            # Layer 3: Active state
+│   └── knowledge-graph.json           # Layer 6: Entity graph
+├── data/
+│   ├── cortex-observations.db         # Layer 0: Observation store
+│   └── cortex-vectors.db             # Layer 0: FTS5 + vector search
+└── logs/
+    └── memory-worker.log              # Worker logs
+```
+
+---
 
 ## Guides
 
 | Guide | What It Covers |
 |-------|---------------|
-| [Architecture Overview](docs/01-ARCHITECTURE-OVERVIEW.md) | How the 7 layers work together, design principles, flow diagrams |
+| [Architecture Overview](docs/01-ARCHITECTURE-OVERVIEW.md) | How the layers work together, design principles, flow diagrams |
 | [Implementation Guide](docs/02-IMPLEMENTATION-GUIDE.md) | Step-by-step code for every layer, copy-paste ready |
 | [Quick Start](docs/03-QUICK-START.md) | Get running in 30 minutes, common commands, troubleshooting |
 
@@ -167,7 +316,9 @@ Each layer is independent. Start with Layer 1 and add more as needed.
 
 - Claude Code CLI
 - Python 3.10+
-- `networkx` (for Knowledge Graph)
+- `fastapi`, `uvicorn`, `pydantic` (for Layer 0 observation pipeline)
+- `networkx` (for Layer 6 knowledge graph)
+- Optional: `sqlite-vec`, `openai` (for vector similarity search)
 
 ## How It Works
 
@@ -175,16 +326,15 @@ Each layer is independent. Start with Layer 1 and add more as needed.
 SESSION START
     |
     v
-[SessionStart Hook] --> context_loader.py
+[SessionStart Hook] --> start_worker.sh + context_loader.py
     |                        |
-    |   Scans last 48h:      |
-    |   - memory files       |
-    |   - session handoffs   |
-    |   - working memory     |
-    |   - incomplete items   |
-    |                        |
+    |   Worker captures:     |   Scans last 48h:
+    |   - tool observations  |   - memory files
+    |   - user prompts       |   - session handoffs
+    |   - session events     |   - working memory
+    |                        |   - incomplete items
     v                        v
-[MEMORY.md loaded]     [Context injected]
+[Worker running]       [Context injected]
     |                        |
     +--------+---------------+
              |
@@ -192,14 +342,18 @@ SESSION START
     Claude Code Session
     (knows: time, goals, recent work, pending items, relationships)
              |
-             |--- Recall past decisions --> episodic memory search
+             |--- Recall past decisions --> cortex_memory_search (MCP)
+             |--- Get context           --> cortex_memory_timeline (MCP)
+             |--- Full details          --> cortex_memory_details (MCP)
+             |--- Save a memory         --> cortex_memory_save (MCP)
              |--- Query relationships   --> knowledge graph
              |--- Complex questions     --> RLM-Graph (recursive)
              |--- Learn something new   --> writes to MEMORY.md + graph
              |
              v
     SESSION END
-    (working memory persisted, handoff created if needed)
+    [Stop Hook] --> session_end.sh
+    (session finalized, working memory persisted, observations indexed)
 ```
 
 ## Key Design Principles
@@ -207,10 +361,11 @@ SESSION START
 1. **Mirrors human cognition** - Different memory types for different needs, just like the brain
 2. **Layers are independent** - Implement any layer without the others
 3. **Graceful degradation** - If one layer fails, the rest keep working
-4. **Zero manual effort** - Session bootstrap requires no user intervention
-5. **Grows over time** - The knowledge graph and episodic memory get more valuable with every session
-6. **Token-conscious** - MEMORY.md has a ~200 line limit; RLM-Graph manages context overflow
+4. **Zero manual effort** - Session bootstrap and observation capture require no user intervention
+5. **Grows over time** - The knowledge graph and observation history get more valuable with every session
+6. **Token-conscious** - MEMORY.md has a ~200 line limit; 3-layer retrieval minimizes token waste
 7. **Disk-backed** - Everything persists to files and SQLite, survives restarts and crashes
+8. **Zero-cost by default** - FTS5 search needs no API keys; vector search is opt-in
 
 ## License
 

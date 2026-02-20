@@ -1,0 +1,55 @@
+{
+  "// Example working memory state": "This is what working_memory.py persists to disk",
+  "// Location": "$CORTEX_WORKSPACE/.planning/working-memory.json",
+
+  "goals": [
+    {
+      "id": "goal-1",
+      "description": "Debug JWT token rotation bug",
+      "priority": "high",
+      "status": "active",
+      "created_at": "2026-01-15T14:30:00Z",
+      "subgoals": [
+        "Reproduce the token expiry race condition",
+        "Write test for concurrent refresh requests",
+        "Fix the refresh endpoint"
+      ]
+    },
+    {
+      "id": "goal-2",
+      "description": "Add rate limiting middleware",
+      "priority": "medium",
+      "status": "pending",
+      "created_at": "2026-01-15T14:30:00Z",
+      "subgoals": []
+    }
+  ],
+  "scratchpad": [
+    {
+      "timestamp": "2026-01-15T14:32:00Z",
+      "tag": "discovery",
+      "content": "Found that refresh_token endpoint doesn't lock the token — two concurrent requests can both succeed with the same old token"
+    },
+    {
+      "timestamp": "2026-01-15T15:10:00Z",
+      "tag": "fix_attempt",
+      "content": "Added Redis lock with 5s TTL on refresh. Tests passing locally but need to verify in staging"
+    }
+  ],
+  "state": {
+    "current_branch": "fix/jwt-refresh-race",
+    "tests_passing": true,
+    "last_test_run": "2026-01-15T15:05:00Z"
+  },
+  "references": [
+    {
+      "key": "jwt_rfc",
+      "path": "https://datatracker.ietf.org/doc/html/rfc7519"
+    },
+    {
+      "key": "auth_module",
+      "path": "src/auth/token_manager.py"
+    }
+  ],
+  "updated_at": "2026-01-15T15:10:00Z"
+}

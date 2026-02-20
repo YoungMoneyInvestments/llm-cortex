@@ -1,0 +1,61 @@
+{
+  "// Claude Code settings.json example": "Add these to ~/.claude/settings.json",
+  "// Adjust paths to match your Cortex installation": "",
+
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/path/to/cortex/hooks/session_start.sh"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/path/to/cortex/hooks/user_prompt_submit.sh"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/path/to/cortex/hooks/post_tool_use.sh"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/path/to/cortex/hooks/session_end.sh"
+          }
+        ]
+      }
+    ]
+  },
+
+  "mcpServers": {
+    "cortex-memory": {
+      "command": "python3",
+      "args": ["/path/to/cortex/scripts/mcp_memory_server.py"],
+      "env": {
+        "CORTEX_WORKSPACE": "/path/to/cortex/workspace"
+      }
+    }
+  }
+}
