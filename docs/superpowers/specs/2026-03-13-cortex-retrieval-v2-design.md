@@ -181,15 +181,17 @@ Ranking features should include:
 
 Source authority contract:
 
-- source authority is a versioned global ranking config keyed by `source_family` and `object_type`
+- source authority is a versioned global ranking config keyed by `source_family`, `object_type`, and `authority_tier`
 - the default precedence is:
-  1. native migrated source family object
-  2. observation object with direct provenance
-  3. handoff or working-memory object with explicit linkage
-  4. session summary or note object
-  5. compatibility-generated synthetic object
+  1. `native`
+  2. `direct_provenance`
+  3. `explicit_linkage`
+  4. `summary_or_note`
+  5. `compat_synthetic`
 - ranking uses this same ordered mapping for the source-authority feature and for deterministic final tie-breaks
 - the mapping is invariant by default, not query-intent-specific
+- adapters must populate `authority_tier` on every `MemoryObject` and `NormalizedCandidate`
+- compatibility-generated synthetic candidates must always use `authority_tier="compat_synthetic"`
 
 Versioned config contract:
 
@@ -237,6 +239,7 @@ Final ranked results must use deterministic tie-breaks after equal final score:
 Near-duplicate penalty contract:
 
 - exact duplicates are handled only by the exact-duplicate keys and merge rules below
+- `provenance_namespace` in all duplicate and near-duplicate rules refers to the canonical `MemoryObject.provenance_namespace` / `NormalizedCandidate.provenance_namespace` field, not ad hoc metadata
 - a pair of candidates may be treated as near-duplicates only if they are not exact duplicates, share the same `object_type`, and either:
   1. have overview-embedding similarity at or above `RankerConfig.near_duplicate_similarity_threshold`, or
   2. have normalized lexical similarity at or above `RankerConfig.near_duplicate_lexical_threshold`
@@ -351,6 +354,7 @@ class MemoryObject:
     object_id: str
     source_family: str
     object_type: Literal["observation", "working_memory_entry", "handoff", "session_summary", "note", "message", "graph_entity"]
+    authority_tier: Literal["native", "direct_provenance", "explicit_linkage", "summary_or_note", "compat_synthetic"]
     visibility: Literal["active", "tombstoned"]
     created_at: str | None
     updated_at: str | None
@@ -359,6 +363,7 @@ class MemoryObject:
     working_memory_thread_id: str | None
     link_group_id: str | None
     source_ref: str | None
+    provenance_namespace: Literal["observations", "working_memory", "handoffs", "session_summaries", "notes", "messages", "knowledge_graph"]
     authoritative_content_hash: str | None
     entities: list[str]
     task_markers: list[str]
@@ -400,6 +405,24 @@ Canonical `object_type` tokens:
 - `note`
 - `message`
 - `graph_entity`
+
+Canonical `authority_tier` tokens:
+
+- `native`
+- `direct_provenance`
+- `explicit_linkage`
+- `summary_or_note`
+- `compat_synthetic`
+
+Canonical `provenance_namespace` tokens:
+
+- `observations`
+- `working_memory`
+- `handoffs`
+- `session_summaries`
+- `notes`
+- `messages`
+- `knowledge_graph`
 
 Canonical formats:
 
@@ -657,8 +680,10 @@ class NormalizedCandidate:
     object_id: str
     source_family: str
     object_type: Literal["observation", "working_memory_entry", "handoff", "session_summary", "note", "message", "graph_entity"]
+    authority_tier: Literal["native", "direct_provenance", "explicit_linkage", "summary_or_note", "compat_synthetic"]
     timestamp: str | None
     source_ref: str | None
+    provenance_namespace: Literal["observations", "working_memory", "handoffs", "session_summaries", "notes", "messages", "knowledge_graph"]
     authoritative_content_hash: str | None
     state: CandidateState
     entities: list[str]
@@ -1061,6 +1086,13 @@ Direct `NeighborResult` collapse semantics:
 
 - `recorded: bool`
 - `feedback_id: str`
+
+Feedback aggregation rule:
+
+- every persisted feedback event must record `created_at`
+- for any query-level evaluation keyed by `query_execution_id`, multiple feedback events are reduced to the last event by `created_at`; ties break by lexical `feedback_id`
+- a final `helpful` feedback event contributes an accepted seed only when it includes `object_id`; otherwise it does not by itself make the query evaluable for shadow usefulness
+- a final `irrelevant`, `missing_context`, or `missed_expected_result` feedback event is explicit negative feedback for that `query_execution_id`
 
 Query execution logging:
 
@@ -1472,14 +1504,14 @@ Shadow-read pass/fail rule:
 - the family passes only if all parity metrics pass over the full 7-day window
 - any failed metric resets the 7-day parity window after the fix is deployed
 - shadow-read context usefulness is computed on the evaluable shadow-query set only
-- an evaluable shadow query is one that, during the parity window, has either explicit `memory_feedback` attached to its `query_execution_id` or a lineage trace showing at least one accepted object interaction on the user-visible legacy path
+- an evaluable shadow query is one that, during the parity window, has either final aggregated explicit negative feedback, final aggregated `helpful` feedback with `object_id`, or a lineage trace showing at least one accepted object interaction on the user-visible legacy path
 - the lineage evaluation window is fixed at 15 minutes after the originating `query_execution_id` is created
 - lineage-derived accepted seed objects are the legacy result objects opened by the user for that `query_execution_id` within that 15-minute window
-- lineage-derived accepted neighbors are the neighbor objects opened via a detail-fetch path or recorded by an explicit `neighbor_selected` interaction event on the same `query_execution_id` within that 15-minute window and originating from the same seed context
+- lineage-derived accepted neighbors are the neighbor objects opened via a detail-fetch path on the same `query_execution_id` within that 15-minute window and originating from the same seed context
 - queries with neither explicit feedback nor accepted lineage are excluded from the usefulness denominator and reported as `unevaluable_shadow_queries`
 - `production_estimated_context_usefulness = useful_shadow_queries / evaluable_shadow_queries`
 - a shadow query counts as `useful_shadow_queries` only if the shadow result set contains at least one accepted seed object and, when accepted neighbors exist, the shadow result set includes that accepted neighbor set in `neighbor_previews` or `memory_neighbors`
-- explicit negative feedback (`irrelevant`, `missing_context`, `missed_expected_result`) marks the shadow query not useful unless a later feedback event on the same `query_execution_id` supersedes it
+- the final aggregated explicit negative feedback for a `query_execution_id` marks the shadow query not useful regardless of lineage
 - the parity gate cannot pass until `evaluable_shadow_queries >= 50`
 
 ### Cutover rule
