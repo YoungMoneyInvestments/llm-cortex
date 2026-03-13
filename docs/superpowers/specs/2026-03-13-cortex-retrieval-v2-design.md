@@ -133,8 +133,8 @@ Candidate fields:
 - `task_markers`
 - `decision_markers`
 - `abstract`
-- `overview_ref`
-- `detail_ref`
+- `overview_layer`
+- `detail_layer`
 
 Adapters are responsible for source-specific retrieval logic, including:
 
@@ -200,7 +200,25 @@ The retrieval interface should default to returning `abstract` plus enough expla
 
 Introduce a shared `MemoryObject` model as the canonical indexing and retrieval unit.
 
+The contract for layered content is authoritative and must be used consistently by:
+
+- stored `MemoryObject` rows
+- adapter outputs
+- ranking inputs
+- MCP tool responses
+- compatibility wrappers
+
+`abstract` is always inline text. `overview` and `detail` are always represented as `ContentLayer` objects, whether the bytes are inline or referenced externally. The system must not mix plain inline strings in one layer and ad hoc `*_ref` fields elsewhere.
+
 ```python
+@dataclass
+class ContentLayer:
+    mode: Literal["inline", "ref", "absent"]
+    text: str | None
+    content_ref: str | None
+    token_estimate: int | None
+    content_hash: str | None
+
 @dataclass
 class MemoryObject:
     object_id: str
@@ -215,8 +233,8 @@ class MemoryObject:
     decision_markers: list[str]
     related_object_ids: list[str]
     abstract: str
-    overview: str
-    detail: str | None
+    overview_layer: ContentLayer
+    detail_layer: ContentLayer
     metadata: dict[str, Any]
 ```
 
@@ -235,10 +253,109 @@ Current Cortex data is spread across multiple storage forms with different seman
 - short compressed context
 - should include who/what/decision/task/result
 - should point to important linked objects
+- represented as `overview_layer`
 
 `detail`
 - full raw body or a pointer to it
 - only loaded when needed
+- represented as `detail_layer`
+
+### Layer materialization rules
+
+- `abstract` must always be present inline and indexed in FTS.
+- `overview_layer` may be inline or reference-backed.
+- `detail_layer` may be inline, reference-backed, or absent.
+- `memory_open` resolves layer payloads through the same `ContentLayer` contract regardless of storage mode.
+- ranking uses `abstract` and `overview_layer`; it must never require `detail_layer` to rank.
+
+## Core Interface Contracts
+
+Retrieval v2 must define explicit interfaces before implementation work begins.
+
+### QueryPlan
+
+```python
+@dataclass
+class QueryPlan:
+    raw_query: str
+    normalized_query: str
+    intents: list[str]
+    entities: list[str]
+    exact_phrases: list[str]
+    recency_hint: Literal["none", "recent", "historical"]
+    source_preferences: list[str]
+    debug: dict[str, Any]
+```
+
+Requirements:
+
+- `intents` must be non-empty.
+- `source_preferences` is ordered from most to least preferred.
+- `debug` may include parser confidence and heuristic triggers.
+
+### NormalizedCandidate
+
+```python
+@dataclass
+class NormalizedCandidate:
+    object_id: str
+    source_family: str
+    object_type: str
+    timestamp: str | None
+    entities: list[str]
+    task_markers: list[str]
+    decision_markers: list[str]
+    abstract: str
+    overview_layer: ContentLayer
+    detail_layer: ContentLayer
+    score_components: list["ScoreComponent"]
+    metadata: dict[str, Any]
+```
+
+### ScoreComponent
+
+```python
+@dataclass
+class ScoreComponent:
+    name: str
+    value: float
+    weight: float
+    contribution: float
+    explanation: str
+```
+
+Requirements:
+
+- every ranked result must expose score components
+- `contribution` is the post-weight contribution to final score
+- debug output must not require reading source code
+
+### NeighborhoodLink
+
+```python
+@dataclass
+class NeighborhoodLink:
+    from_object_id: str
+    to_object_id: str
+    link_type: Literal[
+        "same_session",
+        "same_handoff",
+        "same_working_memory_thread",
+        "shared_entity",
+        "shared_task",
+        "shared_decision",
+        "time_adjacent",
+    ]
+    strength: float
+    inferred: bool
+    metadata: dict[str, Any]
+```
+
+Requirements:
+
+- deterministic links must set `inferred=False`
+- heuristic links must set `inferred=True`
+- expander policy must be able to filter by `link_type` and `inferred`
 
 ## Source Adapters
 
@@ -280,6 +397,75 @@ The current MCP tools should remain available temporarily, but the new engine sh
 `memory_feedback`
 - records whether a result was useful, incorrect, or missing expected context
 
+### MCP v2 request/response contracts
+
+`memory_query` request:
+
+- `query: str` required
+- `limit: int` optional, default 10, max 50
+- `source_families: list[str]` optional
+- `include_debug: bool` optional, default false
+- `expand_neighbors: bool` optional, default true
+
+`memory_query` response:
+
+- `query_plan`
+- `results`
+- `debug` optional
+- `warnings` optional
+
+Each result must include:
+
+- `object_id`
+- `source_family`
+- `object_type`
+- `abstract`
+- `overview_layer`
+- `score`
+- `score_components`
+- `neighbor_preview`
+
+`memory_open` request:
+
+- `object_id: str` required
+- `layer: Literal["abstract", "overview", "detail"]` required
+
+`memory_open` response:
+
+- resolved layer payload
+- `content_ref` if applicable
+- `warnings` if the layer is absent or stale
+
+`memory_neighbors` request:
+
+- `object_id: str` required
+- `limit: int` optional, default 10
+- `link_types: list[str]` optional
+
+`memory_neighbors` response:
+
+- ordered list of linked objects
+- link metadata for each neighbor
+
+`memory_feedback` request:
+
+- `query: str` required
+- `object_id: str | None` optional
+- `feedback: Literal["helpful", "irrelevant", "missing_context", "missed_expected_result"]`
+- `notes: str | None`
+
+`memory_feedback` response:
+
+- `recorded: bool`
+- `feedback_id: str`
+
+### Error behavior
+
+- unsupported source family filters return a structured warning, not silent omission
+- missing objects return a typed not-found error
+- unavailable vector search returns a warning and activates lexical fallback
+- absent layers return a successful response with `warnings`, not a transport failure
+
 ### Backward compatibility
 
 Existing tools:
@@ -305,6 +491,62 @@ Recommended storage split:
 - feedback table for retrieval evaluation
 
 This keeps the operational model simple while enabling better ranking and expansion logic.
+
+### Semantic retrieval contract
+
+- semantic search is optional at runtime but first-class in the design
+- embeddings attach to `overview_layer`, never `detail_layer`
+- every embedding row must record provider, model, dimension, and embedding version
+- ranking must degrade gracefully when vector search is disabled, stale, or unavailable
+- reindexing must be triggerable by embedding version changes
+- lexical-only fallback must remain a supported operating mode in the public repo
+
+If vectors are unavailable, ranking order becomes:
+
+1. lexical retrieval
+2. source-native heuristics
+3. entity overlap
+4. recency and authority features
+
+No MCP client should fail because embeddings are unavailable.
+
+## Neighborhood Expansion Policy
+
+Neighborhood expansion is intentionally bounded and policy-driven.
+
+### Link generation
+
+Deterministic links:
+
+- shared `session_id`
+- shared handoff identifier
+- explicit working-memory thread identifier
+- explicit source references
+
+Heuristic links:
+
+- shared normalized entities above a confidence threshold
+- shared task markers
+- shared decision markers
+- chronological adjacency within a bounded window
+
+### Expansion order
+
+The expander should prioritize:
+
+1. deterministic non-time links
+2. high-confidence heuristic semantic links
+3. time-adjacent links only as a final fallback
+
+### Expansion limits
+
+- default maximum neighbors per seed result: 8
+- maximum expansion depth: 1 for initial rollout
+- global maximum expanded objects per query: 20
+- stop expansion when the next candidate falls below a minimum link strength threshold
+- stop expansion when the estimated token budget for neighbor previews is exhausted
+
+These limits are required to keep latency and fan-out predictable.
 
 ## Migration Plan
 
@@ -333,6 +575,35 @@ This keeps the operational model simple while enabling better ranking and expans
 - keep compatibility shims only where needed
 - update docs and quick-start guidance in the public repo
 
+## Mixed-Mode Rollout Rules
+
+Mixed mode is expected during migration and must be explicitly supported.
+
+### Source family onboarding rules
+
+- only onboarded source families may emit canonical `MemoryObject` results
+- non-onboarded families continue to answer through legacy retrieval paths
+- the router must know which families are v2-capable at runtime
+
+### Stable ID rules
+
+- `object_id` must be deterministic and stable across backfills
+- if derived from legacy sources, it must include the source family namespace
+- `source_ref` must continue to point to the legacy/raw provenance location
+
+### Legacy compatibility behavior
+
+- if a legacy MCP tool queries a source family not yet onboarded to v2, it must use the old retrieval path for that family
+- if both old and new paths are available in shadow mode, old tool responses stay user-facing while v2 results are logged for comparison
+- cutover is allowed only after parity criteria are met on benchmark and shadow-read results
+
+### Shadow-read parity criteria
+
+- no severe correctness regression on top-3 hit rate
+- improved or equal context usefulness
+- bounded latency increase
+- stable object resolution for `memory_open` on migrated families
+
 ## Evaluation Plan
 
 This redesign succeeds only if retrieval quality improves on real queries.
@@ -358,6 +629,54 @@ Metrics:
 - latency by query type and source family
 
 The benchmark should live in the public repo so improvements are testable and upstream reviewable.
+
+### Benchmark construction
+
+- sample historical queries from real usage across all supported query categories
+- annotate each query with one or more acceptable target objects
+- annotate whether success requires neighbor context, not just the seed object
+- store annotations in versioned fixtures
+
+### Data split rules
+
+- use time-based splits to reduce leakage
+- train/tune on older queries
+- validate on a held-out later window
+- reserve a final test window for cutover decisions
+
+### Labeling protocol
+
+Each benchmark item must include:
+
+- query text
+- query category
+- acceptable object IDs
+- minimum acceptable layer (`abstract`, `overview`, or `detail`)
+- whether neighborhood context is required
+- optional notes on failure modes to avoid
+
+### Metric definitions
+
+`context usefulness rate`
+- percentage of queries where the returned result set includes enough seed plus neighbor context to answer without opening unrelated items
+
+`average tokens required`
+- estimated tokens consumed to reach an acceptable answer path, including the initial query response and any required `memory_open` or `memory_neighbors` calls
+
+### Acceptance criteria
+
+Before default cutover on a source family:
+
+- top-1 hit rate must improve or remain within a small predeclared tolerance while top-3 improves
+- false-positive rate in top-3 must not regress materially
+- context usefulness rate must improve
+- latency must remain within the rollout budget
+
+### Confidence reporting
+
+- report aggregate metrics
+- report category-level metrics
+- report confidence intervals or bootstrap estimates where feasible
 
 ## Public Repo vs Local Repo Boundary
 
