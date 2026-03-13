@@ -168,6 +168,31 @@ The ranker produces:
 - explanation fields
 - ranking trace for debugging
 
+### Duplicate handling and source authority
+
+Duplicate detection keys:
+
+- exact `source_ref`
+- exact `content_hash`
+- explicit `related_object_ids` linkage
+- compatibility provenance pointing at the same underlying legacy item
+
+Merge policy:
+
+- exact duplicates from different retrieval paths should be merged into one returned candidate
+- near-duplicates with materially different context may both remain visible but lower-ranked
+- suppressed duplicates still contribute evidence to the surviving candidate and may contribute neighbor links
+
+Source authority precedence for merged duplicates:
+
+1. native migrated source family object
+2. observation object with direct provenance
+3. handoff or working-memory object with explicit linkage
+4. session summary or note object
+5. compatibility-generated synthetic object
+
+When duplicates merge, the highest-authority candidate survives as the canonical returned object. Lower-authority duplicates contribute score evidence and provenance metadata but are not separately returned.
+
 This stage is the main retrieval-accuracy improvement layer.
 
 ### 5. NeighborhoodExpander
@@ -240,6 +265,33 @@ class MemoryObject:
     detail_layer: ContentLayer
     metadata: dict[str, Any]
 ```
+
+### ID contract
+
+`object_id` must be deterministic, namespaced, and parseable.
+
+Canonical formats:
+
+- observations: `obs:<observation_id>`
+- working memory: `wm:<session_key>:<entry_slug>`
+- handoffs: `handoff:<handoff_id>`
+- session summaries: `session:<session_id>`
+- notes: `note:<note_slug>`
+- messages: `msg:<platform>:<message_id>`
+- knowledge graph: `kg:<entity_id>`
+- compatibility-generated synthetic objects: `compat:<source_family>:<stable_key>`
+
+Legacy translation rules:
+
+- numeric observation IDs must translate directly to `obs:<id>`
+- legacy message IDs must translate directly to `msg:<platform>:<id>` when platform is known
+- compatibility adapters must expose deterministic translation helpers for legacy IDs they still support
+- `memory_open` and `memory_neighbors` must accept either canonical `object_id` values or legacy IDs that a compatibility adapter can translate unambiguously
+
+Compatibility invariants:
+
+- translating a supported legacy ID to `object_id` and back must be stable within a rollout phase
+- shadow-mode comparisons must assert that legacy fetches and translated `object_id` fetches resolve to the same underlying provenance
 
 ### Why this model matters
 
