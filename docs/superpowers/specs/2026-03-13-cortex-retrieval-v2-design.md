@@ -466,6 +466,7 @@ class QueryResult:
     overview_layer: ContentLayer | None
     neighbor_previews: list[NeighborPreview]
     warnings: list["Warning"]
+    debug: dict[str, Any] | None
 
 @dataclass
 class NeighborResult:
@@ -477,6 +478,7 @@ class NeighborResult:
     support_count: int
     overview_layer: ContentLayer | None
     warnings: list["Warning"]
+    debug: dict[str, Any] | None
 ```
 
 ### Warning and Error
@@ -531,6 +533,8 @@ class NeighborhoodLink:
         "same_session",
         "same_handoff",
         "same_working_memory_thread",
+        "same_link_group",
+        "same_source_ref",
         "shared_entity",
         "shared_task",
         "shared_decision",
@@ -636,6 +640,7 @@ Each result must include:
 - `score_components`
 - `overview_layer` optional, included only when `include_overview=true`
 - `neighbor_previews: list[NeighborPreview]`
+- `debug` optional, included only when `include_debug=true`
 
 `include_overview=true` invariant:
 
@@ -973,6 +978,14 @@ Rules:
 - if a family is legacy-only but still required by the route plan, query it through a temporary compatibility adapter that emits synthetic `MemoryObject`-shaped candidates
 - synthetic candidates must set metadata flags identifying them as compatibility-generated
 - if a family is unavailable to both v2 and compatibility adapters, `memory_query` must return a coverage warning naming the missing family
+
+Synthetic ID resolution rules:
+
+- compatibility-generated synthetic IDs must be resolvable by `memory_open`
+- compatibility-generated synthetic IDs must be expandable by `memory_neighbors`
+- each compatibility adapter must therefore register open and neighbor resolvers for its synthetic IDs
+- synthetic ID resolution must preserve stable namespacing and source provenance
+- if a compatibility resolver cannot open or expand a synthetic ID, it must return typed warnings and the appropriate status rather than an opaque failure
 
 This prevents v2 queries from becoming incomplete during migration.
 
