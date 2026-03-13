@@ -284,8 +284,9 @@ Merge policy:
 Source authority precedence for merged duplicates:
 
 1. higher configured source authority for the candidate's `(source_family, object_type, authority_tier)`
-2. newer timestamp
-3. lexical `object_id`
+2. stronger intent-fit contribution
+3. newer timestamp
+4. lexical `object_id`
 
 When duplicates merge, the candidate that wins under the same source-authority mapping and deterministic tie-break sequence used by the ranker survives as the canonical returned object. Lower-authority duplicates contribute provenance metadata and debug evidence but are not separately returned.
 
@@ -862,6 +863,12 @@ Canonical warnings location:
 - compatibility-backed `cami_memory_details` calls must retrieve full detail for migrated families, even if that requires internal pagination or multiple fetches behind the compatibility adapter
 - the response must set `payload.token_estimate` for the returned chunk or full body
 
+`OpenLayerResult` wire-shape defaults:
+
+- for successful `abstract` or `overview` opens, `byte_range=None` and `has_more=false`
+- for `status in {"absent", "stale", "not_found"}`, `byte_range=None` and `has_more=false`
+- for successful `detail` opens that are not truncated, `has_more=false`
+
 ### NeighborhoodLink
 
 ```python
@@ -1067,6 +1074,7 @@ Each result must include:
 - `mode="chronology"` must include the seed object in the returned sequence
 - in `mode="chronology"`, `limit` includes the seed row
 - the seed row must set `is_seed=true`, `link_type="seed"`, `link_strength=0.0`, and `support_count=1`
+- the seed row in `mode="chronology"` must set `global_score=0.0`
 - when timestamps are missing, place those rows after timestamped rows using lexical `object_id` tie-breaks
 
 Direct `NeighborResult` collapse semantics:
@@ -1523,13 +1531,14 @@ Shadow-read pass/fail rule:
 - the lineage evaluation window is fixed at 15 minutes after the originating `query_execution_id` is created
 - lineage-derived accepted seed objects are the legacy result objects opened by the user for that `query_execution_id` within that 15-minute window
 - lineage-derived accepted neighbors are the neighbor objects opened via a detail-fetch path on the same `query_execution_id` within that 15-minute window and carrying the matching `parent_object_id` seed context
+- accepted seed contexts are evaluated as a set of tuples `(seed_object_id, accepted_neighbor_set)` where `accepted_neighbor_set` may be empty
 - queries with neither explicit feedback nor accepted lineage are excluded from the usefulness denominator and reported as `unevaluable_shadow_queries`
-- `shadow_top3_hit_rate = shadow_top3_hits / evaluable_shadow_queries`, where `shadow_top3_hits` counts evaluable queries whose accepted seed object appears in the shadow top-3 result IDs
-- `legacy_top3_hit_rate = legacy_top3_hits / evaluable_shadow_queries`, where `legacy_top3_hits` counts evaluable queries whose accepted seed object appears in the paired user-visible legacy top-3 result IDs
+- `shadow_top3_hit_rate = shadow_top3_hits / evaluable_shadow_queries`, where `shadow_top3_hits` counts evaluable queries for which any accepted seed context has its `seed_object_id` in the shadow top-3 result IDs
+- `legacy_top3_hit_rate = legacy_top3_hits / evaluable_shadow_queries`, where `legacy_top3_hits` counts evaluable queries for which any accepted seed context has its `seed_object_id` in the paired user-visible legacy top-3 result IDs
 - `production_estimated_context_usefulness = useful_shadow_queries / evaluable_shadow_queries`
 - `legacy_context_usefulness = useful_legacy_queries / evaluable_shadow_queries`
-- a shadow query counts as `useful_shadow_queries` only if the shadow result set contains at least one accepted seed object and, when accepted neighbors exist, the shadow result set includes that accepted neighbor set in `neighbor_previews` or `memory_neighbors`
-- a legacy query counts as `useful_legacy_queries` only if the paired user-visible legacy top-k contains an accepted seed object and, when accepted neighbors exist, the logged legacy neighbor payloads for that same seed context contain the accepted neighbor set
+- a shadow query counts as `useful_shadow_queries` only if any accepted seed context is fully satisfied: its `seed_object_id` appears in the shadow result set and its `accepted_neighbor_set`, when non-empty, is fully present in `neighbor_previews` or `memory_neighbors` for that same seed context
+- a legacy query counts as `useful_legacy_queries` only if any accepted seed context is fully satisfied by the paired user-visible legacy path: its `seed_object_id` appears in the legacy top-k and its `accepted_neighbor_set`, when non-empty, is fully present in the logged legacy neighbor payloads for that same seed context
 - the final aggregated explicit negative feedback for a `query_execution_id` marks the shadow query not useful regardless of lineage
 - the parity gate cannot pass until `evaluable_shadow_queries >= 50`
 
