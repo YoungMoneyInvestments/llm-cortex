@@ -118,6 +118,15 @@ Example routing behavior:
 
 This stage reduces missed results by ensuring the right stores lead retrieval.
 
+Budget rules:
+
+- the router allocates a per-family candidate budget before retrieval begins
+- higher-ranked `source_preferences` get larger budgets first
+- default per-family pre-rank cap: 25 candidates
+- default total pre-rank cap across all families: 100 candidates
+- if total routed candidates exceed budget, trim lowest-priority families first, then lowest-scoring tail candidates within a family
+- trimming must use deterministic tie-breaks: source preference order, family-local score, newer timestamp, lexical `object_id`
+
 ### 3. CandidateRetriever Adapters
 
 Each source family gets a typed adapter that returns candidates in the same normalized shape.
@@ -144,6 +153,12 @@ Adapters are responsible for source-specific retrieval logic, including:
 - source-native heuristics
 
 They return candidates with evidence, not just opaque scores.
+
+Candidate emission rules:
+
+- no adapter may emit more than its allocated per-family budget
+- adapters must return candidates already ordered by family-local relevance
+- adapters must expose deterministic tie-break behavior for equal local scores
 
 ### 4. CrossSourceRanker
 
@@ -1064,9 +1079,10 @@ This prevents v2 queries from becoming incomplete during migration.
 
 A source family may move from shadow mode to default only when:
 
-- benchmark thresholds are met on the held-out validation window
+- benchmark thresholds are met on the held-out validation window for pre-cutover qualification
 - shadow-read parity is maintained for 7 consecutive days
 - no severity-1 retrieval regressions are observed for that family in production feedback
+- final cutover approval then passes once on the held-out test window
 
 ## Evaluation Plan
 
@@ -1113,8 +1129,8 @@ The benchmark should live in the public repo so improvements are testable and up
 
 - use time-based splits to reduce leakage
 - train/tune on older queries
-- validate on a held-out later window
-- reserve a final test window for cutover decisions
+- validate on a held-out later window for tuning and pre-cutover qualification
+- reserve a final test window for one-time family cutover approval
 
 ### Labeling protocol
 
@@ -1143,6 +1159,18 @@ Before default cutover on a source family:
 - false-positive rate in top-3 must not worsen by more than 2 percentage points
 - context usefulness rate must improve by at least 5 percentage points
 - p95 latency must not worsen by more than 20 percent
+
+### Severity taxonomy
+
+- severity-1: top production query class returns materially wrong or missing results for a migrated family in a way that blocks expected task continuation or decision recall
+- severity-2: noticeable quality regression with an available workaround
+- severity-3: cosmetic or low-impact mismatch
+
+Severity-1 gate:
+
+- one confirmed severity-1 regression in the 7-day parity window blocks cutover for that family
+- confirmation requires either repeated production feedback on the same failure mode or reproducibility on the held-out validation/test benchmark
+- the block is cleared only after the regression is fixed and the family re-passes the 7-day parity window
 
 ### Confidence reporting
 
