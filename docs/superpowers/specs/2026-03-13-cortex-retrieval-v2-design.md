@@ -288,10 +288,10 @@ class MemoryObject:
 Canonical formats:
 
 - observations: `obs:<observation_id>`
-- working memory: `wm:<session_key>:<entry_slug>`
+- working memory: `wm:<session_key>:<entry_id>`
 - handoffs: `handoff:<handoff_id>`
 - session summaries: `session:<session_id>`
-- notes: `note:<note_slug>`
+- notes: `note:<note_id>`
 - messages: `msg:<platform>:<message_id>`
 - knowledge graph: `kg:<entity_id>`
 - compatibility-generated synthetic objects: `compat:<source_family>:<stable_key>`
@@ -302,6 +302,14 @@ Legacy translation rules:
 - legacy message IDs must translate directly to `msg:<platform>:<id>` when platform is known
 - compatibility adapters must expose deterministic translation helpers for legacy IDs they still support
 - `memory_open` and `memory_neighbors` must accept either canonical `object_id` values or legacy IDs that a compatibility adapter can translate unambiguously
+
+Immutable key rules:
+
+- `entry_id`, `note_id`, and `stable_key` must come from immutable source identifiers, not user-visible slugs or titles
+- user-visible slugs may appear in metadata, but must not be used as canonical `object_id` components
+- if source content is renamed, the canonical `object_id` must remain unchanged
+- if an immutable source identifier is unavailable, the adapter must synthesize one once and persist it for future reuse
+- collisions must be resolved by appending a stable disambiguator derived from immutable provenance, not by renumbering existing IDs
 
 Compatibility invariants:
 
@@ -692,6 +700,7 @@ The current MCP tools should remain available temporarily, but the new engine sh
 
 `memory_query` response:
 
+- `query_execution_id`
 - `query_plan`
 - `results: list[QueryResult]`
 - `debug` optional
@@ -746,6 +755,7 @@ Each result must include:
 
 `memory_feedback` request:
 
+- `query_execution_id: str` required
 - `query: str` required
 - `object_id: str | None` optional
 - `feedback: Literal["helpful", "irrelevant", "missing_context", "missed_expected_result"]`
@@ -755,6 +765,12 @@ Each result must include:
 
 - `recorded: bool`
 - `feedback_id: str`
+
+Query execution logging:
+
+- every `memory_query` execution must persist `query_execution_id`
+- the persisted execution record must include engine version, ranker version, source coverage state, top-k returned object IDs, and whether the request ran in shadow mode
+- `memory_feedback` must attach to that stored execution record for regression analysis and cutover decisions
 
 ### Error behavior
 
