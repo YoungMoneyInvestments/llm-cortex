@@ -372,6 +372,7 @@ class NeighborhoodLink:
         "shared_entity",
         "shared_task",
         "shared_decision",
+        "semantic_neighbor",
         "time_adjacent",
     ]
     strength: float
@@ -384,6 +385,19 @@ Requirements:
 - deterministic links must set `inferred=False`
 - heuristic links must set `inferred=True`
 - expander policy must be able to filter by `link_type` and `inferred`
+
+### Ranker missing-feature policy
+
+The ranker must not interpret missing semantic data as negative evidence.
+
+Rules:
+
+- if a feature family is unavailable for a candidate, its weight is masked rather than converted into a zero-penalty feature
+- final candidate score is computed from normalized contributions over available feature families only
+- if semantic features are masked, debug output must include `semantic_masked: true`
+- cross-source comparison must use the same masking logic for every family
+
+This prevents partially embedded families from being unfairly demoted during migration.
 
 ## Source Adapters
 
@@ -581,7 +595,16 @@ Heuristic links:
 - shared normalized entities above a confidence threshold
 - shared task markers
 - shared decision markers
+- `semantic_neighbor` links from overview-embedding similarity above a configured threshold
 - chronological adjacency within a bounded window
+
+`semantic_neighbor` strength is computed from normalized embedding similarity and is only emitted when:
+
+- both objects have valid current-version embeddings
+- the similarity score exceeds the configured minimum threshold
+- the resulting link is not dominated by a stronger deterministic relationship
+
+If embeddings are stale, missing, or disabled, semantic links must not be generated and debug output must record that omission.
 
 ### Expansion order
 
@@ -609,6 +632,7 @@ When multiple seed results nominate overlapping neighbors:
 - compute one global neighbor score from max link strength plus a small bonus for multi-seed support
 - tie-break by deterministic order: stronger link, more seed support, newer timestamp, lexical object ID
 - attach the neighbor to every nominating seed in metadata, but only materialize it once in the global expanded set
+- semantic neighbors participate in the same arbitration rules as other inferred links and are excluded entirely when semantic coverage is unavailable
 
 `neighbor_preview` in `memory_query` responses is per-seed but derived from the globally deduped expanded set. This keeps previews stable across runs and avoids duplicate context.
 
