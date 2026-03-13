@@ -227,6 +227,9 @@ class MemoryObject:
     created_at: str | None
     updated_at: str | None
     session_id: str | None
+    handoff_id: str | None
+    working_memory_thread_id: str | None
+    link_group_id: str | None
     source_ref: str | None
     entities: list[str]
     task_markers: list[str]
@@ -267,6 +270,38 @@ Current Cortex data is spread across multiple storage forms with different seman
 - `detail_layer` may be inline, reference-backed, or absent.
 - `memory_open` resolves layer payloads through the same `ContentLayer` contract regardless of storage mode.
 - ranking uses `abstract` and `overview_layer`; it must never require `detail_layer` to rank.
+
+### Layer generation contract
+
+`abstract` and `overview_layer` must be generated explicitly and versioned.
+
+Generation rules:
+
+- `abstract` should be deterministic where a concise structured summary can be produced from metadata; otherwise it may use a model-based summarizer
+- `overview_layer` may be deterministic for structured sources or model-based for free text
+- `detail_layer` is never generated; it is copied from source content or referenced directly
+
+Required generation metadata:
+
+- `abstract_version`
+- `overview_version`
+- `generation_method`: `deterministic` or `model`
+- `generation_model` if model-based
+- `generated_at`
+
+Regeneration triggers:
+
+- source content change
+- marker extraction change
+- summary prompt/template change
+- generation model/version change
+- explicit repair or rebuild command
+
+Failure behavior:
+
+- if `abstract` generation fails, the object is not queryable until a fallback abstract is synthesized from source metadata
+- if `overview_layer` generation fails, the object may remain queryable through `abstract`, but it is ineligible for semantic retrieval until repaired
+- generation failures must emit typed warnings and queue the object for repair
 
 ### Content resolution contract
 
@@ -724,6 +759,44 @@ If vectors are unavailable, ranking order becomes:
 
 No MCP client should fail because embeddings are unavailable.
 
+## Sync and Invalidation Lifecycle
+
+Retrieval v2 must define how source changes propagate into derived state.
+
+### Create
+
+- on source create, build or enqueue a new `MemoryObject`
+- generate or resolve `abstract` and `overview_layer`
+- extract markers
+- create embeddings if semantic search is enabled
+- derive neighborhood links
+
+### Update
+
+- on source update, mark the existing object stale
+- regenerate layers and markers
+- rebuild embeddings if overview text changed or embedding version changed
+- recompute affected neighborhood links
+
+### Delete or tombstone
+
+- sources should prefer tombstoning over hard deletion
+- tombstoned objects remain addressable for provenance but are excluded from ranking by default
+- links to tombstoned objects must be suppressed from default neighbor expansion
+
+### Repair and rebuild
+
+- failed generation or stale refs must enqueue a repair job
+- embedding-version changes must enqueue incremental reindex jobs
+- link-derivation rule changes must enqueue link rebuild jobs
+- the system must support source-family-scoped and full rebuild procedures
+
+### Stale marking
+
+- stale layers, stale embeddings, and stale links must be tracked separately
+- read-time retrieval must surface stale status through warnings/debug fields
+- ranking must exclude stale semantic features and stale links until rebuilt
+
 ### Partial semantic coverage rules
 
 Real deployments may have incomplete embedding coverage. Retrieval v2 must support:
@@ -785,8 +858,9 @@ Neighborhood expansion is intentionally bounded and policy-driven.
 Deterministic links:
 
 - shared `session_id`
-- shared handoff identifier
-- explicit working-memory thread identifier
+- shared `handoff_id`
+- shared `working_memory_thread_id`
+- shared `link_group_id`
 - explicit source references
 
 Heuristic links:
@@ -961,6 +1035,14 @@ The benchmark should live in the public repo so improvements are testable and up
 - annotate each query with one or more acceptable target objects
 - annotate whether success requires neighbor context, not just the seed object
 - store annotations in versioned fixtures
+
+### Public benchmark sanitization
+
+- raw historical queries, messages, and private object content stay in private local evaluation inputs
+- the public repo must contain only sanitized fixtures
+- sanitization must replace personal names, handles, phone numbers, emails, account numbers, and other private identifiers with stable placeholders
+- sanitized fixtures must preserve query category, structural difficulty, and acceptable-answer relationships
+- the private-to-public fixture generation step should live as a dedicated script in the public repo, with local private inputs excluded from version control
 
 ### Data split rules
 
