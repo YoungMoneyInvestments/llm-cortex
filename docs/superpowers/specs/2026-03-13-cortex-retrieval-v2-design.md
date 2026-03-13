@@ -328,6 +328,13 @@ The contract for layered content is authoritative and must be used consistently 
 - MCP tool responses
 - compatibility wrappers
 
+Published/pending representation rule:
+
+- the canonical `MemoryObject` fields `abstract`, `overview_layer`, `detail_layer`, freshness fields, and generation metadata always represent the currently published artifact set
+- `published_artifact_version` names the artifact set currently exposed through query/open APIs
+- `pending_artifact_version` and `pending_artifact_state` represent the next artifact set being built off-path; its concrete layers, embeddings, and links live in side tables keyed by that pending version until publish
+- `published_source_version` and `pending_source_version` track which source snapshot each artifact set was derived from
+
 `abstract` is always inline text. `overview` and `detail` are always represented as `ContentLayer` objects, whether the bytes are inline or referenced externally. The system must not mix plain inline strings in one layer and ad hoc `*_ref` fields elsewhere.
 
 ```python
@@ -343,7 +350,7 @@ class ContentLayer:
 class MemoryObject:
     object_id: str
     source_family: str
-    object_type: str
+    object_type: Literal["observation", "working_memory_entry", "handoff", "session_summary", "note", "message", "graph_entity"]
     visibility: Literal["active", "tombstoned"]
     created_at: str | None
     updated_at: str | None
@@ -368,6 +375,11 @@ class MemoryObject:
     overview_generation_method: Literal["deterministic", "model"] | None
     overview_generation_model: str | None
     overview_generated_at: str | None
+    published_artifact_version: str
+    pending_artifact_version: str | None
+    published_source_version: str | None
+    pending_source_version: str | None
+    pending_artifact_state: Literal["none", "building", "ready"]
     overview_freshness: Literal["fresh", "stale", "missing"]
     detail_freshness: Literal["fresh", "stale", "missing"]
     embedding_freshness: Literal["fresh", "stale", "missing", "disabled"]
@@ -378,6 +390,16 @@ class MemoryObject:
 ### ID contract
 
 `object_id` must be deterministic, namespaced, and parseable.
+
+Canonical `object_type` tokens:
+
+- `observation`
+- `working_memory_entry`
+- `handoff`
+- `session_summary`
+- `note`
+- `message`
+- `graph_entity`
 
 Canonical formats:
 
@@ -392,7 +414,9 @@ Canonical formats:
 
 Component encoding rule:
 
-- every `object_id` component must use lowercase URL-safe base32 without padding when the raw immutable source identifier contains characters outside the canonical grammar
+- every `object_id` component must either match `[a-z0-9._-]+` exactly or be encoded as lowercase URL-safe base32 without padding
+- raw `:` is reserved exclusively as the component delimiter and must never appear inside an encoded or unencoded component
+- therefore any raw immutable identifier containing `:`, `/`, whitespace, uppercase letters, or any character outside `[a-z0-9._-]` must be encoded as an entire component
 - adapters and compatibility translators must use the same encoding rule
 - if reversibility is required, the raw immutable identifier must also be persisted in metadata
 
@@ -546,6 +570,7 @@ Formal grammar:
 - regex: `^(obs|wm|handoff|session|note|msg|kg|compat)://([a-z0-9._:-]+)/((overview|detail))$`
 - scheme and layer tokens must be lowercase
 - `object_id` may contain only `a-z`, `0-9`, `.`, `_`, `:`, and `-`
+- every `:` inside `object_id` must be a canonical component delimiter; no component may itself contain a raw `:`
 - `/` is not allowed inside `object_id`
 - malformed refs must raise typed `Error(code="invalid_ref", scope="resolver")`, not `not_found`
 - well-formed refs with missing targets must resolve to `not_found`
@@ -631,7 +656,7 @@ class CandidateState:
 class NormalizedCandidate:
     object_id: str
     source_family: str
-    object_type: str
+    object_type: Literal["observation", "working_memory_entry", "handoff", "session_summary", "note", "message", "graph_entity"]
     timestamp: str | None
     source_ref: str | None
     authoritative_content_hash: str | None
@@ -719,7 +744,7 @@ class OpenLayerResult:
 class QueryResult:
     object_id: str
     source_family: str
-    object_type: str
+    object_type: Literal["observation", "working_memory_entry", "handoff", "session_summary", "note", "message", "graph_entity"]
     match_kind: Literal["seed", "expanded_context"]
     abstract: str
     score: float
@@ -1100,7 +1125,7 @@ Per-family onboarding table:
 
 - working_memory
   - source of truth: working-memory state files
-  - canonical object type: working-memory entry
+  - canonical object type: working_memory_entry
   - immutable key: persisted entry ID
   - `object_id`: `wm:<session_key>:<entry_id>`
   - update/delete signal: working-memory writes
@@ -1118,7 +1143,7 @@ Per-family onboarding table:
 
 - session_summaries
   - source of truth: session summary records
-  - canonical object type: session summary
+  - canonical object type: session_summary
   - immutable key: session ID
   - `object_id`: `session:<session_id>`
   - update/delete signal: session-end summarization
@@ -1145,7 +1170,7 @@ Per-family onboarding table:
 
 - knowledge_graph
   - source of truth: graph entity store
-  - canonical object type: graph entity
+  - canonical object type: graph_entity
   - immutable key: entity ID
   - `object_id`: `kg:<entity_id>`
   - update/delete signal: graph seed/update pipeline
@@ -1206,9 +1231,9 @@ Retrieval v2 must define how source changes propagate into derived state.
 
 Published/pending persistence contract:
 
-- object metadata tracks one published artifact set and zero or one pending artifact set
-- pending layers, embeddings, and links must be written under a new version identifier before publish
-- publish is one atomic transaction that swaps the published version pointer, updates searchable indexes, and marks the previous version superseded
+- the canonical `MemoryObject` row tracks one published artifact set through `published_artifact_version` and zero or one pending artifact set through `pending_artifact_version`
+- pending layers, embeddings, and links must be written under `pending_artifact_version` in side tables before publish
+- publish is one atomic transaction that swaps `published_artifact_version` to the prior `pending_artifact_version`, copies the pending source-version pointer into `published_source_version`, updates searchable indexes, clears the pending pointer/state, and marks the previous version superseded
 - query and open paths must never mix published and pending artifacts within the same response
 
 ### Delete or tombstone
