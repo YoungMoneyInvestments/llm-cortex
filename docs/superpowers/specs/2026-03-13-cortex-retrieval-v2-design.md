@@ -281,7 +281,11 @@ class QueryPlan:
     normalized_query: str
     intents: list[str]
     entities: list[str]
+    people: list[str]
+    task_terms: list[str]
+    decision_terms: list[str]
     exact_phrases: list[str]
+    time_hints: list[str]
     recency_hint: Literal["none", "recent", "historical"]
     source_preferences: list[str]
     debug: dict[str, Any]
@@ -308,6 +312,7 @@ class NormalizedCandidate:
     abstract: str
     overview_layer: ContentLayer
     detail_layer: ContentLayer
+    score: float
     score_components: list["ScoreComponent"]
     metadata: dict[str, Any]
 ```
@@ -329,6 +334,29 @@ Requirements:
 - every ranked result must expose score components
 - `contribution` is the post-weight contribution to final score
 - debug output must not require reading source code
+
+### NeighborPreview
+
+```python
+@dataclass
+class NeighborPreview:
+    object_id: str
+    abstract: str
+    link_type: str
+    strength: float
+```
+
+### OpenLayerResult
+
+```python
+@dataclass
+class OpenLayerResult:
+    object_id: str
+    layer: Literal["abstract", "overview", "detail"]
+    payload: ContentLayer
+    resolved_text: str | None
+    warnings: list[str]
+```
 
 ### NeighborhoodLink
 
@@ -510,6 +538,31 @@ If vectors are unavailable, ranking order becomes:
 
 No MCP client should fail because embeddings are unavailable.
 
+### Partial semantic coverage rules
+
+Real deployments may have incomplete embedding coverage. Retrieval v2 must support:
+
+- full semantic coverage
+- partial per-object coverage
+- partial per-family coverage
+- globally disabled vector search
+- stale embeddings after version changes
+
+Rules:
+
+- if a candidate lacks a valid embedding, its semantic score component is set to `0.0`
+- the result debug payload must include `semantic_coverage_state`
+- lexical and symbolic features must still be computed normally
+- stale embeddings must be excluded from semantic ranking until reindexed
+- per-family semantic disablement must produce a family-level warning in debug output
+- ranking must remain deterministic under mixed semantic coverage
+
+Required debug fields:
+
+- `semantic_coverage_state`: `full`, `partial`, `disabled`, or `stale`
+- `embedding_version`
+- `semantic_used: bool`
+
 ## Neighborhood Expansion Policy
 
 Neighborhood expansion is intentionally bounded and policy-driven.
@@ -548,6 +601,17 @@ The expander should prioritize:
 
 These limits are required to keep latency and fan-out predictable.
 
+### Multi-seed arbitration
+
+When multiple seed results nominate overlapping neighbors:
+
+- dedupe globally by `object_id`
+- compute one global neighbor score from max link strength plus a small bonus for multi-seed support
+- tie-break by deterministic order: stronger link, more seed support, newer timestamp, lexical object ID
+- attach the neighbor to every nominating seed in metadata, but only materialize it once in the global expanded set
+
+`neighbor_preview` in `memory_query` responses is per-seed but derived from the globally deduped expanded set. This keeps previews stable across runs and avoids duplicate context.
+
 ## Migration Plan
 
 ### Phase 1: Add the new model beside current retrieval
@@ -585,6 +649,19 @@ Mixed mode is expected during migration and must be explicitly supported.
 - non-onboarded families continue to answer through legacy retrieval paths
 - the router must know which families are v2-capable at runtime
 
+### V2 mixed-query behavior
+
+`memory_query` must support partial rollout through temporary compatibility adapters.
+
+Rules:
+
+- if a family is v2-capable, query it through native Retrieval v2 adapters
+- if a family is legacy-only but still required by the route plan, query it through a temporary compatibility adapter that emits synthetic `MemoryObject`-shaped candidates
+- synthetic candidates must set metadata flags identifying them as compatibility-generated
+- if a family is unavailable to both v2 and compatibility adapters, `memory_query` must return a coverage warning naming the missing family
+
+This prevents v2 queries from becoming incomplete during migration.
+
 ### Stable ID rules
 
 - `object_id` must be deterministic and stable across backfills
@@ -603,6 +680,14 @@ Mixed mode is expected during migration and must be explicitly supported.
 - improved or equal context usefulness
 - bounded latency increase
 - stable object resolution for `memory_open` on migrated families
+
+### Cutover rule
+
+A source family may move from shadow mode to default only when:
+
+- benchmark thresholds are met on the held-out validation window
+- shadow-read parity is maintained for 7 consecutive days
+- no severity-1 retrieval regressions are observed for that family in production feedback
 
 ## Evaluation Plan
 
@@ -667,16 +752,22 @@ Each benchmark item must include:
 
 Before default cutover on a source family:
 
-- top-1 hit rate must improve or remain within a small predeclared tolerance while top-3 improves
-- false-positive rate in top-3 must not regress materially
-- context usefulness rate must improve
-- latency must remain within the rollout budget
+- top-1 hit rate must improve, or stay within 1 percentage point of baseline while top-3 improves by at least 3 percentage points
+- false-positive rate in top-3 must not worsen by more than 2 percentage points
+- context usefulness rate must improve by at least 5 percentage points
+- p95 latency must not worsen by more than 20 percent
 
 ### Confidence reporting
 
 - report aggregate metrics
 - report category-level metrics
 - report confidence intervals or bootstrap estimates where feasible
+
+### Minimum benchmark size
+
+- at least 200 labeled queries before first family cutover
+- at least 25 labeled queries per major query category
+- final cutover decisions use the held-out test window only once per family
 
 ## Public Repo vs Local Repo Boundary
 
