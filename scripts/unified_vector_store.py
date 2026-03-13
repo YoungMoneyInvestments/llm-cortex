@@ -12,6 +12,7 @@ Collections:
 
 Configure:
     CORTEX_WORKSPACE  — Project root (default: ~/cortex)
+    CORTEX_ENV_FILE   — Optional env file containing OPENAI_API_KEY
     OPENAI_API_KEY    — Required only for vector similarity search
 
 Dependencies:
@@ -56,19 +57,23 @@ def get_vector_store(db_path: Optional[Path] = None) -> "UnifiedVectorStore":
 
 
 def _load_openai_key() -> Optional[str]:
-    """Load OpenAI API key from env or .env file."""
+    """Load OpenAI API key from env or an optional env file."""
     key = os.environ.get("OPENAI_API_KEY")
     if key:
         return key
-    # Check for .env file in workspace
-    for env_file in [WORKSPACE / ".env", WORKSPACE / ".env.local"]:
-        if env_file.exists():
-            for line in env_file.read_text().splitlines():
-                line = line.strip()
-                if line.startswith("OPENAI_API_KEY="):
-                    return line.split("=", 1)[1].strip('"').strip("'")
-                if line.startswith("export OPENAI_API_KEY="):
-                    return line.split("=", 1)[1].strip('"').strip("'")
+    env_file_value = os.environ.get("CORTEX_ENV_FILE", "").strip()
+    if not env_file_value:
+        return None
+    env_file = Path(env_file_value).expanduser()
+    if env_file.exists():
+        for line in env_file.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export ") :]
+            if line.startswith("OPENAI_API_KEY="):
+                return line.split("=", 1)[1].strip('"').strip("'")
     return None
 
 

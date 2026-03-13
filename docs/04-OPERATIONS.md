@@ -1,132 +1,128 @@
 # Claude Cortex: Operations Guide
-### What runs, where, and why
+### What runs, where, and how to operate it safely in a public setup
 
 ---
 
-## Background Processes
+## Runtime Components
 
-### 1. Memory Worker (`memory_worker.py`)
-- **What:** FastAPI service that captures, compresses, and indexes all Claude Code activity
-- **Port:** 37778 (localhost only)
-- **Managed by:** launchd (`com.cortex.memory-worker`)
-- **Auto-starts:** Yes, on login. Auto-restarts on crash.
-- **RAM:** ~100MB idle
-- **Logs:** `~/.openclaw/logs/memory-worker.log`
+### 1. Memory Worker (`src/memory_worker.py`)
+- **What:** FastAPI service that captures, compresses, and indexes Claude Code activity
+- **Port:** `127.0.0.1:${CORTEX_WORKER_PORT:-37778}`
+- **Lifecycle:** run it directly or under your own process manager (`launchd`, `systemd`, Docker, etc.)
+- **Logs:** `${CORTEX_LOG_DIR:-$HOME/.cortex/logs}/memory-worker.log`
+- **Auth:** all POST endpoints require `CORTEX_WORKER_API_KEY`
 
-**Sub-systems running inside the worker:**
+### 2. Hook Scripts (`hooks/`)
+- `session_start.sh`
+- `user_prompt_submit.sh`
+- `post_tool_use.sh`
+- `session_end.sh`
 
-| Sub-system | What it does | Runs every |
-|------------|-------------|------------|
-| **Observation Processor** | Picks up pending observations, generates AI or rule-based summaries, syncs to vector store | 5 seconds |
-| **AI Compressor** | Sends high-signal observations to CamiRouter/Anthropic for semantic compression | Per observation (with rate control) |
-| **NER Extractor** | Extracts people, projects, tools, files, companies from observations via regex patterns | Per high-signal observation |
-| **Session Summarizer** | Generates session summaries when sessions end (key decisions, entities, files changed) | On session end + 5-min catch-up loop |
-| **Retention Manager** | Deletes old low-signal data (7d+), trims raw fields on old high-signal data (30d+) | Every hour |
-| **Watchdog** | Monitors all sub-systems, restarts any that crash | Every 30 seconds |
+These fire on Claude Code lifecycle events, POST to the worker, and exit immediately.
 
-### 2. Hook Scripts (in `hooks/`)
-- **What:** Shell scripts that fire on Claude Code lifecycle events
-- **Triggered by:** Claude Code hooks system (configured in `.claude/settings.json`)
-- **They do NOT run continuously** — they fire, POST to the worker, and exit
-
-| Hook | Trigger | What it sends |
-|------|---------|--------------|
-| `post-tool-use.sh` | After every tool call | Tool name, input, output |
-| `user-prompt.sh` | When you type a prompt | Your prompt text, registers session |
-| `session-end.sh` | When a session ends | Session ID (triggers summarization) |
-| `start-worker.sh` | On session start | Ensures worker is running (redundant with launchd) |
-
-### 3. MCP Memory Server (`mcp_memory_server.py`)
-- **What:** Exposes memory search as MCP tools for Claude/Cami
-- **Runs:** On-demand (spawned by MCP client when tools are called)
-- **Not a background process** — starts and stops with each MCP session
-- **Tools provided:** `cami_memory_search`, `cami_memory_timeline`, `cami_memory_details`, `cami_memory_save`, `cami_memory_graph_search`
+### 3. MCP Memory Server (`src/mcp_memory_server.py`)
+- **What:** stdio MCP server exposing the canonical public `cami_*` tools
+- **Runs:** on demand when your MCP client invokes it
+- **Tools:** `cami_memory_search`, `cami_memory_timeline`, `cami_memory_details`, `cami_memory_save`, `cami_memory_graph_search`
 
 ---
 
-## Data Stores
+## Data Locations
 
-| Database | Location | Size (typical) | What's in it |
-|----------|----------|---------------|-------------|
-| **Observations DB** | `~/clawd/data/cortex-observations.db` | 50-200MB | All observations, sessions, session summaries |
-| **Vector DB** | `~/clawd/data/cortex-vectors.db` | 50-150MB | FTS5 index + 384-dim embeddings for semantic search |
-| **Knowledge Graph DB** | `~/clawd/data/cortex-knowledge-graph.db` | 1-5MB | Entities, relationships, aliases |
+The public repo defaults to a generic local runtime under `~/.cortex`. Override with env vars if you want a different layout.
 
-**Estimated growth:** ~10-20MB/month with retention cleanup active. Retention auto-prunes so databases plateau rather than grow unbounded.
-
----
-
-## Automatic Cleanup (Retention)
-
-The retention manager runs hourly inside the worker:
-
-| Data age | What happens |
-|----------|-------------|
-| 0-7 days | Everything kept |
-| 7-30 days | Low-signal observations deleted (Read, Glob, Grep, Bash, TaskOutput) + their vector embeddings |
-| 30+ days | Raw input/output nulled on remaining observations. Summaries preserved forever. |
+| Store | Default location | Notes |
+|------|------------------|-------|
+| Observations DB | `${CORTEX_DATA_DIR:-$HOME/.cortex/data}/cortex-observations.db` | observations, sessions, summaries |
+| Vector DB | `${CORTEX_DATA_DIR:-$HOME/.cortex/data}/cortex-vectors.db` | FTS + optional embeddings |
+| Knowledge Graph DB | `${CORTEX_DATA_DIR:-$HOME/.cortex/data}/cortex-knowledge-graph.db` | entities and relationships |
+| Worker log | `${CORTEX_LOG_DIR:-$HOME/.cortex/logs}/memory-worker.log` | worker application log |
+| PID file | `${CORTEX_PID_FILE:-$HOME/.cortex/worker.pid}` | optional worker PID location |
 
 ---
 
-## Managing the Worker
+## Required Configuration
+
+| Variable | Required | Purpose |
+|----------|----------|---------|
+| `CORTEX_WORKER_API_KEY` | yes for hooks/POST endpoints | shared bearer token between the worker and hook environment |
+| `CORTEX_WORKER_PORT` | no | worker port, defaults to `37778` |
+| `CORTEX_DATA_DIR` | no | runtime data directory |
+| `CORTEX_LOG_DIR` | no | runtime log directory |
+| `CORTEX_PID_FILE` | no | PID file path |
+
+Optional AI compression settings:
+
+| Variable | Required | Purpose |
+|----------|----------|---------|
+| `CAMIROUTER_URL` | optional | OpenAI-compatible router endpoint |
+| `CAMIROUTER_API_KEY` | required if `CAMIROUTER_URL` is set | router auth |
+| `CORTEX_AUTH_PROFILES_PATH` | optional | OAuth fallback auth-profiles.json path |
+| `OPENAI_API_KEY` | optional | OpenAI embeddings |
+| `CORTEX_ENV_FILE` | optional | env file containing `OPENAI_API_KEY=...` |
+
+Generate a safe worker key with:
 
 ```bash
-# Check if running
-launchctl list | grep cortex
-
-# Check health
-TIRITH=0 curl -s http://127.0.0.1:37778/api/health | python3 -m json.tool
-
-# Restart
-launchctl kickstart -k gui/$(id -u)/com.cortex.memory-worker
-
-# Stop temporarily
-launchctl kill SIGTERM gui/$(id -u)/com.cortex.memory-worker
-
-# View logs
-tail -50 ~/.openclaw/logs/memory-worker.log
-
-# Check AI compression status
-TIRITH=0 curl -s http://127.0.0.1:37778/api/compression/status | python3 -m json.tool
-
-# Check NER stats
-TIRITH=0 curl -s http://127.0.0.1:37778/api/ner/stats | python3 -m json.tool
-
-# Check retention stats
-TIRITH=0 curl -s http://127.0.0.1:37778/api/retention/stats | python3 -m json.tool
-
-# Manual retention run (dry run first)
-TIRITH=0 curl -s -X POST "http://127.0.0.1:37778/api/retention/run?dry_run=true" | python3 -m json.tool
-```
-
-## Re-embedding (after DB reset or model change)
-
-```bash
-cd ~/clawd && source venv/bin/activate
-python scripts/unified_vector_store.py backfill
+python3 - <<'PY'
+import secrets
+print(secrets.token_hex(16))
+PY
 ```
 
 ---
 
-## Configuration (Environment Variables)
+## Common Commands
 
-| Variable | Default | What it controls |
-|----------|---------|-----------------|
-| `CORTEX_NER_ENABLED` | `true` | Enable/disable automatic entity extraction |
-| `CORTEX_WORKER_API_KEY` | `cortex-local-2026` | Bearer token for POST endpoints |
-| `CORTEX_EMBEDDING_PROVIDER` | `local` | `local` (free, sentence-transformers) or `openai` (paid) |
+```bash
+# Start the worker
+python3 src/memory_worker.py
+
+# Health
+curl -s http://127.0.0.1:${CORTEX_WORKER_PORT:-37778}/api/health | python3 -m json.tool
+
+# Compression status
+curl -s http://127.0.0.1:${CORTEX_WORKER_PORT:-37778}/api/compression/status | python3 -m json.tool
+
+# NER stats
+curl -s http://127.0.0.1:${CORTEX_WORKER_PORT:-37778}/api/ner/stats | python3 -m json.tool
+
+# Retention stats
+curl -s http://127.0.0.1:${CORTEX_WORKER_PORT:-37778}/api/retention/stats | python3 -m json.tool
+
+# Manual retention run
+curl -s -X POST \
+  -H "Authorization: Bearer $CORTEX_WORKER_API_KEY" \
+  "http://127.0.0.1:${CORTEX_WORKER_PORT:-37778}/api/retention/run?dry_run=true" \
+  | python3 -m json.tool
+
+# Tail logs
+tail -50 "${CORTEX_LOG_DIR:-$HOME/.cortex/logs}/memory-worker.log"
+```
 
 ---
 
-## launchd Plist
+## Re-embedding
 
-Location: `~/Library/LaunchAgents/com.cortex.memory-worker.plist`
+```bash
+python3 src/unified_vector_store.py backfill
+```
 
-- `RunAtLoad: true` — starts on login
-- `KeepAlive.SuccessfulExit: false` — restarts on crash (non-zero exit)
-- `ThrottleInterval: 10` — waits 10s between restart attempts
-- Logs to `~/.openclaw/logs/memory-worker-stdout.log` and `memory-worker-stderr.log`
+If you switch embedding providers or dimensions, re-embed after resetting the vector store.
 
 ---
 
-*Last updated: 2026-03-07*
+## Process Management
+
+This repo does not require a specific supervisor. Use whatever is standard for your environment:
+- local shell session
+- `launchd`
+- `systemd`
+- Docker / Compose
+- CI job / devcontainer entrypoint
+
+If you use a supervisor, make sure it exports the same `CORTEX_WORKER_API_KEY`, `CORTEX_DATA_DIR`, and `CORTEX_LOG_DIR` that your hooks expect.
+
+---
+
+*Last updated: 2026-03-13*

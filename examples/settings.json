@@ -1,6 +1,7 @@
 {
   "// Claude Code settings.json example": "Add these to ~/.claude/settings.json",
   "// Adjust paths to match your Cortex installation": "",
+  "// Export CORTEX_WORKER_API_KEY in the shell that launches Claude Code": "The hooks read it from the environment.",
 
   "hooks": {
     "SessionStart": [
@@ -52,9 +53,9 @@
   "mcpServers": {
     "cortex-memory": {
       "command": "python3",
-      "args": ["/path/to/cortex/scripts/mcp_memory_server.py"],
+      "args": ["/path/to/cortex/src/mcp_memory_server.py"],
       "env": {
-        "CORTEX_WORKSPACE": "/path/to/cortex/workspace"
+        "CORTEX_DATA_DIR": "/path/to/.cortex/data"
       }
     }
   }
