@@ -28,6 +28,7 @@ Usage:
 import json
 import logging
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -40,9 +41,17 @@ logger = logging.getLogger("cortex-retriever")
 
 # ── Config ──────────────────────────────────────────────────────────────────
 
-DATA_DIR = Path(os.environ.get("CORTEX_DATA_DIR", str(Path.home() / ".cortex" / "data"))).expanduser()
+DATA_DIR = Path(
+    os.environ.get("CORTEX_DATA_DIR", str(Path.home() / ".cortex" / "data"))
+).expanduser()
 OBS_DB_PATH = DATA_DIR / "cortex-observations.db"
 VEC_DB_PATH = DATA_DIR / "cortex-vectors.db"
+TOKEN_PATTERN = re.compile(r"[a-z0-9_]+")
+ORIGIN_PRIORITY = {
+    "observations": 3,
+    "session_summary": 2,
+    "vector_store": 1,
+}
 
 # ── Main class ──────────────────────────────────────────────────────────────
 
@@ -185,14 +194,16 @@ class MemoryRetriever:
         # Normalize scores to [0, 1] range
         self._normalize_scores(results)
 
-        # Apply time decay boost
-        self._apply_time_decay(results)
+        query_terms = self._query_terms(query)
+
+        # Calibrate normalized scores with bounded lexical and recency signals
+        self._calibrate_scores(results, query_terms)
 
         # Deduplicate — first by ID, then by text overlap
-        deduped = self._deduplicate_results(results)
+        deduped = self._deduplicate_results(results, query_terms)
 
-        # Sort by relevance (higher normalized score = better) and limit
-        deduped.sort(key=lambda x: x.get("score", 0), reverse=True)
+        # Deterministic final ordering with explicit tie-breakers
+        deduped.sort(key=lambda x: self._sort_key(x, query_terms))
         return deduped[:limit]
 
     def _normalize_scores(self, results: list[dict]):
@@ -233,56 +244,165 @@ class MemoryRetriever:
                     raw = r.get("score", 0)
                     r["score"] = (raw - min_s) / (max_s - min_s)
 
-    def _apply_time_decay(self, results: list[dict]):
-        """Boost recent results: last 24h gets 1.5x, last 7d gets 1.2x."""
-        now = datetime.now(timezone.utc)
-
+    def _calibrate_scores(self, results: list[dict], query_terms: list[str]):
+        """Blend normalized source scores with bounded lexical and recency signals."""
         for r in results:
-            ts_str = r.get("timestamp")
-            if not ts_str:
-                continue
-            try:
-                ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=timezone.utc)
-                age_hours = (now - ts).total_seconds() / 3600
+            base_score = self._clamp_score(r.get("score", 0))
+            coverage = self._query_coverage(query_terms, r)
+            recency = self._recency_score(r.get("timestamp"))
+            origin = self._origin_score(r.get("origin"))
 
-                if age_hours <= 24:
-                    r["score"] = min(1.0, r.get("score", 0) * 1.5)
-                elif age_hours <= 168:  # 7 days
-                    r["score"] = min(1.0, r.get("score", 0) * 1.2)
-            except (ValueError, TypeError):
-                pass
+            calibrated = (
+                (0.62 * base_score)
+                + (0.23 * coverage)
+                + (0.10 * recency)
+                + (0.05 * origin)
+            )
+            r["score"] = round(min(1.0, calibrated), 6)
 
-    def _deduplicate_results(self, results: list[dict]) -> list[dict]:
-        """Deduplicate by ID first, then by >80% text overlap in summaries."""
-        # Phase 1: ID-based dedup
-        seen_ids = set()
-        id_deduped = []
+    def _deduplicate_results(self, results: list[dict], query_terms: list[str]) -> list[dict]:
+        """Deduplicate by canonical ID, then conservatively collapse cross-origin near-duplicates."""
+        # Phase 1: ID-based dedup, keeping the strongest representative.
+        best_by_id: dict[str, dict] = {}
         for r in results:
             key = r.get("obs_id") or r["id"]
-            if key not in seen_ids:
-                seen_ids.add(key)
-                id_deduped.append(r)
+            current = best_by_id.get(key)
+            if current is None or self._sort_key(r, query_terms) < self._sort_key(current, query_terms):
+                best_by_id[key] = r
 
-        # Phase 2: Text overlap dedup — keep higher-scored result
-        # Sort by score descending so we keep the best version
-        id_deduped.sort(key=lambda x: x.get("score", 0), reverse=True)
+        id_deduped = list(best_by_id.values())
+
+        # Phase 2: Cross-origin text dedup — keep the better-ranked version.
+        id_deduped.sort(key=lambda x: self._sort_key(x, query_terms))
         final = []
         for candidate in id_deduped:
-            c_summary = candidate.get("summary", "")
             is_dup = False
             for kept in final:
-                k_summary = kept.get("summary", "")
-                if c_summary and k_summary:
-                    ratio = SequenceMatcher(None, c_summary, k_summary).ratio()
-                    if ratio > 0.8:
-                        is_dup = True
-                        break
+                if self._is_text_duplicate(candidate, kept):
+                    is_dup = True
+                    break
             if not is_dup:
                 final.append(candidate)
 
         return final
+
+    def _query_terms(self, query: str) -> list[str]:
+        """Extract stable lowercase terms from a query."""
+        terms = []
+        seen = set()
+        for token in TOKEN_PATTERN.findall(query.lower()):
+            if token in seen:
+                continue
+            seen.add(token)
+            terms.append(token)
+        return terms
+
+    def _normalize_text(self, text: Optional[str]) -> str:
+        if not text:
+            return ""
+        return " ".join(TOKEN_PATTERN.findall(text.lower()))
+
+    def _query_coverage(self, query_terms: list[str], result: dict) -> float:
+        """Score how well the result text covers the query terms."""
+        if not query_terms:
+            return 0.0
+
+        haystack = self._normalize_text(
+            " ".join(
+                part for part in (
+                    result.get("summary"),
+                    result.get("tool"),
+                    result.get("source"),
+                )
+                if part
+            )
+        )
+
+        if not haystack:
+            return 0.0
+
+        matched = sum(1 for term in query_terms if term in haystack.split())
+        return matched / len(query_terms)
+
+    def _recency_score(self, timestamp: Optional[str]) -> float:
+        """Map timestamps into bounded, explainable recency buckets."""
+        ts = self._parse_timestamp(timestamp)
+        if ts is None:
+            return 0.0
+
+        age_hours = (datetime.now(timezone.utc) - ts).total_seconds() / 3600
+        if age_hours <= 24:
+            return 1.0
+        if age_hours <= 168:
+            return 0.6
+        if age_hours <= 720:
+            return 0.25
+        return 0.0
+
+    def _origin_score(self, origin: Optional[str]) -> float:
+        priority = ORIGIN_PRIORITY.get(origin or "", 0)
+        if priority <= 0:
+            return 0.0
+        return priority / max(ORIGIN_PRIORITY.values())
+
+    def _richness_score(self, result: dict) -> float:
+        summary_terms = self._normalize_text(result.get("summary")).split()
+        if not summary_terms:
+            return 0.0
+        return min(1.0, len(set(summary_terms)) / 12)
+
+    def _parse_timestamp(self, timestamp: Optional[str]) -> Optional[datetime]:
+        if not timestamp:
+            return None
+        try:
+            parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+
+    def _clamp_score(self, score: float) -> float:
+        return max(0.0, min(1.0, float(score)))
+
+    def _sort_key(self, result: dict, query_terms: list[str]) -> tuple:
+        ts = self._parse_timestamp(result.get("timestamp"))
+        timestamp_key = ts.timestamp() if ts is not None else float("-inf")
+        return (
+            -self._clamp_score(result.get("score", 0)),
+            -self._query_coverage(query_terms, result),
+            -self._recency_score(result.get("timestamp")),
+            -self._origin_score(result.get("origin")),
+            -self._richness_score(result),
+            -timestamp_key,
+            result.get("id", ""),
+        )
+
+    def _is_text_duplicate(self, candidate: dict, kept: dict) -> bool:
+        """Collapse near-identical cross-origin text while preserving same-origin evidence."""
+        if candidate.get("origin") == kept.get("origin"):
+            return False
+
+        candidate_summary = self._normalize_text(candidate.get("summary"))
+        kept_summary = self._normalize_text(kept.get("summary"))
+        if not candidate_summary or not kept_summary:
+            return False
+
+        ratio = SequenceMatcher(None, candidate_summary, kept_summary).ratio()
+        if ratio >= 0.88:
+            return True
+
+        shorter, longer = sorted(
+            (candidate_summary, kept_summary),
+            key=len,
+        )
+        if shorter in longer:
+            shorter_terms = shorter.split()
+            longer_terms = set(longer.split())
+            if shorter_terms and all(term in longer_terms for term in shorter_terms):
+                return True
+
+        return False
 
     def _search_observations(
         self,
