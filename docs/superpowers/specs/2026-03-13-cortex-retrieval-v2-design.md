@@ -399,6 +399,13 @@ Rules:
 
 This prevents partially embedded families from being unfairly demoted during migration.
 
+Canonical semantic rule:
+
+- if semantic retrieval is unavailable for a candidate, the semantic feature family is excluded from score normalization
+- in that case, no semantic `ScoreComponent` is emitted for that candidate
+- `semantic_used` must be `false`
+- `semantic_coverage_state` must describe why semantic scoring was excluded
+
 ## Source Adapters
 
 The public repo should provide generic adapters with well-defined interfaces. Local/private installations can extend them.
@@ -564,7 +571,7 @@ Real deployments may have incomplete embedding coverage. Retrieval v2 must suppo
 
 Rules:
 
-- if a candidate lacks a valid embedding, its semantic score component is set to `0.0`
+- if a candidate lacks a valid embedding, semantic scoring is omitted for that candidate rather than assigned a zero-valued semantic component
 - the result debug payload must include `semantic_coverage_state`
 - lexical and symbolic features must still be computed normally
 - stale embeddings must be excluded from semantic ranking until reindexed
@@ -576,6 +583,33 @@ Required debug fields:
 - `semantic_coverage_state`: `full`, `partial`, `disabled`, or `stale`
 - `embedding_version`
 - `semantic_used: bool`
+
+## Marker Normalization Contract
+
+Cross-source overlap depends on normalized markers, not raw free-text lists.
+
+### Canonical marker shapes
+
+- `entities`: normalized identifiers such as `person:jake-smith` or `project:brokerbridge`
+- `task_markers`: normalized task phrases such as `debug-auth-module`
+- `decision_markers`: normalized decision phrases such as `use-refresh-token-rotation`
+
+### Normalization rules
+
+- lowercase
+- trim whitespace
+- collapse punctuation and spacing to a canonical slug form
+- attach a namespace where possible (`person:`, `project:`, `company:`, `topic:`)
+- keep original extracted text in metadata for debugging
+
+### Overlap rules
+
+- entity overlap is exact-match on normalized identifiers
+- task overlap is exact-match first, with optional heuristic alias mapping from a shared synonym table
+- decision overlap is exact-match first, with optional heuristic alias mapping from a shared synonym table
+- routing, ranking, and neighborhood linking must all use the same normalized marker forms
+
+This contract is required so different adapters can interoperate predictably.
 
 ## Neighborhood Expansion Policy
 
