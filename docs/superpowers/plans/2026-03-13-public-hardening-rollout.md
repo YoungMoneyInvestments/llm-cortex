@@ -69,9 +69,10 @@ git -C /Users/cameronbennion/tmp-claude-cortex worktree list
 ### Task 3: Dispatch branch ownership
 
 **Files:**
-- Write: `/Users/cameronbennion/tmp-claude-cortex/.worktrees/tests-ci/RESULTS.md`
-- Write: `/Users/cameronbennion/tmp-claude-cortex/.worktrees/schema-safety/RESULTS.md`
-- Write: `/Users/cameronbennion/tmp-claude-cortex/.worktrees/retrieval-ranking/RESULTS.md`
+- Optional untracked notes:
+  - `/Users/cameronbennion/tmp-claude-cortex/.worktrees/tests-ci/RESULTS.md`
+  - `/Users/cameronbennion/tmp-claude-cortex/.worktrees/schema-safety/RESULTS.md`
+  - `/Users/cameronbennion/tmp-claude-cortex/.worktrees/retrieval-ranking/RESULTS.md`
 
 - [ ] **Step 1: Assign `tests-ci` branch scope**
 
@@ -79,6 +80,7 @@ Ownership:
 - tests package and fixtures
 - `.github/workflows/*`
 - lightweight contributor docs for test commands
+- tests should target the canonical `src/` public surface
 
 - [ ] **Step 2: Assign `schema-safety` branch scope**
 
@@ -86,6 +88,7 @@ Ownership:
 - config/env validation
 - public-safe defaults
 - docs that currently mention Cameron-local paths/services
+- canonical public-surface alignment for `src/mcp_memory_server.py` and the five `cami_*` tools
 
 - [ ] **Step 3: Assign `retrieval-ranking` branch scope**
 
@@ -93,6 +96,7 @@ Ownership:
 - `src/memory_retriever.py`
 - related benchmark scaffolding
 - retrieval-facing tests and docs
+- only minimal MCP-layer formatting/debug additions after rebasing on `schema-safety`
 
 ## Chunk 3: Branch Execution Requirements
 
@@ -108,6 +112,7 @@ Ownership:
 - [ ] **Step 3: Add minimal test harness and CI workflow**
 - [ ] **Step 4: Run the test suite locally**
 - [ ] **Step 5: Write `RESULTS.md` summarizing coverage and gaps**
+- If used, `RESULTS.md` must remain untracked.
 - [ ] **Step 6: Commit with a focused message**
 
 ### Task 5: `schema-safety` branch
@@ -126,6 +131,7 @@ Ownership:
 - [ ] **Step 4: Rewrite docs to use generic public-safe environment guidance**
 - [ ] **Step 5: Run targeted tests and text scans for private references**
 - [ ] **Step 6: Write `RESULTS.md` and commit**
+- If used, `RESULTS.md` must remain untracked.
 
 ### Task 6: `retrieval-ranking` branch
 
@@ -140,6 +146,7 @@ Ownership:
 - [ ] **Step 3: Add benchmark scaffolding and fixture format for future retrieval evaluation**
 - [ ] **Step 4: Run targeted retrieval tests locally**
 - [ ] **Step 5: Write `RESULTS.md` and commit**
+- If used, `RESULTS.md` must remain untracked.
 
 ## Chunk 4: Integration and Safety Verification
 
@@ -179,6 +186,10 @@ Expected:
 
 - [ ] **Step 1: Summarize each PR**
 - [ ] **Step 2: Confirm merge order**
+- Merge order:
+  1. `schema-safety`
+  2. `tests-ci`
+  3. `retrieval-ranking`
 - [ ] **Step 3: Push branches and open PRs only after private-reference scan is clean**
 
 Plan complete and saved to `docs/superpowers/plans/2026-03-13-public-hardening-rollout.md`. Ready to execute?
