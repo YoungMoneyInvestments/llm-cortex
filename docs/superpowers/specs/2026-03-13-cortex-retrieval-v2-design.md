@@ -294,6 +294,11 @@ class MemoryObject:
     abstract: str
     overview_layer: ContentLayer
     detail_layer: ContentLayer
+    abstract_version: str | None
+    overview_version: str | None
+    generation_method: Literal["deterministic", "model"] | None
+    generation_model: str | None
+    generated_at: str | None
     overview_freshness: Literal["fresh", "stale", "missing"]
     detail_freshness: Literal["fresh", "stale", "missing"]
     embedding_freshness: Literal["fresh", "stale", "missing", "disabled"]
@@ -442,10 +447,11 @@ Allowed `content_ref` formats:
 - `note://<object_id>/<layer>`
 - `msg://<object_id>/<layer>`
 - `kg://<object_id>/<layer>`
+- `compat://<object_id>/<layer>`
 
 Formal grammar:
 
-- regex: `^(obs|wm|handoff|session|note|msg|kg)://([a-z0-9._:-]+)/((overview|detail))$`
+- regex: `^(obs|wm|handoff|session|note|msg|kg|compat)://([a-z0-9._:-]+)/((overview|detail))$`
 - scheme and layer tokens must be lowercase
 - `object_id` may contain only `a-z`, `0-9`, `.`, `_`, `:`, and `-`
 - `/` is not allowed inside `object_id`
@@ -541,6 +547,22 @@ class NormalizedCandidate:
     score_components: list["ScoreComponent"]
     metadata: dict[str, Any]
 ```
+
+Timestamp contract:
+
+- `timestamp` should represent source event time when the family has a meaningful event timestamp
+- if event time is unavailable, use the best immutable creation timestamp for that family
+- only if neither exists may the adapter fall back to update time, and that fallback must be recorded in debug metadata
+
+Per-family timestamp source:
+
+- observations: observation event timestamp
+- working memory: entry creation timestamp
+- handoffs: handoff creation timestamp
+- session summaries: session end timestamp
+- notes: note creation timestamp if available, otherwise first-seen timestamp
+- messages: message sent/received timestamp
+- knowledge graph: entity creation or first-seen timestamp; update time only as explicit fallback
 
 ### ScoreComponent
 
