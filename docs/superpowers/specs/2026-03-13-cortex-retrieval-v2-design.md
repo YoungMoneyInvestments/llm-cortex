@@ -189,6 +189,12 @@ Source authority contract:
 - ranking uses this same ordered mapping for the source-authority feature and for deterministic final tie-breaks
 - the mapping is invariant by default, not query-intent-specific
 
+Versioned config contract:
+
+- `RankerConfig` is the single source of truth for feature weights, source authority, diversity bonus, duplicate penalties, and final tie-break settings
+- `ExpansionConfig` is the single source of truth for semantic thresholds, neighbor thresholds, chronology balancing, and expansion budgets
+- every `query_execution_id` must log the `RankerConfig` and `ExpansionConfig` versions used for that run
+
 The ranker produces:
 
 - final score
@@ -546,6 +552,14 @@ Requirements:
 
 ```python
 @dataclass
+class CandidateState:
+    visibility: Literal["active", "tombstoned"]
+    overview_freshness: Literal["fresh", "stale", "missing"]
+    detail_freshness: Literal["fresh", "stale", "missing"]
+    embedding_freshness: Literal["fresh", "stale", "missing", "disabled"]
+    link_freshness: Literal["fresh", "stale", "missing"]
+
+@dataclass
 class NormalizedCandidate:
     object_id: str
     source_family: str
@@ -553,6 +567,7 @@ class NormalizedCandidate:
     timestamp: str | None
     source_ref: str | None
     authoritative_content_hash: str | None
+    state: CandidateState
     entities: list[str]
     task_markers: list[str]
     decision_markers: list[str]
@@ -581,6 +596,8 @@ Per-family timestamp source:
 - notes: note creation timestamp if available, otherwise first-seen timestamp
 - messages: message sent/received timestamp
 - knowledge graph: entity creation or first-seen timestamp; update time only as explicit fallback
+
+Ranker and query logic must use `NormalizedCandidate.state` directly rather than hidden store lookups.
 
 ### ScoreComponent
 
@@ -880,6 +897,14 @@ Each result must include:
 - the seed row must set `is_seed=true`, `link_type="seed"`, `link_strength=0.0`, and `support_count=1`
 - when timestamps are missing, place those rows after timestamped rows using lexical `object_id` tie-breaks
 - chronology mode should prefer the nearest before/after neighbors around the seed within the requested `limit`
+
+`memory_neighbors` behavior table:
+
+- malformed request or unsupported `mode`: typed MCP error with `Error.scope="request"`
+- nonexistent or untranslatable seed `object_id`: typed MCP error with `Error.scope="object"`
+- tombstoned seed object: successful response with warnings; seed may be returned but tombstoned neighbors remain excluded by default
+- unknown `link_types` filter values: structured warning and those filter values are ignored
+- `link_types` filtering applies before final neighbor ranking and before displayed `link_type` collapse
 
 `memory_feedback` request:
 
