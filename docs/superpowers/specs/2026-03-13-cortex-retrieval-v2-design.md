@@ -285,8 +285,32 @@ Allowed `content_ref` formats:
 Resolver rules:
 
 - each source family must register a resolver for its own `content_ref` namespace
-- resolvers must return a `ContentLayer`-compatible payload or a typed not-found/stale result
+- resolvers must return a `ResolvedLayerResult`
 - `memory_open` must use the registered resolver rather than source-specific branching in the MCP layer
+
+Resolver return contract:
+
+```python
+@dataclass
+class ResolvedLayerResult:
+    status: Literal["success", "absent", "stale", "not_found"]
+    payload: ContentLayer
+    resolved_text: str | None
+    warnings: list[str]
+```
+
+Resolver invariants:
+
+- on `success`, `payload.mode` must be `inline`, `payload.text` must be populated, and `resolved_text` must equal `payload.text`
+- on `absent`, `payload.mode` must be `absent`, `payload.text` must be `None`, and `resolved_text` must be `None`
+- on `stale`, `payload.mode` may remain `ref` or be `absent`, `resolved_text` must be `None`, and `warnings` must explain staleness
+- on `not_found`, `payload.mode` must be `ref` or `absent`, `resolved_text` must be `None`, and `warnings` must explain the missing target
+
+`memory_open` invariant:
+
+- `OpenLayerResult.payload` is always the post-resolution payload, never the original unresolved ref shell
+- `OpenLayerResult.resolved_text` is populated only when the resolved payload is inline text
+- ref-backed success therefore resolves to an inline payload in the response
 
 Indexing and ranking rules for ref-backed `overview_layer`:
 
@@ -369,8 +393,10 @@ Requirements:
 class NeighborPreview:
     object_id: str
     abstract: str
-    link_type: str
-    strength: float
+    global_score: float
+    seed_link_type: str
+    seed_link_strength: float
+    support_count: int
 ```
 
 ### OpenLayerResult
@@ -695,7 +721,24 @@ When multiple seed results nominate overlapping neighbors:
 - attach the neighbor to every nominating seed in metadata, but only materialize it once in the global expanded set
 - semantic neighbors participate in the same arbitration rules as other inferred links and are excluded entirely when semantic coverage is unavailable
 
-`neighbor_previews` in `memory_query` responses is an ordered per-seed list derived from the globally deduped expanded set. It must be ordered by global neighbor score descending, capped at the per-seed expansion limit, and returned as an empty list when `expand_neighbors=false`. This keeps previews stable across runs and avoids duplicate context.
+`neighbor_previews` in `memory_query` responses is an ordered per-seed list derived from the globally deduped expanded set. It must be ordered by `global_score` descending, capped at the per-seed expansion limit, and returned as an empty list when `expand_neighbors=false`.
+
+Field semantics:
+
+- `global_score` is the globally arbitrated neighbor score after dedupe and multi-seed bonuses
+- `seed_link_type` is the highest-priority link type connecting the current seed to that neighbor
+- `seed_link_strength` is the seed-local link strength for the displayed `seed_link_type`
+- `support_count` is the number of seed results that nominated the neighbor
+
+If multiple seed-local link types exist for the same neighbor, choose the displayed `seed_link_type` by deterministic priority:
+
+1. deterministic non-time link types
+2. `semantic_neighbor`
+3. `time_adjacent`
+
+Break ties by stronger seed-local link strength, then lexical link-type name.
+
+This keeps previews stable across runs and avoids duplicate context.
 
 ## Migration Plan
 
