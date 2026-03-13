@@ -595,6 +595,7 @@ class QueryResult:
 class NeighborResult:
     object_id: str
     abstract: str
+    is_seed: bool
     timestamp: str | None
     global_score: float
     link_type: str
@@ -650,9 +651,10 @@ Canonical warnings location:
 
 `memory_open(detail)` payload contract:
 
-- native v2 callers may receive truncated detail
-- default maximum inline detail payload for native v2 callers: 64 KB of UTF-8 text
-- if detail exceeds that limit for a native v2 caller, return the first chunk inline and emit a warning indicating truncation
+- native v2 callers may receive chunked detail
+- default inline detail chunk limit for native v2 callers: 64 KB of UTF-8 text
+- `offset` and `limit_bytes` control which detail chunk is returned
+- if more detail remains after the returned chunk, emit a truncation warning and expose `next_cursor`
 - compatibility-backed `cami_memory_details` calls must retrieve full detail for migrated families, even if that requires internal pagination or multiple fetches behind the compatibility adapter
 - the response must set `payload.token_estimate` for the returned chunk or full body
 
@@ -796,6 +798,8 @@ Each result must include:
 
 - `object_id: str` required
 - `layer: Literal["abstract", "overview", "detail"]` required
+- `offset: int` optional, default 0, only for `layer="detail"`
+- `limit_bytes: int` optional, default 65536, only for `layer="detail"`
 
 `memory_open` response:
 
@@ -822,6 +826,8 @@ Each result must include:
 - ties break by stronger link strength, then newer timestamp if available, then lexical object ID
 - returned neighbors include `abstract` always and `overview_layer` only if a future request flag explicitly asks for it; initial v2 should default `overview_layer` to `None`
 - `mode="chronology"` must include the seed object in the returned sequence
+- in `mode="chronology"`, `limit` includes the seed row
+- the seed row must set `is_seed=true`, `link_type="seed"`, `link_strength=0.0`, and `support_count=1`
 
 `memory_feedback` request:
 
