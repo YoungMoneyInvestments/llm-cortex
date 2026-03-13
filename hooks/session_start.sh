@@ -6,7 +6,7 @@
 #
 # Configure:
 #   CORTEX_WORKSPACE   — Project root (default: ~/cortex)
-#   CORTEX_WORKER_PORT — Worker port (default: 7778)
+#   CORTEX_WORKER_PORT — Worker port (default: 37778)
 #   CORTEX_PYTHON      — Python interpreter (default: python3)
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

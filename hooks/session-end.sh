@@ -5,8 +5,9 @@
 # Claude Code pipes JSON to stdin with session_id.
 # Tells the worker to finalize the session and queue summarization.
 
-WORKER_URL="http://127.0.0.1:37778"
-AUTH_KEY="${CORTEX_WORKER_API_KEY:-cortex-local-2026}"
+WORKER_PORT="${CORTEX_WORKER_PORT:-37778}"
+WORKER_URL="http://127.0.0.1:$WORKER_PORT"
+AUTH_KEY="${CORTEX_WORKER_API_KEY:-}"
 
 # Read stdin (Claude Code sends JSON)
 INPUT_JSON=$(cat)
@@ -17,6 +18,12 @@ if ! curl -s --connect-timeout 1 "$WORKER_URL/api/health" > /dev/null 2>&1; then
 fi
 
 SESSION_ID=$(echo "$INPUT_JSON" | jq -r '.session_id // empty' 2>/dev/null)
+
+if [ -z "$AUTH_KEY" ]; then
+    echo "Warning: CORTEX_WORKER_API_KEY is not set; skipping Cortex session finalization." >&2
+    exit 0
+fi
+
 SID="${SESSION_ID:-$(date +%Y%m%d-%H%M%S)}"
 
 # End session

@@ -6,10 +6,12 @@
 # Sends observation to the background worker via HTTP (fire-and-forget).
 #
 # Configure:
-#   CORTEX_WORKER_PORT — Worker port (default: 7778)
+#   CORTEX_WORKER_PORT — Worker port (default: 37778)
+#   CORTEX_WORKER_API_KEY — Required bearer token for POST endpoints
 
-WORKER_PORT="${CORTEX_WORKER_PORT:-7778}"
+WORKER_PORT="${CORTEX_WORKER_PORT:-37778}"
 WORKER_URL="http://127.0.0.1:$WORKER_PORT"
+AUTH_KEY="${CORTEX_WORKER_API_KEY:-}"
 
 # Read stdin (Claude Code sends JSON)
 INPUT_JSON=$(cat)
@@ -28,6 +30,11 @@ if [ -z "$TOOL_NAME" ]; then
     exit 0
 fi
 
+if [ -z "$AUTH_KEY" ]; then
+    echo "Warning: CORTEX_WORKER_API_KEY is not set; skipping Cortex observation capture." >&2
+    exit 0
+fi
+
 SID="${SESSION_ID:-$(date +%Y%m%d-%H%M%S)}"
 
 # Extract and truncate input/output
@@ -38,6 +45,7 @@ TOOL_OUTPUT=$(echo "$INPUT_JSON" | jq -r '.tool_output // empty' 2>/dev/null | h
 curl -s --max-time 2 \
     -X POST "$WORKER_URL/api/observations" \
     -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $AUTH_KEY" \
     -d "$(jq -n \
         --arg sid "$SID" \
         --arg tool "$TOOL_NAME" \

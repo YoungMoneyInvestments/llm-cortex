@@ -6,10 +6,12 @@
 # Registers the session (if new) and logs the user's prompt.
 #
 # Configure:
-#   CORTEX_WORKER_PORT — Worker port (default: 7778)
+#   CORTEX_WORKER_PORT — Worker port (default: 37778)
+#   CORTEX_WORKER_API_KEY — Required bearer token for POST endpoints
 
-WORKER_PORT="${CORTEX_WORKER_PORT:-7778}"
+WORKER_PORT="${CORTEX_WORKER_PORT:-37778}"
 WORKER_URL="http://127.0.0.1:$WORKER_PORT"
+AUTH_KEY="${CORTEX_WORKER_API_KEY:-}"
 
 # Read stdin (Claude Code sends JSON)
 INPUT_JSON=$(cat)
@@ -24,12 +26,19 @@ fi
 PROMPT=$(echo "$INPUT_JSON" | jq -r '.prompt // empty' 2>/dev/null)
 SESSION_ID=$(echo "$INPUT_JSON" | jq -r '.session_id // empty' 2>/dev/null)
 
+if [ -z "$AUTH_KEY" ]; then
+    echo "Warning: CORTEX_WORKER_API_KEY is not set; skipping Cortex session capture." >&2
+    echo "Success"
+    exit 0
+fi
+
 SID="${SESSION_ID:-$(date +%Y%m%d-%H%M%S)}"
 
 # Register/update session with user prompt
 curl -s --max-time 2 \
     -X POST "$WORKER_URL/api/sessions/start" \
     -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $AUTH_KEY" \
     -d "$(jq -n \
         --arg sid "$SID" \
         --arg prompt "$PROMPT" \
@@ -45,6 +54,7 @@ if [ -n "$PROMPT" ]; then
     curl -s --max-time 2 \
         -X POST "$WORKER_URL/api/observations" \
         -H "Content-Type: application/json" \
+        -H "Authorization: Bearer $AUTH_KEY" \
         -d "$(jq -n \
             --arg sid "$SID" \
             --arg prompt "$PROMPT" \

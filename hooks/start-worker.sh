@@ -4,7 +4,9 @@
 # Called on SessionStart. Delegates to the main worker launcher script.
 # Uses port 37778 to avoid conflict with claude-mem (37777).
 
-WORKER_SCRIPT="${CORTEX_HOME:-$HOME/clawd}/scripts/start_worker.sh"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CORTEX_ROOT="$(dirname "$SCRIPT_DIR")"
+WORKER_SCRIPT="${CORTEX_WORKER_SCRIPT:-$CORTEX_ROOT/scripts/start_worker.sh}"
 
 if [ -x "$WORKER_SCRIPT" ]; then
     "$WORKER_SCRIPT" start 2>/dev/null

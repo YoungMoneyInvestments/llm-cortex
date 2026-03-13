@@ -3,7 +3,7 @@
 Knowledge Graph Layer - Explicit Relationship Tracking
 
 Converts implicit relationships buried in prose into first-class entities.
-Persists to SQLite (~/clawd/data/cortex-knowledge-graph.db) with NetworkX
+Persists to SQLite (by default under ~/.cortex/data) with NetworkX
 MultiDiGraph for fast in-memory traversal.
 
 Examples:
@@ -21,6 +21,7 @@ Examples:
 
 import json
 import logging
+import os
 import re
 import sqlite3
 import sys
@@ -34,7 +35,7 @@ import networkx as nx
 
 # ── Config ──────────────────────────────────────────────────────────────────
 
-DATA_DIR = Path.home() / "clawd" / "data"
+DATA_DIR = Path(os.environ.get("CORTEX_DATA_DIR", str(Path.home() / ".cortex" / "data"))).expanduser()
 DB_PATH = DATA_DIR / "cortex-knowledge-graph.db"
 
 # ── Logging ─────────────────────────────────────────────────────────────────

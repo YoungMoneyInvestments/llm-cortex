@@ -27,6 +27,9 @@ Usage:
 import json
 import sys
 from pathlib import Path
+from typing import Optional
+
+from pydantic import BaseModel, ValidationError, field_validator, model_validator
 
 # Add scripts dir to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
@@ -193,11 +196,122 @@ TOOLS = [
 ]
 
 
+class SearchArguments(BaseModel):
+    query: str
+    limit: int = 15
+    source: Optional[str] = None
+    agent: Optional[str] = None
+
+    @field_validator("query")
+    @classmethod
+    def _validate_query(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("query must not be blank")
+        return value
+
+    @field_validator("limit")
+    @classmethod
+    def _validate_limit(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("limit must be >= 1")
+        return value
+
+
+class TimelineArguments(BaseModel):
+    observation_id: int
+    window: int = 5
+
+    @field_validator("observation_id")
+    @classmethod
+    def _validate_observation_id(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("observation_id must be >= 1")
+        return value
+
+    @field_validator("window")
+    @classmethod
+    def _validate_window(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("window must be >= 0")
+        return value
+
+
+class DetailsArguments(BaseModel):
+    observation_ids: list[int]
+
+    @field_validator("observation_ids")
+    @classmethod
+    def _validate_observation_ids(cls, value: list[int]) -> list[int]:
+        if not value:
+            raise ValueError("observation_ids must not be empty")
+        if any(item < 1 for item in value):
+            raise ValueError("observation_ids must only contain positive integers")
+        return value
+
+
+class SaveArguments(BaseModel):
+    content: str
+    tags: Optional[str] = None
+
+    @field_validator("content")
+    @classmethod
+    def _validate_content(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("content must not be blank")
+        return value
+
+
+class GraphSearchArguments(SearchArguments):
+    graph_depth: int = 1
+
+    @field_validator("graph_depth")
+    @classmethod
+    def _validate_graph_depth(cls, value: int) -> int:
+        if value not in (1, 2):
+            raise ValueError("graph_depth must be 1 or 2")
+        return value
+
+
+TOOL_ARGUMENT_MODELS = {
+    "cami_memory_search": SearchArguments,
+    "cami_memory_timeline": TimelineArguments,
+    "cami_memory_details": DetailsArguments,
+    "cami_memory_save": SaveArguments,
+    "cami_memory_graph_search": GraphSearchArguments,
+}
+
+
+def _format_validation_error(tool_name: str, error: ValidationError) -> str:
+    parts = []
+    for item in error.errors():
+        field = ".".join(str(part) for part in item["loc"]) or "arguments"
+        parts.append(f"{field}: {item['msg']}")
+    return f"Invalid arguments for {tool_name}: " + "; ".join(parts)
+
+
+def _validate_tool_arguments(name: str, arguments: dict) -> dict:
+    model = TOOL_ARGUMENT_MODELS.get(name)
+    if model is None:
+        return arguments
+    validated = model.model_validate(arguments)
+    return validated.model_dump(exclude_none=True)
+
+
 # ── Tool handlers ───────────────────────────────────────────────────────────
 
 
 def handle_tool_call(name: str, arguments: dict) -> dict:
     """Handle a tool call and return the result."""
+    try:
+        arguments = _validate_tool_arguments(name, arguments)
+    except ValidationError as error:
+        return {
+            "content": [{"type": "text", "text": _format_validation_error(name, error)}],
+            "isError": True,
+        }
+
     retriever = MemoryRetriever()
 
     try:
@@ -299,6 +413,11 @@ def handle_tool_call(name: str, arguments: dict) -> dict:
                 "isError": True,
             }
 
+    except ValidationError as e:
+        return {
+            "content": [{"type": "text", "text": _format_validation_error(name, e)}],
+            "isError": True,
+        }
     except Exception as e:
         return {
             "content": [{"type": "text", "text": f"Error: {str(e)}"}],

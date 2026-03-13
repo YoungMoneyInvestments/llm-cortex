@@ -32,21 +32,57 @@ from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Literal, Optional, Set, Tuple
 
 import httpx
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 import uvicorn
 
 # ── Config ──────────────────────────────────────────────────────────────────
 
-WORKER_PORT = 37778
-DATA_DIR = Path.home() / "clawd" / "data"
+def _optional_env(name: str) -> Optional[str]:
+    value = os.environ.get(name, "").strip()
+    return value or None
+
+
+def _path_from_env(name: str, default: Optional[Path]) -> Optional[Path]:
+    value = _optional_env(name)
+    if value:
+        return Path(value).expanduser()
+    return default
+
+
+def _int_from_env(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer, got {raw!r}") from exc
+
+
+def _default_cortex_home() -> Path:
+    return Path.home() / ".cortex"
+
+
+def _derive_camirouter_models_url(chat_url: Optional[str]) -> Optional[str]:
+    if not chat_url:
+        return None
+    stripped = chat_url.rstrip("/")
+    suffix = "/chat/completions"
+    if stripped.endswith(suffix):
+        return stripped[: -len(suffix)] + "/models"
+    return stripped + "/models"
+
+
+WORKER_PORT = _int_from_env("CORTEX_WORKER_PORT", 37778)
+DATA_DIR = _path_from_env("CORTEX_DATA_DIR", _default_cortex_home() / "data")
 DB_PATH = DATA_DIR / "cortex-observations.db"
-PID_FILE = Path.home() / ".openclaw" / "worker.pid"
-LOG_DIR = Path.home() / ".openclaw" / "logs"
+PID_FILE = _path_from_env("CORTEX_PID_FILE", _default_cortex_home() / "worker.pid")
+LOG_DIR = _path_from_env("CORTEX_LOG_DIR", _default_cortex_home() / "logs")
 LOG_FILE = LOG_DIR / "memory-worker.log"
 
 # How often to process pending observations (seconds)
@@ -65,7 +101,7 @@ HIGH_SIGNAL_TOOLS = frozenset({
 })
 
 # ── API Authentication config ──────────────────────────────────────────
-CORTEX_API_KEY = os.environ.get("CORTEX_WORKER_API_KEY", "cortex-local-2026")
+CORTEX_API_KEY = _optional_env("CORTEX_WORKER_API_KEY")
 
 # ── Rate limiting config ───────────────────────────────────────────────
 RATE_LIMIT_MAX = 100           # max observations per minute per session_id
@@ -80,15 +116,16 @@ AI_FAILURE_ALERT_THRESHOLD = 3   # consecutive failures before alerting
 AI_BACKOFF_BASE = 30             # base backoff seconds after rate limit
 AI_BACKOFF_MAX = 600             # max backoff seconds (10 minutes)
 AI_RECOVERY_PROBE_INTERVAL = 120 # seconds between health probes when degraded
-AUTH_PROFILES_PATH = Path.home() / ".openclaw" / "agents" / "main" / "agent" / "auth-profiles.json"
+AUTH_PROFILES_PATH = _path_from_env("CORTEX_AUTH_PROFILES_PATH", None)
 
 # ── NER (Named Entity Recognition) config ────────────────────────────────
 NER_ENABLED = os.environ.get("CORTEX_NER_ENABLED", "true").lower() == "true"
 
 # ── CamiRouter config (preferred path — avoids OAuth rate limit contention) ──
-CAMIROUTER_URL = "http://localhost:8317/v1/chat/completions"
-CAMIROUTER_API_KEY = os.environ.get("CAMIROUTER_API_KEY", "change-me")
-CAMIROUTER_MODEL = "sonnet"  # CamiRouter alias for claude-sonnet-4-6
+CAMIROUTER_URL = _optional_env("CAMIROUTER_URL")
+CAMIROUTER_MODELS_URL = _derive_camirouter_models_url(CAMIROUTER_URL)
+CAMIROUTER_API_KEY = _optional_env("CAMIROUTER_API_KEY")
+CAMIROUTER_MODEL = os.environ.get("CAMIROUTER_MODEL", "sonnet")
 
 # ── Logging ─────────────────────────────────────────────────────────────────
 
@@ -195,6 +232,14 @@ async def require_auth(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer_scheme),
 ):
     """Dependency that enforces bearer token auth on POST endpoints."""
+    if not CORTEX_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "CORTEX_WORKER_API_KEY is not configured. Set the same bearer token "
+                "in the worker and hook environments before using POST endpoints."
+            ),
+        )
     if credentials is None or credentials.credentials != CORTEX_API_KEY:
         raise HTTPException(
             status_code=401,
@@ -242,7 +287,7 @@ def _check_rate_limit(session_id: str) -> bool:
 class ObservationRequest(BaseModel):
     """Observation from a hook."""
     session_id: str
-    source: str  # 'post_tool_use', 'user_prompt', 'session_end'
+    source: Literal["post_tool_use", "user_prompt", "session_end"]
     tool_name: Optional[str] = None
     agent: str = "main"
     raw_input: Optional[str] = None
@@ -251,6 +296,28 @@ class ObservationRequest(BaseModel):
     # Truncation limits to avoid bloating the DB
     MAX_INPUT_LEN: int = Field(default=4000, exclude=True)
     MAX_OUTPUT_LEN: int = Field(default=8000, exclude=True)
+
+    @field_validator("session_id", "agent")
+    @classmethod
+    def _validate_nonempty_fields(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("must not be blank")
+        return value
+
+    @field_validator("tool_name")
+    @classmethod
+    def _normalize_tool_name(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
+
+    @model_validator(mode="after")
+    def _validate_tool_name_for_source(self):
+        if self.source == "post_tool_use" and not self.tool_name:
+            raise ValueError("tool_name is required when source='post_tool_use'")
+        return self
 
     def truncated_input(self) -> Optional[str]:
         if self.raw_input and len(self.raw_input) > self.MAX_INPUT_LEN:
@@ -269,10 +336,26 @@ class SessionStartRequest(BaseModel):
     agent: str = "main"
     user_prompt: Optional[str] = None
 
+    @field_validator("session_id", "agent")
+    @classmethod
+    def _validate_nonempty_fields(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("must not be blank")
+        return value
+
 
 class SessionEndRequest(BaseModel):
     """End a session and trigger summarization."""
     session_id: str
+
+    @field_validator("session_id")
+    @classmethod
+    def _validate_session_id(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("must not be blank")
+        return value
 
 
 class HealthResponse(BaseModel):
@@ -281,6 +364,25 @@ class HealthResponse(BaseModel):
     pending_observations: int
     total_observations: int
     active_sessions: int
+    configuration_issues: List[str] = Field(default_factory=list)
+
+
+def get_configuration_issues() -> list[str]:
+    """Return required configuration issues that affect the public worker surface."""
+    issues: list[str] = []
+    if not CORTEX_API_KEY:
+        issues.append(
+            "CORTEX_WORKER_API_KEY is not configured, so authenticated POST endpoints are unavailable."
+        )
+    if CAMIROUTER_URL and not CAMIROUTER_API_KEY:
+        issues.append(
+            "CAMIROUTER_URL is set without CAMIROUTER_API_KEY; router compression is disabled."
+        )
+    if CAMIROUTER_API_KEY and not CAMIROUTER_URL:
+        issues.append(
+            "CAMIROUTER_API_KEY is set without CAMIROUTER_URL; router compression is disabled."
+        )
+    return issues
 
 
 # ── Background processor ───────────────────────────────────────────────────
@@ -453,9 +555,9 @@ def _generate_summary_rule_based(
 class AICompressor:
     """AI-powered observation compression with dual-path routing.
 
-    Primary path: CamiRouter (localhost:8317) — OpenAI-compatible endpoint
-    that routes through Cursor subscription. Avoids OAuth rate limit
-    contention with Claude Code sessions.
+    Primary path: an OpenAI-compatible router configured through
+    CORTEX_ROUTER_URL / CAMIROUTER_URL so deployments can pick their own
+    endpoint and credentials without changing code.
 
     Fallback path: Direct Anthropic OAuth — used if CamiRouter is down.
     """
@@ -575,6 +677,8 @@ class AICompressor:
     async def _ensure_router_client(self) -> bool:
         """Set up or verify CamiRouter client."""
         try:
+            if not CAMIROUTER_URL or not CAMIROUTER_API_KEY:
+                return False
             if self._router_client is None:
                 self._router_client = httpx.AsyncClient(
                     headers={
@@ -586,7 +690,7 @@ class AICompressor:
             # Quick health check if we haven't confirmed availability
             if not self._router_available:
                 resp = await self._router_client.get(
-                    "http://localhost:8317/v1/models",
+                    CAMIROUTER_MODELS_URL,
                     timeout=3.0,
                 )
                 self._router_available = resp.status_code == 200
@@ -598,6 +702,12 @@ class AICompressor:
     async def _ensure_client(self) -> bool:
         """Load or refresh the OAuth token from auth-profiles (fallback path)."""
         try:
+            if AUTH_PROFILES_PATH is None:
+                logger.debug(
+                    "OAuth fallback disabled because CORTEX_AUTH_PROFILES_PATH is not configured"
+                )
+                return False
+
             if not AUTH_PROFILES_PATH.exists():
                 logger.warning(f"Auth profiles not found: {AUTH_PROFILES_PATH}")
                 return False
@@ -1663,11 +1773,12 @@ async def health():
         proc_status = "dead"
 
     return HealthResponse(
-        status="healthy" if proc_status == "running" else "degraded",
+        status="healthy" if proc_status == "running" and not get_configuration_issues() else "degraded",
         uptime_seconds=round(time.time() - start_time, 1),
         pending_observations=pending,
         total_observations=total,
         active_sessions=active,
+        configuration_issues=get_configuration_issues(),
     )
 
 

@@ -43,7 +43,17 @@ logger = logging.getLogger("cortex-vectors")
 
 # -- Config ------------------------------------------------------------------
 
-DATA_DIR = Path.home() / "clawd" / "data"
+def _optional_env(name: str) -> Optional[str]:
+    value = os.environ.get(name, "").strip()
+    return value or None
+
+
+def _path_from_env(name: str, default: Path) -> Path:
+    value = _optional_env(name)
+    return Path(value).expanduser() if value else default
+
+
+DATA_DIR = _path_from_env("CORTEX_DATA_DIR", Path.home() / ".cortex" / "data")
 DB_PATH = DATA_DIR / "cortex-vectors.db"
 
 EMBEDDING_PROVIDER = os.environ.get("CORTEX_EMBEDDING_PROVIDER", "local")
@@ -82,15 +92,27 @@ def get_vector_store(db_path: Optional[Path] = None) -> "UnifiedVectorStore":
 
 
 def _load_openai_key() -> Optional[str]:
-    """Load OpenAI API key from env or .env.local file."""
-    key = os.environ.get("OPENAI_API_KEY")
+    """Load OpenAI API key from env or an optional env file."""
+    key = _optional_env("OPENAI_API_KEY")
     if key:
         return key
-    env_file = Path.home() / "clawd" / ".env.local"
-    if env_file.exists():
-        for line in env_file.read_text().splitlines():
-            if line.startswith("export OPENAI_API_KEY="):
-                return line.split("=", 1)[1].strip('"').strip("'")
+
+    env_file_value = _optional_env("CORTEX_ENV_FILE")
+    if not env_file_value:
+        return None
+
+    env_file = Path(env_file_value).expanduser()
+    if not env_file.exists():
+        return None
+
+    for line in env_file.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("export "):
+            stripped = stripped[len("export ") :]
+        if stripped.startswith("OPENAI_API_KEY="):
+            return stripped.split("=", 1)[1].strip().strip('"').strip("'")
     return None
 
 
@@ -339,7 +361,7 @@ class UnifiedVectorStore:
             if not key:
                 raise RuntimeError(
                     "OPENAI_API_KEY not set. OpenAI embeddings require an API key. "
-                    "Set it in env or ~/clawd/.env.local"
+                    "Set OPENAI_API_KEY directly or point CORTEX_ENV_FILE at a file containing it."
                 )
             from openai import OpenAI
             self._openai_client = OpenAI(api_key=key)

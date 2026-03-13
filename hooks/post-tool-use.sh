@@ -5,8 +5,9 @@
 # Claude Code pipes JSON to stdin with tool_name, tool_input, tool_output, session_id.
 # Sends observation to the background worker via HTTP (fire-and-forget).
 
-WORKER_URL="http://127.0.0.1:37778"
-AUTH_KEY="${CORTEX_WORKER_API_KEY:-cortex-local-2026}"
+WORKER_PORT="${CORTEX_WORKER_PORT:-37778}"
+WORKER_URL="http://127.0.0.1:$WORKER_PORT"
+AUTH_KEY="${CORTEX_WORKER_API_KEY:-}"
 
 # Read stdin (Claude Code sends JSON)
 INPUT_JSON=$(cat)
@@ -22,6 +23,11 @@ SESSION_ID=$(echo "$INPUT_JSON" | jq -r '.session_id // empty' 2>/dev/null)
 
 # Skip if no tool name (nothing useful to capture)
 if [ -z "$TOOL_NAME" ]; then
+    exit 0
+fi
+
+if [ -z "$AUTH_KEY" ]; then
+    echo "Warning: CORTEX_WORKER_API_KEY is not set; skipping Cortex observation capture." >&2
     exit 0
 fi
 

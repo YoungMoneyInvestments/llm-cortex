@@ -5,8 +5,9 @@
 # Claude Code pipes JSON to stdin with prompt and session_id.
 # Registers the session (if new) and logs the user's prompt.
 
-WORKER_URL="http://127.0.0.1:37778"
-AUTH_KEY="${CORTEX_WORKER_API_KEY:-cortex-local-2026}"
+WORKER_PORT="${CORTEX_WORKER_PORT:-37778}"
+WORKER_URL="http://127.0.0.1:$WORKER_PORT"
+AUTH_KEY="${CORTEX_WORKER_API_KEY:-}"
 
 # Read stdin (Claude Code sends JSON)
 INPUT_JSON=$(cat)
@@ -20,6 +21,12 @@ fi
 # Extract fields from stdin JSON
 PROMPT=$(echo "$INPUT_JSON" | jq -r '.prompt // empty' 2>/dev/null)
 SESSION_ID=$(echo "$INPUT_JSON" | jq -r '.session_id // empty' 2>/dev/null)
+
+if [ -z "$AUTH_KEY" ]; then
+    echo "Warning: CORTEX_WORKER_API_KEY is not set; skipping Cortex session capture." >&2
+    echo "Success"
+    exit 0
+fi
 
 SID="${SESSION_ID:-$(date +%Y%m%d-%H%M%S)}"
 
