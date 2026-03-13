@@ -282,6 +282,15 @@ Allowed `content_ref` formats:
 - `msg://<object_id>/<layer>`
 - `kg://<object_id>/<layer>`
 
+Formal grammar:
+
+- regex: `^(obs|wm|handoff|session|note|msg|kg)://([a-z0-9._:-]+)/((overview|detail))$`
+- scheme and layer tokens must be lowercase
+- `object_id` may contain only `a-z`, `0-9`, `.`, `_`, `:`, and `-`
+- `/` is not allowed inside `object_id`
+- malformed refs must raise `invalid_ref`, not `not_found`
+- well-formed refs with missing targets must resolve to `not_found`
+
 Resolver rules:
 
 - each source family must register a resolver for its own `content_ref` namespace
@@ -409,7 +418,7 @@ class OpenLayerResult:
     status: Literal["success", "absent", "stale", "not_found"]
     payload: ContentLayer
     resolved_text: str | None
-    warnings: list[str]
+    warnings: list["Warning"]
 
 @dataclass
 class QueryResult:
@@ -421,6 +430,7 @@ class QueryResult:
     score_components: list["ScoreComponent"]
     overview_layer: ContentLayer | None
     neighbor_previews: list[NeighborPreview]
+    warnings: list["Warning"]
 
 @dataclass
 class NeighborResult:
@@ -431,6 +441,27 @@ class NeighborResult:
     link_strength: float
     support_count: int
     overview_layer: ContentLayer | None
+    warnings: list["Warning"]
+```
+
+### Warning and Error
+
+```python
+@dataclass
+class Warning:
+    code: str
+    message: str
+    scope: Literal["query", "result", "neighbor", "object", "source_family"]
+    object_id: str | None
+    source_family: str | None
+
+@dataclass
+class Error:
+    code: str
+    message: str
+    scope: Literal["request", "object", "source_family", "resolver"]
+    object_id: str | None
+    source_family: str | None
 ```
 
 `memory_open` response mapping:
@@ -444,6 +475,15 @@ Canonical warnings location:
 
 - warnings live only in `OpenLayerResult.warnings`
 - the top-level `memory_open` response must not duplicate warnings separately
+
+`memory_open` behavior table:
+
+- malformed request or unsupported `layer` token: typed MCP error with `Error.scope="request"`
+- nonexistent `object_id`: successful `OpenLayerResult` with `status="not_found"`
+- existing object, requested layer absent: successful `OpenLayerResult` with `status="absent"`
+- existing object, requested ref stale: successful `OpenLayerResult` with `status="stale"`
+- existing object, successful resolution: successful `OpenLayerResult` with `status="success"`
+- `layer="abstract"`: synthesize an inline `ContentLayer` from the stored abstract string and return it as a successful `OpenLayerResult`
 
 ### NeighborhoodLink
 
@@ -549,7 +589,7 @@ The current MCP tools should remain available temporarily, but the new engine sh
 - `query_plan`
 - `results: list[QueryResult]`
 - `debug` optional
-- `warnings` optional
+- `warnings: list[Warning]` optional
 
 Each result must include:
 
@@ -588,7 +628,7 @@ Each result must include:
 
 - `results: list[NeighborResult]`
 - optional `debug`
-- optional `warnings`
+- `warnings: list[Warning]` optional
 
 `memory_neighbors` ordering and dedupe:
 
@@ -611,10 +651,11 @@ Each result must include:
 
 ### Error behavior
 
-- unsupported source family filters return a structured warning, not silent omission
-- missing objects return a typed not-found error
-- unavailable vector search returns a warning and activates lexical fallback
-- absent layers return a successful response with `warnings`, not a transport failure
+- unsupported source family filters return a structured `Warning`, not silent omission
+- malformed requests return typed `Error` objects at the MCP boundary
+- unavailable vector search returns a `Warning` and activates lexical fallback
+- absent layers return a successful response with `OpenLayerResult.status="absent"`
+- nonexistent objects in `memory_open` return a successful response with `OpenLayerResult.status="not_found"`
 
 ### Backward compatibility
 
@@ -627,6 +668,29 @@ Existing tools:
 - `cami_message_search`
 
 should initially be adapters over the new retrieval engine where possible. This allows Claude Code, Cami/OpenClaw, and Codex to migrate safely.
+
+Compatibility matrix:
+
+- `cami_memory_search` -> `memory_query`
+  - preserve legacy-style compact summaries
+  - legacy observation IDs remain valid for observation-backed objects via stable `object_id` namespacing
+  - non-onboarded families may be omitted unless explicitly exposed by compatibility adapters
+
+- `cami_memory_timeline` -> `memory_neighbors`
+  - preserve chronology-oriented output for session-linked and time-adjacent neighbors
+  - if v2 neighborhood data is unavailable, fall back to legacy timeline behavior for that family
+
+- `cami_memory_details` -> `memory_open`
+  - map detail fetches to `layer="detail"`
+  - preserve legacy ability to fetch full text for migrated families
+
+- `cami_memory_graph_search` -> `memory_query` plus graph-biased routing
+  - preserve graph-oriented recall behavior and result summaries
+
+- `cami_message_search` -> `memory_query` or compatibility adapter over message stores
+  - preserve message-centric result ordering and source labeling
+
+During rollout, legacy responses remain user-visible stable while v2 runs in shadow mode for comparison.
 
 ## Storage and Indexing Strategy
 
