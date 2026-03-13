@@ -268,6 +268,33 @@ Current Cortex data is spread across multiple storage forms with different seman
 - `memory_open` resolves layer payloads through the same `ContentLayer` contract regardless of storage mode.
 - ranking uses `abstract` and `overview_layer`; it must never require `detail_layer` to rank.
 
+### Content resolution contract
+
+Reference-backed layers must use a concrete `content_ref` contract.
+
+Allowed `content_ref` formats:
+
+- `obs://<object_id>/<layer>`
+- `wm://<object_id>/<layer>`
+- `handoff://<object_id>/<layer>`
+- `session://<object_id>/<layer>`
+- `note://<object_id>/<layer>`
+- `msg://<object_id>/<layer>`
+- `kg://<object_id>/<layer>`
+
+Resolver rules:
+
+- each source family must register a resolver for its own `content_ref` namespace
+- resolvers must return a `ContentLayer`-compatible payload or a typed not-found/stale result
+- `memory_open` must use the registered resolver rather than source-specific branching in the MCP layer
+
+Indexing and ranking rules for ref-backed `overview_layer`:
+
+- every ref-backed overview must still have a materialized text form available for FTS and ranking
+- materialized overview text may be cached in the primary object table or a dedicated overview cache
+- if a ref-backed overview cannot be materialized, the object is not eligible for ranking until repaired
+- stale refs must return warnings and be excluded from ranking until the resolver succeeds again
+
 ## Core Interface Contracts
 
 Retrieval v2 must define explicit interfaces before implementation work begins.
@@ -454,6 +481,7 @@ The current MCP tools should remain available temporarily, but the new engine sh
 - `limit: int` optional, default 10, max 50
 - `source_families: list[str]` optional
 - `include_debug: bool` optional, default false
+- `include_overview: bool` optional, default false
 - `expand_neighbors: bool` optional, default true
 
 `memory_query` response:
@@ -469,10 +497,10 @@ Each result must include:
 - `source_family`
 - `object_type`
 - `abstract`
-- `overview_layer`
 - `score`
 - `score_components`
-- `neighbor_preview`
+- `overview_layer` optional, included only when `include_overview=true`
+- `neighbor_previews: list[NeighborPreview]`
 
 `memory_open` request:
 
@@ -481,8 +509,7 @@ Each result must include:
 
 `memory_open` response:
 
-- resolved layer payload
-- `content_ref` if applicable
+- `OpenLayerResult`
 - `warnings` if the layer is absent or stale
 
 `memory_neighbors` request:
@@ -668,7 +695,7 @@ When multiple seed results nominate overlapping neighbors:
 - attach the neighbor to every nominating seed in metadata, but only materialize it once in the global expanded set
 - semantic neighbors participate in the same arbitration rules as other inferred links and are excluded entirely when semantic coverage is unavailable
 
-`neighbor_preview` in `memory_query` responses is per-seed but derived from the globally deduped expanded set. This keeps previews stable across runs and avoids duplicate context.
+`neighbor_previews` in `memory_query` responses is an ordered per-seed list derived from the globally deduped expanded set. It must be ordered by global neighbor score descending, capped at the per-seed expansion limit, and returned as an empty list when `expand_neighbors=false`. This keeps previews stable across runs and avoids duplicate context.
 
 ## Migration Plan
 
