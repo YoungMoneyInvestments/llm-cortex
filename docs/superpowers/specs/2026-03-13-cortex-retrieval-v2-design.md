@@ -211,6 +211,14 @@ Normative final-score formula:
 - apply diversity bonus after duplicate penalties
 - final score is clipped to `[0, 1]`
 
+Source diversity bonus contract:
+
+- diversity bonus is prefix-dependent and applies only to seed-ranking rows
+- for a candidate at rank position `r`, `diversity_bonus(candidate, r)` equals the configured per-family bonus only if no higher-ranked seed candidate in positions `< r` has the same `source_family`
+- otherwise `diversity_bonus(candidate, r) = 0.0`
+- the diversity bonus may therefore be applied at most once per `source_family` within a ranked query result set
+- duplicate collapse and duplicate penalties run before diversity-bonus eligibility is evaluated
+
 Final ranked results must use deterministic tie-breaks after equal final score:
 
 1. stronger intent-fit contribution
@@ -661,6 +669,7 @@ Requirements:
 @dataclass
 class NeighborPreview:
     object_id: str
+    source_family: str
     abstract: str
     global_score: float
     seed_link_type: str
@@ -687,6 +696,7 @@ class QueryResult:
     object_id: str
     source_family: str
     object_type: str
+    match_kind: Literal["seed", "expanded_context"]
     abstract: str
     score: float
     score_components: list["ScoreComponent"]
@@ -878,19 +888,28 @@ The current MCP tools should remain available temporarily, but the new engine sh
 - the router may only allocate candidate budget to listed families
 - unsupported or unavailable listed families must produce structured warnings
 - omitted families must not appear as seed results
-- neighbor expansion may still return linked objects from omitted families only if those neighbors are explicitly labeled as expanded context rather than seed matches
+- neighbor expansion may still return linked objects from omitted families only inside `neighbor_previews`
+- every `NeighborPreview` is expanded context by definition and must not be interpreted as a seed match
+- omitted families may appear in `neighbor_previews` only when linked expansion selects them
 
 Each result must include:
 
 - `object_id`
 - `source_family`
 - `object_type`
+- `match_kind`
 - `abstract`
 - `score`
 - `score_components`
 - `overview_layer` optional, included only when `include_overview=true`
 - `neighbor_previews: list[NeighborPreview]`
 - `debug` optional, included only when `include_debug=true`
+
+`memory_query` result-shape invariant:
+
+- initial v2 `memory_query.results` contain only seed matches, so `QueryResult.match_kind` must be `"seed"` for every returned row
+- if a future compatibility mode inlines expanded rows into `results`, those rows must set `match_kind="expanded_context"` and must never consume seed-ranking budget
+- `neighbor_previews` remain previews of expanded context, not additional seed rows
 
 `include_overview=true` invariant:
 
@@ -1354,6 +1373,7 @@ This prevents v2 queries from becoming incomplete during migration.
 
 - minimum 7 consecutive days of shadow traffic for the family
 - minimum 200 shadowed queries in that window
+- minimum 50 evaluable shadowed queries for lineage-based usefulness scoring in that same window
 - top-3 hit rate must not regress by more than 2 percentage points versus the legacy path
 - production-estimated context usefulness must be equal or better versus the legacy path
 - p95 latency must not worsen by more than 20 percent
@@ -1363,11 +1383,18 @@ Shadow-read pass/fail rule:
 
 - the family passes only if all parity metrics pass over the full 7-day window
 - any failed metric resets the 7-day parity window after the fix is deployed
-- production-estimated context usefulness is computed from labeled feedback and query-lineage traces collected during the shadow window
+- shadow-read context usefulness is computed on the evaluable shadow-query set only
+- an evaluable shadow query is one that, during the parity window, has either explicit `memory_feedback` attached to its `query_execution_id` or a lineage trace showing at least one accepted object interaction on the user-visible legacy path
+- lineage-derived accepted seed objects are the legacy result objects opened by the user for that `query_execution_id`; lineage-derived accepted neighbors are the neighbor objects subsequently opened or selected from the same seed context within the configured evaluation window
+- queries with neither explicit feedback nor accepted lineage are excluded from the usefulness denominator and reported as `unevaluable_shadow_queries`
+- `production_estimated_context_usefulness = useful_shadow_queries / evaluable_shadow_queries`
+- a shadow query counts as `useful_shadow_queries` only if the shadow result set contains at least one accepted seed object and, when accepted neighbors exist, the shadow result set includes that accepted neighbor set in `neighbor_previews` or `memory_neighbors`
+- explicit negative feedback (`irrelevant`, `missing_context`, `missed_expected_result`) marks the shadow query not useful unless a later feedback event on the same `query_execution_id` supersedes it
+- the parity gate cannot pass until `evaluable_shadow_queries >= 50`
 
 ### Cutover rule
 
-A source family may move from shadow mode to default only when:
+A replayable source family may move from shadow mode to default only when:
 
 - benchmark thresholds are met on the held-out validation window for pre-cutover qualification
 - shadow-read parity is maintained for 7 consecutive days
@@ -1419,7 +1446,9 @@ As-of-time replay contract:
 Non-replayable family cutover rule:
 
 - replayable as-of-time history is the default prerequisite for public benchmark-based cutover
-- families without full replayability may still qualify for local/private cutover only if they pass 14 days of shadow-read parity, at least 50 labeled local queries, and the same acceptance metrics otherwise required for benchmarked families
+- families without full replayability may still qualify for local/private cutover only through this alternate cutover path, which replaces the held-out validation and held-out test benchmark gates for that family
+- the alternate local/private path requires 14 consecutive days of shadow-read parity, at least 50 evaluable local shadow queries, stable `memory_open` resolution, no severity-1 regressions, and the same top-1/top-3/false-positive/context-usefulness/p95 acceptance thresholds otherwise required for replayable families
+- those local/private parity and acceptance gates are the only cutover authority for non-replayable families until replayable retention exists
 - those families must not be counted toward public benchmark claims until replayable retention exists
 
 ### Public benchmark sanitization
