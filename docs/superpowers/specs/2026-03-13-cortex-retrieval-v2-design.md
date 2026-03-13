@@ -264,6 +264,13 @@ Duplicate detection keys:
 - exact `authoritative_content_hash`
 - compatibility provenance pointing at the same underlying legacy item
 
+`source_ref` contract:
+
+- `source_ref` must be a canonical provenance URI of the form `<provenance_namespace>://<immutable_source_key>`
+- `immutable_source_key` must be unique within `provenance_namespace`
+- equality of `source_ref` therefore means the same underlying raw source item, not merely the same source family or storage system
+- cross-family collisions are disallowed because `provenance_namespace` is part of the canonical URI
+
 Duplicate hash contract:
 
 - `authoritative_content_hash` is the only canonical cross-object duplicate hash
@@ -447,7 +454,7 @@ Canonical formats:
 
 Component encoding rule:
 
-- every `object_id` component must either match `[a-z0-9._-]+` exactly or be encoded as lowercase URL-safe base32 without padding
+- every `object_id` component must either match `[a-z0-9._-]+` exactly or be encoded as lowercase RFC 4648 base32 using the alphabet `abcdefghijklmnopqrstuvwxyz234567` without padding
 - raw `:` is reserved exclusively as the component delimiter and must never appear inside an encoded or unencoded component
 - therefore any raw immutable identifier containing `:`, `/`, whitespace, uppercase letters, or any character outside `[a-z0-9._-]` must be encoded as an entire component
 - adapters and compatibility translators must use the same encoding rule
@@ -1119,6 +1126,7 @@ Query execution logging:
 
 - every `memory_query` execution must persist `query_execution_id`
 - the persisted execution record must include engine version, `RankerConfig` version, `ExpansionConfig` version, source coverage state, top-k returned object IDs, emitted `neighbor_previews` by seed result, and whether the request ran in shadow mode
+- shadow mode must internally rank and persist at least the top 3 seed result IDs for parity metrics even when the user-requested `limit` is `1` or `2`
 - in shadow mode, the persisted execution record must also include the paired user-visible legacy top-k object IDs for the same request so shadow-vs-legacy parity can be computed on the same query set
 - `memory_feedback` must attach to that stored execution record for regression analysis and cutover decisions
 - `memory_open` and `memory_neighbors` must attach to the originating `query_execution_id` when present so token-to-answer paths remain traceable
@@ -1548,14 +1556,15 @@ Shadow-read pass/fail rule:
 - the lineage evaluation window is fixed at 15 minutes after the originating `query_execution_id` is created
 - lineage-derived accepted seed objects are the legacy result objects opened by the user for that `query_execution_id` within that 15-minute window
 - lineage-derived accepted neighbors are the neighbor objects opened via a detail-fetch path on the same `query_execution_id` within that 15-minute window and carrying the matching `parent_object_id` seed context
-- accepted seed contexts are evaluated as a set of tuples `(seed_object_id, accepted_neighbor_set)` where `accepted_neighbor_set` may be empty
+- accepted seed contexts are evaluated as a set of tuples `(seed_object_id, minimum_accepted_layer, accepted_neighbor_set)` where `accepted_neighbor_set` may be empty
 - queries with neither explicit feedback nor accepted lineage are excluded from the usefulness denominator and reported as `unevaluable_shadow_queries`
-- `shadow_top3_hit_rate = shadow_top3_hits / evaluable_shadow_queries`, where `shadow_top3_hits` counts evaluable queries for which any accepted seed context has its `seed_object_id` in the shadow top-3 result IDs
-- `legacy_top3_hit_rate = legacy_top3_hits / evaluable_shadow_queries`, where `legacy_top3_hits` counts evaluable queries for which any accepted seed context has its `seed_object_id` in the paired user-visible legacy top-3 result IDs
+- `minimum_accepted_layer` defaults to `abstract` unless the legacy lineage shows the user successfully opened `overview` or `detail`, in which case the deepest successfully opened layer becomes the required minimum for that accepted seed context
+- `shadow_top3_hit_rate = shadow_top3_hits / evaluable_shadow_queries`, where `shadow_top3_hits` counts evaluable queries for which any accepted seed context has its `seed_object_id` in the shadow top-3 result IDs and the same seed object can satisfy `minimum_accepted_layer` through the query response or a successful `memory_open`
+- `legacy_top3_hit_rate = legacy_top3_hits / evaluable_shadow_queries`, where `legacy_top3_hits` counts evaluable queries for which any accepted seed context has its `seed_object_id` in the paired user-visible legacy top-3 result IDs and the same seed object can satisfy `minimum_accepted_layer` through the legacy response path
 - `production_estimated_context_usefulness = useful_shadow_queries / evaluable_shadow_queries`
 - `legacy_context_usefulness = useful_legacy_queries / evaluable_shadow_queries`
-- a shadow query counts as `useful_shadow_queries` only if any accepted seed context is fully satisfied: its `seed_object_id` appears in the shadow result set and its `accepted_neighbor_set`, when non-empty, is fully present in `neighbor_previews` or `memory_neighbors` for that same seed context
-- a legacy query counts as `useful_legacy_queries` only if any accepted seed context is fully satisfied by the paired user-visible legacy path: its `seed_object_id` appears in the legacy top-k and its `accepted_neighbor_set`, when non-empty, is fully present in the logged legacy neighbor payloads for that same seed context
+- a shadow query counts as `useful_shadow_queries` only if any accepted seed context is fully satisfied: its `seed_object_id` appears in the shadow result set, it can satisfy `minimum_accepted_layer`, and its `accepted_neighbor_set`, when non-empty, is fully present in `neighbor_previews` or `memory_neighbors` for that same seed context
+- a legacy query counts as `useful_legacy_queries` only if any accepted seed context is fully satisfied by the paired user-visible legacy path: its `seed_object_id` appears in the legacy top-k, it can satisfy `minimum_accepted_layer`, and its `accepted_neighbor_set`, when non-empty, is fully present in the logged legacy neighbor payloads for that same seed context
 - the final aggregated explicit negative feedback for a `query_execution_id` marks the shadow query not useful regardless of lineage
 - the parity gate cannot pass until `evaluable_shadow_queries >= 50`
 
@@ -1615,7 +1624,7 @@ Non-replayable family cutover rule:
 - replayable as-of-time history is the default prerequisite for public benchmark-based cutover
 - families without full replayability may still qualify for local/private cutover only through this alternate cutover path, which replaces the held-out validation and held-out test benchmark gates for that family
 - the alternate local/private path requires 14 consecutive days of shadow-read parity, at least 50 evaluable local shadow queries, stable `memory_open` resolution, no severity-1 regressions, and the same top-1/top-3/false-positive/context-usefulness/p95 acceptance thresholds otherwise required for replayable families
-- in this shadow-only alternate path, `top-1` and `top-3` are defined from the evaluable shadow-query set using the same accepted seed contexts as the 7-day parity gate: a hit occurs when any accepted seed context appears in shadow top-1 or shadow top-3 respectively
+- in this shadow-only alternate path, `top-1` and `top-3` are defined from the evaluable shadow-query set using the same accepted seed contexts and `minimum_accepted_layer` contract as the 7-day parity gate: a hit occurs when any accepted seed context appears in shadow top-1 or shadow top-3 respectively and can satisfy `minimum_accepted_layer`
 - in this shadow-only alternate path, `false-positive rate` is the share of evaluable shadow queries whose shadow top-3 contains no accepted seed context and whose final aggregated explicit feedback is negative
 - those local/private parity and acceptance gates are the only cutover authority for non-replayable families until replayable retention exists
 - those families must not be counted toward public benchmark claims until replayable retention exists
@@ -1647,6 +1656,9 @@ Each benchmark item must include:
 - optional notes on failure modes to avoid
 
 ### Metric definitions
+
+`top-k hit rate`
+- a query is a top-k hit only if an acceptable seed object appears in the top-k results and the query response or a successful `memory_open` can satisfy the benchmark item's minimum acceptable layer for that seed
 
 `context usefulness rate`
 - percentage of queries where the returned result set includes an acceptable seed object plus the labeled acceptable neighbor set, without requiring the caller to open or fetch additional unrelated objects outside an acceptable context set
