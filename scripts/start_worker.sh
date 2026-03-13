@@ -8,21 +8,26 @@
 #   ./start_worker.sh restart  # Stop + start
 #
 # Configure:
-#   CORTEX_WORKSPACE  — Project root (default: ~/cortex)
-#   CORTEX_WORKER_PORT — HTTP port (default: 7778)
+#   CORTEX_DATA_DIR   — Runtime data dir (default: ~/.cortex/data)
+#   CORTEX_LOG_DIR    — Runtime log dir (default: ~/.cortex/logs)
+#   CORTEX_PID_FILE   — Worker PID file (default: ~/.cortex/worker.pid)
+#   CORTEX_WORKER_PORT — HTTP port (default: 37778)
 #   CORTEX_PYTHON     — Python interpreter (default: python3)
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-WORKSPACE="${CORTEX_WORKSPACE:-$HOME/cortex}"
 PYTHON="${CORTEX_PYTHON:-python3}"
-WORKER_SCRIPT="$SCRIPT_DIR/memory_worker.py"
-PID_FILE="$WORKSPACE/.worker.pid"
-LOG_FILE="$WORKSPACE/logs/memory-worker.log"
-WORKER_PORT="${CORTEX_WORKER_PORT:-7778}"
+RUNTIME_HOME="${CORTEX_RUNTIME_HOME:-$HOME/.cortex}"
+DATA_DIR="${CORTEX_DATA_DIR:-$RUNTIME_HOME/data}"
+LOG_DIR="${CORTEX_LOG_DIR:-$RUNTIME_HOME/logs}"
+WORKER_SCRIPT="${CORTEX_WORKER_SCRIPT:-$SCRIPT_DIR/../src/memory_worker.py}"
+PID_FILE="${CORTEX_PID_FILE:-$RUNTIME_HOME/worker.pid}"
+LOG_FILE="$LOG_DIR/memory-worker.log"
+WORKER_PORT="${CORTEX_WORKER_PORT:-37778}"
 WORKER_URL="http://127.0.0.1:$WORKER_PORT"
 
 mkdir -p "$(dirname "$PID_FILE")"
 mkdir -p "$(dirname "$LOG_FILE")"
+mkdir -p "$DATA_DIR"
 
 is_running() {
     if [ -f "$PID_FILE" ]; then
@@ -46,7 +51,8 @@ start_worker() {
 
     echo "Starting Cortex Worker..."
     cd "$SCRIPT_DIR"
-    CORTEX_WORKSPACE="$WORKSPACE" CORTEX_WORKER_PORT="$WORKER_PORT" \
+    CORTEX_DATA_DIR="$DATA_DIR" CORTEX_LOG_DIR="$LOG_DIR" \
+        CORTEX_PID_FILE="$PID_FILE" CORTEX_WORKER_PORT="$WORKER_PORT" \
         nohup "$PYTHON" "$WORKER_SCRIPT" >> "$LOG_FILE" 2>&1 &
     local pid=$!
 
