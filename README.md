@@ -77,7 +77,7 @@ Layer 1: Auto Memory ────────── Permanent notes Claude alway
 ```
 
 ### Layer 0: Observation Pipeline (NEW)
-Claude's **procedural memory**. A background worker that automatically captures every tool use, user prompt, and session lifecycle event via Claude Code hooks. Observations are queued in SQLite, processed asynchronously (summarized, indexed), and synced to a unified vector store for search. Exposes 4 MCP tools for token-efficient retrieval: search (L1, ~20 tokens/result), timeline (L2, ~100 tokens/item), details (L3, full text), and save (manual memory).
+Claude's **procedural memory**. A background worker that automatically captures every tool use, user prompt, and session lifecycle event via Claude Code hooks. Observations are queued in SQLite, processed asynchronously (summarized, indexed), and synced to a unified vector store for search. Exposes 5 MCP tools for token-efficient retrieval: `cami_memory_search` (L1, ~20 tokens/result), `cami_memory_timeline` (L2, ~100 tokens/item), `cami_memory_details` (L3, full text), `cami_memory_save` (manual memory), and `cami_memory_graph_search` (graph-augmented search).
 
 ### Layer 1: Auto Memory
 Claude's **long-term memory**. A markdown file (MEMORY.md) that's always loaded into the system prompt. Confirmed patterns, key decisions, architecture notes. Survives forever.
@@ -153,19 +153,20 @@ The difference isn't incremental. It's the difference between working with someo
 
 ```
 claude-cortex/
-├── scripts/                    # All Python scripts (the brain)
-│   ├── context_loader.py       # Layer 2: Session bootstrap
-│   ├── working_memory.py       # Layer 3: Goals, scratchpad, state
-│   ├── hybrid_search.py        # Layer 5: Multi-source search fusion
-│   ├── knowledge_graph.py      # Layer 6: Entity-relationship graph
-│   ├── query_knowledge_graph.py # Layer 6: Graph query CLI
-│   ├── rlm_graph.py            # Layer 7: Recursive context partitioning
-│   ├── seed_graph.py           # Layer 6: Graph seeding helper
+├── src/                        # Canonical public runtime surface
 │   ├── memory_worker.py        # Layer 0: Background observation processor
 │   ├── unified_vector_store.py # Layer 0: SQLite FTS5 + vector search
 │   ├── memory_retriever.py     # Layer 0: 3-layer token-efficient retrieval
-│   ├── mcp_memory_server.py    # Layer 0: MCP server for memory tools
-│   └── start_worker.sh         # Layer 0: Worker lifecycle management
+│   ├── mcp_memory_server.py    # Layer 0: MCP server for the five cami_* tools
+│   └── knowledge_graph.py      # Layer 6: Entity-relationship graph
+├── scripts/                    # Helpers and bootstrap utilities
+│   ├── context_loader.py       # Layer 2: Session bootstrap
+│   ├── working_memory.py       # Layer 3: Goals, scratchpad, state
+│   ├── hybrid_search.py        # Layer 5: Multi-source search fusion
+│   ├── query_knowledge_graph.py # Layer 6: Graph query CLI
+│   ├── rlm_graph.py            # Layer 7: Recursive context partitioning
+│   ├── seed_graph.py           # Layer 6: Graph seeding helper
+│   └── start_worker.sh         # Worker lifecycle management
 ├── hooks/                      # Claude Code lifecycle hooks
 │   ├── session_start.sh        # Starts worker + runs context loader
 │   ├── post_tool_use.sh        # Captures tool observations
@@ -198,9 +199,16 @@ cd claude-cortex
 # 2. Install dependencies
 pip install -r requirements.txt
 
-# 3. Set your workspace (or use default ~/cortex)
+# 3. Configure a generic local runtime
 export CORTEX_WORKSPACE="$HOME/cortex"
-mkdir -p "$CORTEX_WORKSPACE/memory" "$CORTEX_WORKSPACE/.planning"
+export CORTEX_DATA_DIR="$HOME/.cortex/data"
+export CORTEX_LOG_DIR="$HOME/.cortex/logs"
+export CORTEX_WORKER_API_KEY="$(python3 - <<'PY'
+import secrets
+print(secrets.token_hex(16))
+PY
+)"
+mkdir -p "$CORTEX_WORKSPACE/memory" "$CORTEX_WORKSPACE/.planning" "$CORTEX_DATA_DIR" "$CORTEX_LOG_DIR"
 
 # 4. Create your MEMORY.md (Layer 1)
 cp examples/MEMORY.md "$CORTEX_WORKSPACE/MEMORY.md"
@@ -229,7 +237,7 @@ python3 scripts/context_loader.py --hours 48
 
 ```bash
 # 1. Start the background worker
-./scripts/start_worker.sh
+python3 src/memory_worker.py
 
 # 2. Add all 4 hooks to ~/.claude/settings.json
 # (see examples/settings.json for the full configuration)
@@ -238,12 +246,12 @@ python3 scripts/context_loader.py --hours 48
 # "mcpServers": {
 #   "cortex-memory": {
 #     "command": "python3",
-#     "args": ["/path/to/scripts/mcp_memory_server.py"]
+#     "args": ["/path/to/cortex/src/mcp_memory_server.py"]
 #   }
 # }
 
 # 4. Verify
-curl http://127.0.0.1:7778/api/health
+curl http://127.0.0.1:37778/api/health
 ```
 
 ### Add Knowledge Graph (30 minutes)
@@ -274,15 +282,22 @@ Each layer is independent. Start with Layer 1 and add more as needed.
 
 ## Configuration
 
-All scripts use environment variables for configuration:
+Runtime components use environment variables for configuration:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CORTEX_WORKSPACE` | `~/cortex` | Root directory for all Cortex data |
-| `CORTEX_WORKER_PORT` | `7778` | HTTP port for the memory worker |
+| `CORTEX_DATA_DIR` | `~/.cortex/data` | SQLite databases for observations, vectors, and the knowledge graph |
+| `CORTEX_LOG_DIR` | `~/.cortex/logs` | Worker log directory |
+| `CORTEX_PID_FILE` | `~/.cortex/worker.pid` | Worker PID file location |
+| `CORTEX_WORKER_PORT` | `37778` | HTTP port for the memory worker |
+| `CORTEX_WORKER_API_KEY` | required | Shared bearer token for hook POST requests |
 | `CORTEX_PYTHON` | `python3` | Python interpreter to use |
-| `CORTEX_GRAPH_FILE` | `$WORKSPACE/.planning/knowledge-graph.json` | Knowledge graph location |
-| `OPENAI_API_KEY` | (none) | Required only for vector similarity search |
+| `CORTEX_AUTH_PROFILES_PATH` | unset | Optional OAuth fallback auth-profiles.json path for AI compression |
+| `CAMIROUTER_URL` | unset | Optional OpenAI-compatible router endpoint for AI compression |
+| `CAMIROUTER_API_KEY` | unset | Required when `CAMIROUTER_URL` is set |
+| `CORTEX_ENV_FILE` | unset | Optional env file containing `OPENAI_API_KEY=...` |
+| `OPENAI_API_KEY` | unset | Optional embedding key when `CORTEX_EMBEDDING_PROVIDER=openai` |
 
 ### Workspace Layout
 
@@ -295,11 +310,16 @@ $CORTEX_WORKSPACE/
 ├── .planning/
 │   ├── working-memory.json            # Layer 3: Active state
 │   └── knowledge-graph.json           # Layer 6: Entity graph
-├── data/
-│   ├── cortex-observations.db         # Layer 0: Observation store
-│   └── cortex-vectors.db             # Layer 0: FTS5 + vector search
-└── logs/
-    └── memory-worker.log              # Worker logs
+```
+
+```
+$CORTEX_DATA_DIR/
+├── cortex-observations.db             # Layer 0: Observation store
+├── cortex-vectors.db                  # Layer 0: FTS5 + vector search
+└── cortex-knowledge-graph.db          # Layer 6: Entity graph
+
+$CORTEX_LOG_DIR/
+└── memory-worker.log                  # Worker logs
 ```
 
 ---
@@ -342,10 +362,11 @@ SESSION START
     Claude Code Session
     (knows: time, goals, recent work, pending items, relationships)
              |
-             |--- Recall past decisions --> cortex_memory_search (MCP)
-             |--- Get context           --> cortex_memory_timeline (MCP)
-             |--- Full details          --> cortex_memory_details (MCP)
-             |--- Save a memory         --> cortex_memory_save (MCP)
+             |--- Recall past decisions --> cami_memory_search (MCP)
+             |--- Get context           --> cami_memory_timeline (MCP)
+             |--- Full details          --> cami_memory_details (MCP)
+             |--- Save a memory         --> cami_memory_save (MCP)
+             |--- Graph expansion       --> cami_memory_graph_search (MCP)
              |--- Query relationships   --> knowledge graph
              |--- Complex questions     --> RLM-Graph (recursive)
              |--- Learn something new   --> writes to MEMORY.md + graph

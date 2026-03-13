@@ -27,6 +27,7 @@ Usage:
 
 import json
 import logging
+import os
 import sqlite3
 import sys
 import time
@@ -39,7 +40,7 @@ logger = logging.getLogger("cortex-retriever")
 
 # ── Config ──────────────────────────────────────────────────────────────────
 
-DATA_DIR = Path.home() / "clawd" / "data"
+DATA_DIR = Path(os.environ.get("CORTEX_DATA_DIR", str(Path.home() / ".cortex" / "data"))).expanduser()
 OBS_DB_PATH = DATA_DIR / "cortex-observations.db"
 VEC_DB_PATH = DATA_DIR / "cortex-vectors.db"
 
