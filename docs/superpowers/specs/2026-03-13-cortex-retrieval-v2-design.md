@@ -183,6 +183,13 @@ The ranker produces:
 - explanation fields
 - ranking trace for debugging
 
+Final ranked results must use deterministic tie-breaks after equal final score:
+
+1. stronger intent-fit contribution
+2. higher source authority
+3. newer timestamp
+4. lexical `object_id`
+
 ### Duplicate handling and source authority
 
 Duplicate detection keys:
@@ -576,6 +583,9 @@ class OpenLayerResult:
     status: Literal["success", "absent", "stale", "not_found"]
     payload: ContentLayer
     resolved_text: str | None
+    byte_range: tuple[int, int] | None
+    has_more: bool
+    next_cursor: str | None
     warnings: list["Warning"]
 
 @dataclass
@@ -822,12 +832,14 @@ Each result must include:
 
 - dedupe by `object_id`
 - order by global neighbor score descending in `mode="relevance"`
-- order by timestamp ascending around the seed object in `mode="chronology"`
+- order by timestamp ascending in `mode="chronology"`, with the seed row inserted at its natural chronological position
 - ties break by stronger link strength, then newer timestamp if available, then lexical object ID
 - returned neighbors include `abstract` always and `overview_layer` only if a future request flag explicitly asks for it; initial v2 should default `overview_layer` to `None`
 - `mode="chronology"` must include the seed object in the returned sequence
 - in `mode="chronology"`, `limit` includes the seed row
 - the seed row must set `is_seed=true`, `link_type="seed"`, `link_strength=0.0`, and `support_count=1`
+- when timestamps are missing, place those rows after timestamped rows using lexical `object_id` tie-breaks
+- chronology mode should prefer the nearest before/after neighbors around the seed within the requested `limit`
 
 `memory_feedback` request:
 
