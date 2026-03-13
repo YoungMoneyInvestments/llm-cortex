@@ -327,12 +327,19 @@ Compatibility invariants:
 - translating a supported legacy ID to `object_id` and back must be stable within a rollout phase
 - shadow-mode comparisons must assert that legacy fetches and translated `object_id` fetches resolve to the same underlying provenance
 
+Identity migration rule:
+
+- if a compatibility adapter cannot emit the eventual native `object_id` from day one, the system must persist a permanent alias table from `compat:*` IDs to canonical native IDs
+- query, open, neighbors, logging, feedback, and duplicate merging must canonicalize through that alias table
+- once a native ID exists, the compat alias remains valid for backward compatibility
+
 ### State contract
 
 - `visibility="active"` objects are eligible for ranking
 - `visibility="tombstoned"` objects remain openable by ID but are excluded from default ranking and neighbor expansion
 - `overview_freshness`, `detail_freshness`, `embedding_freshness`, and `link_freshness` are authoritative per-object state fields
 - ranking must exclude stale embeddings and stale links
+- ranking may continue to use the last fully fresh `abstract` and `overview_layer` until replacement text and indexes are ready, then atomically swap to the rebuilt version
 - `memory_query` must surface relevant state through warnings/debug when stale data affects ranking
 - `memory_open` must surface layer freshness through `status` and warnings
 - `memory_neighbors` must exclude stale or tombstoned neighbors by default unless explicitly requested by a future extension
@@ -1165,6 +1172,13 @@ The benchmark should live in the public repo so improvements are testable and up
 - store annotations in versioned fixtures
 - replay each query against an as-of-time corpus snapshot containing only source data and derived artifacts available at the original query timestamp
 - generated layers, embeddings, and neighborhood links used in evaluation must be constrained to that same snapshot
+
+As-of-time replay contract:
+
+- each source family must define its historical source of truth for replay
+- the evaluation harness must reconstruct or filter source data to the query timestamp before building derived artifacts
+- derived artifacts for replay must be rebuilt from that as-of-time source state rather than reused from current live indexes
+- if a source family lacks replayable history, it must be excluded from public cutover metrics until a replayable retention path exists
 
 ### Public benchmark sanitization
 
