@@ -301,6 +301,12 @@ Canonical formats:
 - knowledge graph: `kg:<entity_id>`
 - compatibility-generated synthetic objects: `compat:<source_family>:<stable_key>`
 
+Component encoding rule:
+
+- every `object_id` component must use lowercase URL-safe base32 without padding when the raw immutable source identifier contains characters outside the canonical grammar
+- adapters and compatibility translators must use the same encoding rule
+- if reversibility is required, the raw immutable identifier must also be persisted in metadata
+
 Legacy translation rules:
 
 - numeric observation IDs must translate directly to `obs:<id>`
@@ -413,7 +419,7 @@ Formal grammar:
 - scheme and layer tokens must be lowercase
 - `object_id` may contain only `a-z`, `0-9`, `.`, `_`, `:`, and `-`
 - `/` is not allowed inside `object_id`
-- malformed refs must raise `invalid_ref`, not `not_found`
+- malformed refs must raise typed `Error(code="invalid_ref", scope="resolver")`, not `not_found`
 - well-formed refs with missing targets must resolve to `not_found`
 
 Resolver rules:
@@ -597,6 +603,7 @@ class Error:
 - resolver `absent` maps to `OpenLayerResult.status="absent"`
 - resolver `stale` maps to `OpenLayerResult.status="stale"`
 - resolver `not_found` maps to `OpenLayerResult.status="not_found"`
+- resolver `invalid_ref` must surface as typed `Error(code="invalid_ref", scope="resolver")` at the MCP boundary
 
 Canonical warnings location:
 
@@ -609,6 +616,7 @@ Canonical warnings location:
 - nonexistent `object_id`: successful `OpenLayerResult` with `status="not_found"`
 - existing object, requested layer absent: successful `OpenLayerResult` with `status="absent"`
 - existing object, requested ref stale: successful `OpenLayerResult` with `status="stale"`
+- existing object, malformed stored ref: typed MCP error with `Error.code="invalid_ref"` and `Error.scope="resolver"`
 - existing object, successful resolution: successful `OpenLayerResult` with `status="success"`
 - `layer="abstract"`: synthesize an inline `ContentLayer` from the stored abstract string and return it as a successful `OpenLayerResult`
 
@@ -1155,6 +1163,8 @@ The benchmark should live in the public repo so improvements are testable and up
 - annotate each query with one or more acceptable target objects
 - annotate whether success requires neighbor context, not just the seed object
 - store annotations in versioned fixtures
+- replay each query against an as-of-time corpus snapshot containing only source data and derived artifacts available at the original query timestamp
+- generated layers, embeddings, and neighborhood links used in evaluation must be constrained to that same snapshot
 
 ### Public benchmark sanitization
 
