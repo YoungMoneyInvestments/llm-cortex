@@ -324,6 +324,7 @@ class MemoryObject:
     working_memory_thread_id: str | None
     link_group_id: str | None
     source_ref: str | None
+    authoritative_content_hash: str | None
     entities: list[str]
     task_markers: list[str]
     decision_markers: list[str]
@@ -333,9 +334,12 @@ class MemoryObject:
     detail_layer: ContentLayer
     abstract_version: str | None
     overview_version: str | None
-    generation_method: Literal["deterministic", "model"] | None
-    generation_model: str | None
-    generated_at: str | None
+    abstract_generation_method: Literal["deterministic", "model"] | None
+    abstract_generation_model: str | None
+    abstract_generated_at: str | None
+    overview_generation_method: Literal["deterministic", "model"] | None
+    overview_generation_model: str | None
+    overview_generated_at: str | None
     overview_freshness: Literal["fresh", "stale", "missing"]
     detail_freshness: Literal["fresh", "stale", "missing"]
     embedding_freshness: Literal["fresh", "stale", "missing", "disabled"]
@@ -470,9 +474,12 @@ Required generation metadata:
 
 - `abstract_version`
 - `overview_version`
-- `generation_method`: `deterministic` or `model`
-- `generation_model` if model-based
-- `generated_at`
+- `abstract_generation_method`: `deterministic` or `model`
+- `abstract_generation_model` if model-based
+- `abstract_generated_at`
+- `overview_generation_method`: `deterministic` or `model`
+- `overview_generation_model` if model-based
+- `overview_generated_at`
 
 Regeneration triggers:
 
@@ -606,7 +613,8 @@ class NormalizedCandidate:
     abstract: str
     overview_layer: ContentLayer
     detail_layer: ContentLayer
-    score: float
+    family_local_score: float
+    global_score: float
     score_components: list["ScoreComponent"]
     metadata: dict[str, Any]
 ```
