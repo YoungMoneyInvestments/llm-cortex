@@ -234,6 +234,18 @@ Final ranked results must use deterministic tie-breaks after equal final score:
 
 ### Duplicate handling and source authority
 
+Near-duplicate penalty contract:
+
+- exact duplicates are handled only by the exact-duplicate keys and merge rules below
+- a pair of candidates may be treated as near-duplicates only if they are not exact duplicates, share the same `object_type`, and either:
+  1. have overview-embedding similarity at or above `RankerConfig.near_duplicate_similarity_threshold`, or
+  2. have normalized lexical similarity at or above `RankerConfig.near_duplicate_lexical_threshold`
+- a near-duplicate pair must also share at least one extracted entity or the same provenance namespace
+- near-duplicate penalties apply only to the lower-priority candidate in the pair after sorting by base score, then source authority, then newer timestamp, then lexical `object_id`
+- the lower-priority candidate receives a single penalty of `RankerConfig.near_duplicate_penalty`
+- if a candidate is near-duplicate to multiple higher-priority candidates, apply the penalty only once
+- if the required semantic or lexical evidence for a pair is unavailable, near-duplicate penalty is disabled for that pair and debug output must record that masking
+
 Duplicate detection keys:
 
 - exact `source_ref`
@@ -781,6 +793,10 @@ Canonical warnings location:
 - native v2 callers may receive chunked detail
 - default inline detail chunk limit for native v2 callers: 64 KB of UTF-8 text
 - `offset` and `limit_bytes` control which detail chunk is returned
+- `byte_range` is a half-open UTF-8 byte interval `[start, end)` over the underlying detail payload
+- the server must snap the actual chunk start down to the nearest UTF-8 code point boundary at or before the requested `offset`
+- the server must snap the actual chunk end down to the greatest UTF-8 code point boundary such that `end - start <= limit_bytes`
+- if the snapped start is at or beyond the end of the detail payload, return a successful empty tail chunk with `byte_range=(payload_length, payload_length)`, `resolved_text=""`, and `has_more=false`
 - if more detail remains after the returned chunk, emit a truncation warning and set `has_more=true`
 - native callers request the next chunk by advancing `offset` to the previous `byte_range[1]`
 - compatibility-backed `cami_memory_details` calls must retrieve full detail for migrated families, even if that requires internal pagination or multiple fetches behind the compatibility adapter
@@ -998,6 +1014,7 @@ Direct `NeighborResult` collapse semantics:
 - ties between candidate displayed link types break by stronger link strength, then lexical link-type name
 - displayed `link_strength` is the strongest surviving link strength for the displayed `link_type`
 - `support_count` is the number of surviving qualifying seed-to-neighbor links after filtering and before displayed-link collapse
+- direct `NeighborResult.global_score` is `clip(link_strength + ExpansionConfig.support_count_bonus * max(0, support_count - 1), 0, 1)`
 
 `memory_neighbors` behavior table:
 
@@ -1318,7 +1335,7 @@ These limits are required to keep latency and fan-out predictable.
 When multiple seed results nominate overlapping neighbors:
 
 - dedupe globally by `object_id`
-- compute one global neighbor score from max link strength plus a small bonus for multi-seed support
+- compute one global neighbor score as `clip(max_link_strength + ExpansionConfig.support_count_bonus * max(0, support_count - 1), 0, 1)`
 - tie-break by deterministic order: stronger link, more seed support, newer timestamp, lexical object ID
 - attach the neighbor to every nominating seed in metadata, but only materialize it once in the global expanded set
 - semantic neighbors participate in the same arbitration rules as other inferred links and are excluded entirely when semantic coverage is unavailable
@@ -1331,6 +1348,7 @@ Field semantics:
 - `seed_link_type` is the highest-priority link type connecting the current seed to that neighbor
 - `seed_link_strength` is the seed-local link strength for the displayed `seed_link_type`
 - `support_count` is the number of seed results that nominated the neighbor
+- `ExpansionConfig.support_count_bonus` is the single versioned coefficient for multi-support neighbor scoring in both preview expansion and direct neighbor ranking
 
 If multiple seed-local link types exist for the same neighbor, choose the displayed `seed_link_type` by deterministic priority:
 
@@ -1396,7 +1414,9 @@ Synthetic ID resolution rules:
 - compatibility-generated synthetic IDs must be expandable by `memory_neighbors`
 - each compatibility adapter must therefore register open and neighbor resolvers for its synthetic IDs
 - synthetic ID resolution must preserve stable namespacing and source provenance
-- if a compatibility resolver cannot open or expand a synthetic ID, it must return typed warnings and the appropriate status rather than an opaque failure
+- if a compatibility resolver cannot open a synthetic ID for `memory_open`, it must return the normal `OpenLayerResult` warning/status outcome rather than an opaque failure
+- if a compatibility resolver cannot translate or expand a synthetic seed ID for `memory_neighbors`, the call must fail with the same typed `Error.scope="object"` contract used for nonexistent or untranslatable seed IDs
+- if synthetic neighbor expansion fails for a non-seed object during query-time neighbor preview generation, the unresolved neighbor must be omitted and a typed warning attached to the parent result or query
 
 This prevents v2 queries from becoming incomplete during migration.
 
