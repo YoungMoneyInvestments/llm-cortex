@@ -262,7 +262,12 @@ Duplicate detection keys:
 
 - exact `source_ref`
 - exact `authoritative_content_hash`
-- compatibility provenance pointing at the same underlying legacy item
+- exact `duplicate_provenance_key`
+
+Compatibility duplicate-provenance contract:
+
+- compatibility adapters that can prove two candidates point at the same underlying legacy item must emit the same stable `duplicate_provenance_key`
+- `duplicate_provenance_key` is a canonical exact-duplicate signal distinct from `source_ref` and from semantic relationships
 
 `source_ref` contract:
 
@@ -381,6 +386,7 @@ class MemoryObject:
     source_ref: str | None
     provenance_namespace: Literal["observations", "working_memory", "handoffs", "session_summaries", "notes", "messages", "knowledge_graph"]
     authoritative_content_hash: str | None
+    duplicate_provenance_key: str | None
     entities: list[str]
     task_markers: list[str]
     decision_markers: list[str]
@@ -713,6 +719,7 @@ class NormalizedCandidate:
     source_ref: str | None
     provenance_namespace: Literal["observations", "working_memory", "handoffs", "session_summaries", "notes", "messages", "knowledge_graph"]
     authoritative_content_hash: str | None
+    duplicate_provenance_key: str | None
     state: CandidateState
     entities: list[str]
     task_markers: list[str]
@@ -1670,6 +1677,9 @@ Each benchmark item must include:
 `top-k hit rate`
 - a query is a top-k hit only if an acceptable seed object appears in the top-k results and the query response or a successful `memory_open` can satisfy the benchmark item's minimum acceptable layer for that seed
 
+`false-positive rate`
+- a benchmark query is a false positive if its evaluated top-3 results contain no acceptable seed object satisfying the benchmark item's minimum acceptable layer
+
 `context usefulness rate`
 - percentage of queries where the returned result set includes an acceptable seed object plus the labeled acceptable neighbor set, without requiring the caller to open or fetch additional unrelated objects outside an acceptable context set
 
@@ -1684,7 +1694,7 @@ Benchmark annotations required for context usefulness:
 
 Harness rule:
 
-- a query counts as context-useful only if at least one acceptable seed object is returned and one labeled acceptable context set is fully satisfied by the returned neighbors; additional unrelated rows in the payload do not negate usefulness unless the benchmark item explicitly marks them as a failure mode to avoid
+- a query counts as context-useful only if at least one acceptable seed object is returned and one labeled acceptable context set is fully satisfied either by `memory_query.neighbor_previews` for that seed or by a follow-up `memory_neighbors` call for that same seed context; additional unrelated rows in the payload do not negate usefulness unless the benchmark item explicitly marks them as a failure mode to avoid
 
 ### Acceptance criteria
 
