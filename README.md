@@ -4,6 +4,20 @@
 
 ---
 
+## What's New
+
+Recent public updates focused on making Cortex easier to trust, easier to run, and easier to improve:
+
+- **Public-safe runtime defaults.** The public worker, vector store, and MCP server now use generic `CORTEX_*` environment variables and `~/.cortex/...` defaults instead of private local paths or machine-specific assumptions.
+- **Clearer public entrypoints.** The canonical runtime now lives under `src/`, while the older `scripts/` entrypoints remain as compatibility wrappers for existing local setups.
+- **Safer MCP tool contracts.** The memory MCP server now validates tool arguments with explicit schemas so bad inputs fail clearly instead of producing vague runtime errors.
+- **Offline test coverage + CI.** The repo now includes an offline-safe test suite for the public `src/` surface and a GitHub Actions workflow to run it automatically.
+- **Better retrieval ranking guardrails.** Retrieval now has checked-in ranking fixtures and a small benchmark runner so relevance tuning can be measured instead of guessed.
+
+These changes do not replace the larger Retrieval v2 roadmap. They harden the current system so the public repo is more reproducible, more verifiable, and less dependent on one local environment.
+
+---
+
 ## The Problem Nobody Talks About
 
 Claude Code is powerful. But every time you start a new session, it has **total amnesia**. It doesn't remember what you built yesterday, what decisions you made last week, who your teammates are, or what your project even does. You spend the first 5 minutes of every session re-explaining context that should already be known.
