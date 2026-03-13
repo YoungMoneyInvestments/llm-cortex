@@ -619,7 +619,7 @@ Formal grammar:
 Resolver rules:
 
 - each source family must register a resolver for its own `content_ref` namespace
-- resolvers must return a `ResolvedLayerResult`
+- resolvers must accept a `ResolvedLayerRequest` and return a `ResolvedLayerResult`
 - `memory_open` must use the registered resolver rather than source-specific branching in the MCP layer
 - resolver namespace validation must happen before target lookup, and any scheme/object-id namespace mismatch must raise `Error(code="invalid_ref", scope="resolver")`
 
@@ -627,16 +627,25 @@ Resolver return contract:
 
 ```python
 @dataclass
+class ResolvedLayerRequest:
+    content_ref: str
+    offset: int | None
+    limit_bytes: int | None
+
+@dataclass
 class ResolvedLayerResult:
     status: Literal["success", "absent", "stale", "not_found"]
     payload: ContentLayer
     resolved_text: str | None
+    byte_range: tuple[int, int] | None
+    has_more: bool
     warnings: list["Warning"]
 ```
 
 Resolver invariants:
 
 - on `success`, `payload.mode` must be `inline`, `payload.text` must be populated, and `resolved_text` must equal `payload.text`
+- on chunked detail success, `byte_range` and `has_more` must be populated exactly as required by `OpenLayerResult`
 - on `absent`, `payload.mode` must be `absent`, `payload.text` must be `None`, and `resolved_text` must be `None`
 - on `stale`, `payload.mode` may remain `ref` or be `absent`, `resolved_text` must be `None`, and `warnings` must explain staleness
 - on `not_found`, `payload.mode` must be `ref` or `absent`, `resolved_text` must be `None`, and `warnings` must explain the missing target
@@ -1127,7 +1136,8 @@ Query execution logging:
 - every `memory_query` execution must persist `query_execution_id`
 - the persisted execution record must include engine version, `RankerConfig` version, `ExpansionConfig` version, source coverage state, top-k returned object IDs, emitted `neighbor_previews` by seed result, and whether the request ran in shadow mode
 - shadow mode must internally rank and persist at least the top 3 seed result IDs for parity metrics even when the user-requested `limit` is `1` or `2`
-- in shadow mode, the persisted execution record must also include the paired user-visible legacy top-k object IDs for the same request so shadow-vs-legacy parity can be computed on the same query set
+- in shadow mode, the persisted execution record must also include the paired user-visible legacy top-k object IDs for the same request
+- when the paired legacy request limit is `1` or `2`, shadow mode must still internally rank and persist the paired legacy top 3 seed result IDs for parity metrics even though only the lower user-visible limit is returned
 - `memory_feedback` must attach to that stored execution record for regression analysis and cutover decisions
 - `memory_open` and `memory_neighbors` must attach to the originating `query_execution_id` when present so token-to-answer paths remain traceable
 - when `memory_open.parent_object_id` is provided, that parent seed context must be persisted in the execution lineage log for later neighbor-attribution analysis
