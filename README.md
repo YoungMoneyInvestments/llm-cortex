@@ -218,6 +218,19 @@ cp examples/MEMORY.md "$CORTEX_WORKSPACE/MEMORY.md"
 # Add to ~/.claude/settings.json (see examples/settings.json):
 ```
 
+### Run The Offline Test Suite
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+python -m unittest discover -s tests -v
+```
+
+The current automated suite stays offline-safe. It exercises the public `src/`
+modules against temporary SQLite databases and does not require local services
+or live credentials.
+
 ### Add Session Bootstrap (15 minutes)
 
 ```bash
