@@ -283,8 +283,8 @@ Merge policy:
 
 Source authority precedence for merged duplicates:
 
-1. higher configured source authority for the candidate's `(source_family, object_type, authority_tier)`
-2. stronger intent-fit contribution
+1. stronger intent-fit contribution
+2. higher configured source authority for the candidate's `(source_family, object_type, authority_tier)`
 3. newer timestamp
 4. lexical `object_id`
 
@@ -293,7 +293,8 @@ When duplicates merge, the candidate that wins under the same source-authority m
 Field merge rules for exact duplicates:
 
 - canonical `object_id`, `abstract`, `overview_layer`, `detail_layer`, and freshness state come from the surviving candidate
-- `family_local_score`, `global_score`, and numeric `score_components` remain exactly those computed for the surviving candidate before duplicate merge
+- `family_local_score` remains exactly the surviving candidate's adapter-emitted local score
+- `global_score` and numeric `score_components` are computed only after duplicate collapse during cross-source ranking
 - `entities`, `task_markers`, `decision_markers`, and `related_object_ids` are unioned and deduped
 - `timestamp` uses the surviving candidate timestamp unless it is missing, then the newest non-missing duplicate timestamp wins
 - warnings and debug evidence may include contributed duplicate provenance and suppressed duplicate IDs
@@ -1117,10 +1118,10 @@ Feedback aggregation rule:
 Query execution logging:
 
 - every `memory_query` execution must persist `query_execution_id`
-- the persisted execution record must include engine version, `RankerConfig` version, `ExpansionConfig` version, source coverage state, top-k returned object IDs, and whether the request ran in shadow mode
+- the persisted execution record must include engine version, `RankerConfig` version, `ExpansionConfig` version, source coverage state, top-k returned object IDs, emitted `neighbor_previews` by seed result, and whether the request ran in shadow mode
 - in shadow mode, the persisted execution record must also include the paired user-visible legacy top-k object IDs for the same request so shadow-vs-legacy parity can be computed on the same query set
 - `memory_feedback` must attach to that stored execution record for regression analysis and cutover decisions
-- `memory_open` and `memory_neighbors` should attach to the originating `query_execution_id` when present so token-to-answer paths remain traceable
+- `memory_open` and `memory_neighbors` must attach to the originating `query_execution_id` when present so token-to-answer paths remain traceable
 - when `memory_open.parent_object_id` is provided, that parent seed context must be persisted in the execution lineage log for later neighbor-attribution analysis
 - when legacy compatibility paths are user-visible during shadow mode, their neighbor-result payloads and opened-object lineage must also be persisted under the same `query_execution_id`
 
@@ -1376,6 +1377,14 @@ Deterministic links:
 - shared `link_group_id`
 - explicit source references
 
+Deterministic `link_strength` contract:
+
+- `link_group_id` match: `1.00`
+- explicit source reference: `0.95`
+- shared `handoff_id`: `0.90`
+- shared `working_memory_thread_id`: `0.85`
+- shared `session_id`: `0.80`
+
 Heuristic links:
 
 - shared normalized entities above a confidence threshold
@@ -1391,6 +1400,14 @@ Heuristic links:
 - the resulting link is not dominated by a stronger deterministic relationship
 
 If embeddings are stale, missing, or disabled, semantic links must not be generated and debug output must record that omission.
+
+Heuristic `link_strength` contract:
+
+- `shared_entity` strength is `clip(ExpansionConfig.shared_entity_base + ExpansionConfig.shared_entity_step * matched_entity_count, 0, ExpansionConfig.shared_entity_cap)`
+- `shared_task` strength is `clip(ExpansionConfig.shared_task_base + ExpansionConfig.shared_task_step * shared_task_marker_count, 0, ExpansionConfig.shared_task_cap)`
+- `shared_decision` strength is `clip(ExpansionConfig.shared_decision_base + ExpansionConfig.shared_decision_step * shared_decision_marker_count, 0, ExpansionConfig.shared_decision_cap)`
+- `time_adjacent` strength is `clip(ExpansionConfig.time_adjacent_cap * (1 - time_delta_seconds / ExpansionConfig.time_adjacent_window_seconds), 0, ExpansionConfig.time_adjacent_cap)`
+- all deterministic and heuristic `link_strength` values are therefore comparable on the same `[0, 1]` scale
 
 ### Expansion order
 
@@ -1598,6 +1615,8 @@ Non-replayable family cutover rule:
 - replayable as-of-time history is the default prerequisite for public benchmark-based cutover
 - families without full replayability may still qualify for local/private cutover only through this alternate cutover path, which replaces the held-out validation and held-out test benchmark gates for that family
 - the alternate local/private path requires 14 consecutive days of shadow-read parity, at least 50 evaluable local shadow queries, stable `memory_open` resolution, no severity-1 regressions, and the same top-1/top-3/false-positive/context-usefulness/p95 acceptance thresholds otherwise required for replayable families
+- in this shadow-only alternate path, `top-1` and `top-3` are defined from the evaluable shadow-query set using the same accepted seed contexts as the 7-day parity gate: a hit occurs when any accepted seed context appears in shadow top-1 or shadow top-3 respectively
+- in this shadow-only alternate path, `false-positive rate` is the share of evaluable shadow queries whose shadow top-3 contains no accepted seed context and whose final aggregated explicit feedback is negative
 - those local/private parity and acceptance gates are the only cutover authority for non-replayable families until replayable retention exists
 - those families must not be counted toward public benchmark claims until replayable retention exists
 
