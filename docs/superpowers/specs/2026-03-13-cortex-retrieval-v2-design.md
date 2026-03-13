@@ -169,6 +169,7 @@ Candidate emission rules:
 - adapters must populate `family_local_score`
 - adapters must leave `global_score=None` and `score_components=None`; those fields are populated only after cross-source ranking
 - adapters must expose deterministic tie-break behavior for equal local scores
+- adapters must populate `provenance_object_ids` only with direct provenance ancestors that this object was materially derived from; `related_object_ids` remains the broader semantic/relational field and must not be used as a substitute for provenance lineage
 
 ### 4. CrossSourceRanker
 
@@ -375,6 +376,7 @@ class MemoryObject:
     task_markers: list[str]
     decision_markers: list[str]
     related_object_ids: list[str]
+    provenance_object_ids: list[str]
     abstract: str
     overview_layer: ContentLayer
     detail_layer: ContentLayer
@@ -1013,6 +1015,7 @@ Each result must include:
 
 - `query_execution_id: str | None` optional
 - `object_id: str` required
+- `parent_object_id: str | None` optional, required when opening a neighbor from a previously returned neighbor list and the caller wants lineage attribution to that seed context
 - `layer: Literal["abstract", "overview", "detail"]` required
 - `offset: int` optional, default 0, min 0, only for `layer="detail"`
 - `limit_bytes: int` optional, default 65536, min 1, max 262144, only for `layer="detail"`
@@ -1023,6 +1026,7 @@ Each result must include:
 - `limit_bytes < 1` or `limit_bytes > 262144` is a typed MCP error with `Error.scope="request"`
 - `offset` has no fixed maximum, but implementations must treat it as a seek into stored detail content rather than materializing skipped bytes
 - providing `offset` or `limit_bytes` when `layer != "detail"` is a typed MCP error with `Error.scope="request"`
+- providing `parent_object_id` without `query_execution_id` is a typed MCP error with `Error.scope="request"`
 
 `memory_open` response:
 
@@ -1106,8 +1110,11 @@ Query execution logging:
 
 - every `memory_query` execution must persist `query_execution_id`
 - the persisted execution record must include engine version, `RankerConfig` version, `ExpansionConfig` version, source coverage state, top-k returned object IDs, and whether the request ran in shadow mode
+- in shadow mode, the persisted execution record must also include the paired user-visible legacy top-k object IDs for the same request so shadow-vs-legacy parity can be computed on the same query set
 - `memory_feedback` must attach to that stored execution record for regression analysis and cutover decisions
 - `memory_open` and `memory_neighbors` should attach to the originating `query_execution_id` when present so token-to-answer paths remain traceable
+- when `memory_open.parent_object_id` is provided, that parent seed context must be persisted in the execution lineage log for later neighbor-attribution analysis
+- when legacy compatibility paths are user-visible during shadow mode, their neighbor-result payloads and opened-object lineage must also be persisted under the same `query_execution_id`
 
 ### Error behavior
 
@@ -1511,14 +1518,18 @@ Shadow-read pass/fail rule:
 
 - the family passes only if all parity metrics pass over the full 7-day window
 - any failed metric resets the 7-day parity window after the fix is deployed
-- shadow-read context usefulness is computed on the evaluable shadow-query set only
+- shadow-read `top-3 hit rate` and context usefulness are both computed on the evaluable shadow-query set only
 - an evaluable shadow query is one that, during the parity window, has either final aggregated explicit negative feedback, final aggregated `helpful` feedback with `object_id`, or a lineage trace showing at least one accepted object interaction on the user-visible legacy path
 - the lineage evaluation window is fixed at 15 minutes after the originating `query_execution_id` is created
 - lineage-derived accepted seed objects are the legacy result objects opened by the user for that `query_execution_id` within that 15-minute window
-- lineage-derived accepted neighbors are the neighbor objects opened via a detail-fetch path on the same `query_execution_id` within that 15-minute window and originating from the same seed context
+- lineage-derived accepted neighbors are the neighbor objects opened via a detail-fetch path on the same `query_execution_id` within that 15-minute window and carrying the matching `parent_object_id` seed context
 - queries with neither explicit feedback nor accepted lineage are excluded from the usefulness denominator and reported as `unevaluable_shadow_queries`
+- `shadow_top3_hit_rate = shadow_top3_hits / evaluable_shadow_queries`, where `shadow_top3_hits` counts evaluable queries whose accepted seed object appears in the shadow top-3 result IDs
+- `legacy_top3_hit_rate = legacy_top3_hits / evaluable_shadow_queries`, where `legacy_top3_hits` counts evaluable queries whose accepted seed object appears in the paired user-visible legacy top-3 result IDs
 - `production_estimated_context_usefulness = useful_shadow_queries / evaluable_shadow_queries`
+- `legacy_context_usefulness = useful_legacy_queries / evaluable_shadow_queries`
 - a shadow query counts as `useful_shadow_queries` only if the shadow result set contains at least one accepted seed object and, when accepted neighbors exist, the shadow result set includes that accepted neighbor set in `neighbor_previews` or `memory_neighbors`
+- a legacy query counts as `useful_legacy_queries` only if the paired user-visible legacy top-k contains an accepted seed object and, when accepted neighbors exist, the logged legacy neighbor payloads for that same seed context contain the accepted neighbor set
 - the final aggregated explicit negative feedback for a `query_execution_id` marks the shadow query not useful regardless of lineage
 - the parity gate cannot pass until `evaluable_shadow_queries >= 50`
 
