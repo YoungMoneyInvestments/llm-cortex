@@ -220,7 +220,10 @@ Duplicate detection keys:
 Duplicate hash contract:
 
 - `authoritative_content_hash` is the only canonical cross-object duplicate hash
-- adapters must compute it from the canonical content representation for the object
+- adapters must compute it from a canonical JSON envelope with stable key order
+- the canonical envelope must include: canonical `object_type`, normalized primary textual content, and canonical provenance identifier when needed to disambiguate identical text from different sources
+- normalization must trim surrounding whitespace, normalize line endings to `\n`, and normalize Unicode to NFC before hashing
+- the hash algorithm must be SHA-256 recorded under the active config version
 - layer-level `ContentLayer.content_hash` values are not used for cross-object dedupe unless explicitly copied into `authoritative_content_hash`
 
 Merge policy:
@@ -1376,6 +1379,12 @@ As-of-time replay contract:
 - the evaluation harness must reconstruct or filter source data to the query timestamp before building derived artifacts
 - derived artifacts for replay must be rebuilt from that as-of-time source state rather than reused from current live indexes
 - if a source family lacks replayable history, it must be excluded from public cutover metrics until a replayable retention path exists
+
+Non-replayable family cutover rule:
+
+- replayable as-of-time history is the default prerequisite for public benchmark-based cutover
+- families without full replayability may still qualify for local/private cutover only if they pass 14 days of shadow-read parity, at least 50 labeled local queries, and the same acceptance metrics otherwise required for benchmarked families
+- those families must not be counted toward public benchmark claims until replayable retention exists
 
 ### Public benchmark sanitization
 
