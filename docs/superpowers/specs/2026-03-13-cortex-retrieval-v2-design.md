@@ -253,7 +253,7 @@ Merge policy:
 
 - exact duplicates from different retrieval paths should be merged into one returned candidate
 - near-duplicates with materially different context may both remain visible but lower-ranked
-- suppressed duplicates still contribute evidence to the surviving candidate and may contribute neighbor links
+- suppressed duplicates may contribute provenance/debug evidence and may contribute neighbor links, but they must not change the surviving candidate's numeric scores
 
 Source authority precedence for merged duplicates:
 
@@ -263,14 +263,15 @@ Source authority precedence for merged duplicates:
 4. session summary or note object
 5. compatibility-generated synthetic object
 
-When duplicates merge, the highest-authority candidate survives as the canonical returned object. Lower-authority duplicates contribute score evidence and provenance metadata but are not separately returned.
+When duplicates merge, the highest-authority candidate survives as the canonical returned object. Lower-authority duplicates contribute provenance metadata and debug evidence but are not separately returned.
 
 Field merge rules for exact duplicates:
 
 - canonical `object_id`, `abstract`, `overview_layer`, `detail_layer`, and freshness state come from the surviving candidate
+- `family_local_score`, `global_score`, and numeric `score_components` remain exactly those computed for the surviving candidate before duplicate merge
 - `entities`, `task_markers`, `decision_markers`, and `related_object_ids` are unioned and deduped
 - `timestamp` uses the surviving candidate timestamp unless it is missing, then the newest non-missing duplicate timestamp wins
-- warnings and debug evidence may include contributed duplicate provenance
+- warnings and debug evidence may include contributed duplicate provenance and suppressed duplicate IDs
 - lower-authority duplicates may contribute provenance and neighbor links, but may not replace the surviving candidate's layers
 
 This stage is the main retrieval-accuracy improvement layer.
@@ -996,7 +997,7 @@ Each result must include:
 Query execution logging:
 
 - every `memory_query` execution must persist `query_execution_id`
-- the persisted execution record must include engine version, ranker version, source coverage state, top-k returned object IDs, and whether the request ran in shadow mode
+- the persisted execution record must include engine version, `RankerConfig` version, `ExpansionConfig` version, source coverage state, top-k returned object IDs, and whether the request ran in shadow mode
 - `memory_feedback` must attach to that stored execution record for regression analysis and cutover decisions
 - `memory_open` and `memory_neighbors` should attach to the originating `query_execution_id` when present so token-to-answer paths remain traceable
 
@@ -1496,7 +1497,7 @@ Each benchmark item must include:
 ### Metric definitions
 
 `context usefulness rate`
-- percentage of queries where the returned result set includes an acceptable seed object plus the labeled acceptable neighbor set, without requiring unrelated objects
+- percentage of queries where the returned result set includes an acceptable seed object plus the labeled acceptable neighbor set, without requiring the caller to open or fetch additional unrelated objects outside an acceptable context set
 
 `average tokens required`
 - estimated tokens consumed to reach an acceptable answer path, including the initial query response and any required `memory_open` or `memory_neighbors` calls
@@ -1509,7 +1510,7 @@ Benchmark annotations required for context usefulness:
 
 Harness rule:
 
-- a query counts as context-useful only if at least one acceptable seed object is returned and one labeled acceptable context set is fully satisfied by the returned neighbors
+- a query counts as context-useful only if at least one acceptable seed object is returned and one labeled acceptable context set is fully satisfied by the returned neighbors; additional unrelated rows in the payload do not negate usefulness unless the benchmark item explicitly marks them as a failure mode to avoid
 
 ### Acceptance criteria
 
