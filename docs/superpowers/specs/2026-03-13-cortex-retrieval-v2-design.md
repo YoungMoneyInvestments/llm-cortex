@@ -211,7 +211,7 @@ Versioned config contract:
 Required `RankerConfig` keys:
 
 - `feature_weights`: mapping from feature name to weight in `[0, 1]`
-- `source_authority`: mapping keyed by `(source_family, object_type, authority_tier)` to a total order rank
+- `source_authority`: mapping keyed by `(source_family, object_type, authority_tier)` to a total order rank where lower numeric rank is stronger authority
 - `source_diversity_bonus`: mapping from `source_family` to additive bonus in `[0, 0.25]`
 - `near_duplicate_similarity_threshold`: float in `[0, 1]`
 - `near_duplicate_lexical_threshold`: float in `[0, 1]`
@@ -322,15 +322,15 @@ Merge policy:
 - exact duplicates from different retrieval paths should be merged into one returned candidate
 - near-duplicates with materially different context may both remain visible but lower-ranked
 - suppressed duplicates may contribute provenance/debug evidence and may contribute neighbor links, but they must not change the surviving candidate's numeric scores
+- exact-duplicate collapse is pre-rank and therefore intentionally query-intent-agnostic
 
 Source authority precedence for merged duplicates:
 
-1. stronger intent-fit contribution
-2. higher configured source authority for the candidate's `(source_family, object_type, authority_tier)`
-3. newer timestamp
-4. lexical `object_id`
+1. stronger configured source authority for the candidate's `(source_family, object_type, authority_tier)`, where lower numeric rank is stronger
+2. newer timestamp
+3. lexical `object_id`
 
-When duplicates merge, the candidate that wins under the same source-authority mapping and deterministic tie-break sequence used by the ranker survives as the canonical returned object. Lower-authority duplicates contribute provenance metadata and debug evidence but are not separately returned.
+When exact duplicates merge, the candidate that wins under this pre-rank duplicate-survivor precedence survives as the canonical returned object. Lower-authority duplicates contribute provenance metadata and debug evidence but are not separately returned.
 
 Field merge rules for exact duplicates:
 
