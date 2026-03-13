@@ -201,6 +201,16 @@ The ranker produces:
 - explanation fields
 - ranking trace for debugging
 
+Normative final-score formula:
+
+- normalize each feature to `[0, 1]`
+- apply configured feature weights from `RankerConfig`
+- mask unavailable features before weighted summation
+- renormalize by the sum of active feature weights
+- apply duplicate penalties after weighted summation
+- apply diversity bonus after duplicate penalties
+- final score is clipped to `[0, 1]`
+
 Final ranked results must use deterministic tie-breaks after equal final score:
 
 1. stronger intent-fit contribution
@@ -883,6 +893,7 @@ Each result must include:
 
 `memory_open` request:
 
+- `query_execution_id: str | None` optional
 - `object_id: str` required
 - `layer: Literal["abstract", "overview", "detail"]` required
 - `offset: int` optional, default 0, only for `layer="detail"`
@@ -894,6 +905,7 @@ Each result must include:
 
 `memory_neighbors` request:
 
+- `query_execution_id: str | None` optional
 - `object_id: str` required
 - `limit: int` optional, default 10
 - `link_types: list[str]` optional
@@ -944,6 +956,7 @@ Query execution logging:
 - every `memory_query` execution must persist `query_execution_id`
 - the persisted execution record must include engine version, ranker version, source coverage state, top-k returned object IDs, and whether the request ran in shadow mode
 - `memory_feedback` must attach to that stored execution record for regression analysis and cutover decisions
+- `memory_open` and `memory_neighbors` should attach to the originating `query_execution_id` when present so token-to-answer paths remain traceable
 
 ### Error behavior
 
@@ -1103,6 +1116,13 @@ Retrieval v2 must define how source changes propagate into derived state.
 - regenerate layers and markers
 - rebuild embeddings if overview text changed or embedding version changed
 - recompute affected neighborhood links
+
+Published/pending persistence contract:
+
+- object metadata tracks one published artifact set and zero or one pending artifact set
+- pending layers, embeddings, and links must be written under a new version identifier before publish
+- publish is one atomic transaction that swaps the published version pointer, updates searchable indexes, and marks the previous version superseded
+- query and open paths must never mix published and pending artifacts within the same response
 
 ### Delete or tombstone
 
