@@ -208,6 +208,29 @@ Versioned config contract:
 - `ExpansionConfig` is the single source of truth for semantic thresholds, neighbor thresholds, chronology balancing, and expansion budgets
 - every `query_execution_id` must log the `RankerConfig` and `ExpansionConfig` versions used for that run
 
+Required `RankerConfig` keys:
+
+- `feature_weights`: mapping from feature name to weight in `[0, 1]`
+- `source_authority`: mapping keyed by `(source_family, object_type, authority_tier)` to a total order rank
+- `source_diversity_bonus`: mapping from `source_family` to additive bonus in `[0, 0.25]`
+- `near_duplicate_similarity_threshold`: float in `[0, 1]`
+- `near_duplicate_lexical_threshold`: float in `[0, 1]`
+- `near_duplicate_penalty`: additive penalty in `[0, 0.5]`
+- `final_tie_break`: fixed ordered list `["intent_fit", "source_authority", "timestamp", "object_id"]`
+
+Required `ExpansionConfig` keys:
+
+- `semantic_min_similarity`: float in `[0, 1]`
+- `min_link_strength`: float in `[0, 1]`
+- `support_count_bonus`: additive bonus in `[0, 0.25]`
+- `shared_entity_base`, `shared_entity_step`, `shared_entity_cap`
+- `shared_task_base`, `shared_task_step`, `shared_task_cap`
+- `shared_decision_base`, `shared_decision_step`, `shared_decision_cap`
+- `time_adjacent_cap`: float in `[0, 1]`
+- `time_adjacent_window_seconds`: positive integer
+- `per_seed_expansion_limit`: positive integer
+- `global_expansion_limit`: positive integer
+
 The ranker produces:
 
 - final score
@@ -235,6 +258,13 @@ Source diversity bonus contract:
 - the candidate with the highest `effective_score` wins rank `r`; ties break with the deterministic final tie-break sequence defined below
 - the diversity bonus may therefore be applied at most once per `source_family` within a ranked query result set
 - duplicate collapse and duplicate penalties run before diversity-bonus eligibility is evaluated
+
+Score-component accounting rule:
+
+- post-sum adjustments must be represented explicitly as `ScoreComponent` entries named `duplicate_penalty`, `near_duplicate_penalty`, and `diversity_bonus`
+- those synthetic components must use `weight=1.0` and `contribution` equal to their signed additive effect on final score before clipping
+- the sum of all `ScoreComponent.contribution` values must equal the unclipped final score
+- clipping to `[0, 1]` happens after component aggregation and must be reported separately in debug output if it changes the unclipped score
 
 Final ranked results must use deterministic tie-breaks after equal final score:
 
@@ -1046,7 +1076,7 @@ Each result must include:
 
 - `query_execution_id: str | None` optional
 - `object_id: str` required
-- `parent_object_id: str | None` optional, required when opening a neighbor from a previously returned neighbor list and the caller wants lineage attribution to that seed context
+- `parent_object_id: str | None` optional, but mandatory for parity/lineage logging whenever opening a neighbor from a previously returned neighbor list
 - `layer: Literal["abstract", "overview", "detail"]` required
 - `offset: int` optional, default 0, min 0, only for `layer="detail"`
 - `limit_bytes: int` optional, default 65536, min 1, max 262144, only for `layer="detail"`
@@ -1149,6 +1179,7 @@ Query execution logging:
 - `memory_open` and `memory_neighbors` must attach to the originating `query_execution_id` when present so token-to-answer paths remain traceable
 - when `memory_open.parent_object_id` is provided, that parent seed context must be persisted in the execution lineage log for later neighbor-attribution analysis
 - when legacy compatibility paths are user-visible during shadow mode, their neighbor-result payloads and opened-object lineage must also be persisted under the same `query_execution_id`
+- compatibility adapters must preserve or synthesize `parent_object_id` for neighbor opens whenever the originating legacy interaction exposed a seed context
 
 ### Error behavior
 
@@ -1581,7 +1612,7 @@ Shadow-read pass/fail rule:
 - `production_estimated_context_usefulness = useful_shadow_queries / evaluable_shadow_queries`
 - `legacy_context_usefulness = useful_legacy_queries / evaluable_shadow_queries`
 - a shadow query counts as `useful_shadow_queries` only if any accepted seed context is fully satisfied: its `seed_object_id` appears in the shadow result set, it can satisfy `minimum_accepted_layer`, and its `accepted_neighbor_set`, when non-empty, is fully present in `neighbor_previews` or `memory_neighbors` for that same seed context
-- a legacy query counts as `useful_legacy_queries` only if any accepted seed context is fully satisfied by the paired user-visible legacy path: its `seed_object_id` appears in the legacy top-k, it can satisfy `minimum_accepted_layer`, and its `accepted_neighbor_set`, when non-empty, is fully present in the logged legacy neighbor payloads for that same seed context
+- a legacy query counts as `useful_legacy_queries` only if any accepted seed context is fully satisfied by the paired user-visible legacy path: its `seed_object_id` appears in the legacy top-3, it can satisfy `minimum_accepted_layer`, and its `accepted_neighbor_set`, when non-empty, is fully present in the logged legacy neighbor payloads for that same seed context
 - the final aggregated explicit negative feedback for a `query_execution_id` marks the shadow query not useful regardless of lineage
 - the parity gate cannot pass until `evaluable_shadow_queries >= 50`
 
