@@ -208,6 +208,14 @@ Source authority precedence for merged duplicates:
 
 When duplicates merge, the highest-authority candidate survives as the canonical returned object. Lower-authority duplicates contribute score evidence and provenance metadata but are not separately returned.
 
+Field merge rules for exact duplicates:
+
+- canonical `object_id`, `abstract`, `overview_layer`, `detail_layer`, and freshness state come from the surviving candidate
+- `entities`, `task_markers`, `decision_markers`, and `related_object_ids` are unioned and deduped
+- `timestamp` uses the surviving candidate timestamp unless it is missing, then the newest non-missing duplicate timestamp wins
+- warnings and debug evidence may include contributed duplicate provenance
+- lower-authority duplicates may contribute provenance and neighbor links, but may not replace the surviving candidate's layers
+
 This stage is the main retrieval-accuracy improvement layer.
 
 ### 5. NeighborhoodExpander
@@ -343,6 +351,14 @@ Identity migration rule:
 - `memory_query` must surface relevant state through warnings/debug when stale data affects ranking
 - `memory_open` must surface layer freshness through `status` and warnings
 - `memory_neighbors` must exclude stale or tombstoned neighbors by default unless explicitly requested by a future extension
+
+Update state model:
+
+- each object has one published version that remains queryable
+- rebuilds create pending derived artifacts for the next published version
+- `memory_query` reads only the published version
+- `memory_open` reads the published version unless a future admin/debug path explicitly requests pending state
+- when rebuild completes, layers, embeddings, and links swap atomically from pending to published
 
 ### Why this model matters
 
@@ -630,6 +646,14 @@ Canonical warnings location:
 - existing object, malformed stored ref: typed MCP error with `Error.code="invalid_ref"` and `Error.scope="resolver"`
 - existing object, successful resolution: successful `OpenLayerResult` with `status="success"`
 - `layer="abstract"`: synthesize an inline `ContentLayer` from the stored abstract string and return it as a successful `OpenLayerResult`
+
+`memory_open(detail)` payload contract:
+
+- detail responses may be truncated
+- default maximum inline detail payload: 64 KB of UTF-8 text
+- if detail exceeds that limit, return the first chunk inline and emit a warning indicating truncation
+- the response must set `payload.token_estimate` for the returned chunk
+- a future extension may add cursor-based detail pagination; initial v2 only guarantees first-chunk inline detail
 
 ### NeighborhoodLink
 
