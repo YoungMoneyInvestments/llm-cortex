@@ -595,6 +595,7 @@ class QueryResult:
 class NeighborResult:
     object_id: str
     abstract: str
+    timestamp: str | None
     global_score: float
     link_type: str
     link_strength: float
@@ -649,11 +650,11 @@ Canonical warnings location:
 
 `memory_open(detail)` payload contract:
 
-- detail responses may be truncated
-- default maximum inline detail payload: 64 KB of UTF-8 text
-- if detail exceeds that limit, return the first chunk inline and emit a warning indicating truncation
-- the response must set `payload.token_estimate` for the returned chunk
-- a future extension may add cursor-based detail pagination; initial v2 only guarantees first-chunk inline detail
+- native v2 callers may receive truncated detail
+- default maximum inline detail payload for native v2 callers: 64 KB of UTF-8 text
+- if detail exceeds that limit for a native v2 caller, return the first chunk inline and emit a warning indicating truncation
+- compatibility-backed `cami_memory_details` calls must retrieve full detail for migrated families, even if that requires internal pagination or multiple fetches behind the compatibility adapter
+- the response must set `payload.token_estimate` for the returned chunk or full body
 
 ### NeighborhoodLink
 
@@ -805,6 +806,7 @@ Each result must include:
 - `object_id: str` required
 - `limit: int` optional, default 10
 - `link_types: list[str]` optional
+- `mode: Literal["relevance", "chronology"]` optional, default `"relevance"`
 
 `memory_neighbors` response:
 
@@ -815,9 +817,11 @@ Each result must include:
 `memory_neighbors` ordering and dedupe:
 
 - dedupe by `object_id`
-- order by global neighbor score descending
+- order by global neighbor score descending in `mode="relevance"`
+- order by timestamp ascending around the seed object in `mode="chronology"`
 - ties break by stronger link strength, then newer timestamp if available, then lexical object ID
 - returned neighbors include `abstract` always and `overview_layer` only if a future request flag explicitly asks for it; initial v2 should default `overview_layer` to `None`
+- `mode="chronology"` must include the seed object in the returned sequence
 
 `memory_feedback` request:
 
@@ -866,7 +870,7 @@ Compatibility matrix:
   - non-onboarded families may be omitted unless explicitly exposed by compatibility adapters
 
 - `cami_memory_timeline` -> `memory_neighbors`
-  - preserve chronology-oriented output for session-linked and time-adjacent neighbors
+  - preserve chronology-oriented output for session-linked and time-adjacent neighbors by using `mode="chronology"`
   - if v2 neighborhood data is unavailable, fall back to legacy timeline behavior for that family
 
 - `cami_memory_details` -> `memory_open`
@@ -880,6 +884,71 @@ Compatibility matrix:
   - preserve message-centric result ordering and source labeling
 
 During rollout, legacy responses remain user-visible stable while v2 runs in shadow mode for comparison.
+
+Per-family onboarding table:
+
+- observations
+  - source of truth: observations database
+  - canonical object type: observation
+  - immutable key: numeric observation ID
+  - `object_id`: `obs:<observation_id>`
+  - update/delete signal: hook writes and worker updates
+  - resolver path: observation content resolver
+  - replayability: yes
+
+- working_memory
+  - source of truth: working-memory state files
+  - canonical object type: working-memory entry
+  - immutable key: persisted entry ID
+  - `object_id`: `wm:<session_key>:<entry_id>`
+  - update/delete signal: working-memory writes
+  - resolver path: working-memory resolver
+  - replayability: partial
+
+- handoffs
+  - source of truth: handoff documents
+  - canonical object type: handoff
+  - immutable key: persisted handoff ID
+  - `object_id`: `handoff:<handoff_id>`
+  - update/delete signal: handoff document writes
+  - resolver path: handoff resolver
+  - replayability: yes if retained
+
+- session_summaries
+  - source of truth: session summary records
+  - canonical object type: session summary
+  - immutable key: session ID
+  - `object_id`: `session:<session_id>`
+  - update/delete signal: session-end summarization
+  - resolver path: session-summary resolver
+  - replayability: yes if retained
+
+- notes
+  - source of truth: note files or note records
+  - canonical object type: note
+  - immutable key: persisted note ID
+  - `object_id`: `note:<note_id>`
+  - update/delete signal: note updates
+  - resolver path: note resolver
+  - replayability: partial
+
+- messages
+  - source of truth: message store
+  - canonical object type: message
+  - immutable key: platform message ID
+  - `object_id`: `msg:<platform>:<message_id>`
+  - update/delete signal: message ingestion/update pipeline
+  - resolver path: message resolver
+  - replayability: yes if retained
+
+- knowledge_graph
+  - source of truth: graph entity store
+  - canonical object type: graph entity
+  - immutable key: entity ID
+  - `object_id`: `kg:<entity_id>`
+  - update/delete signal: graph seed/update pipeline
+  - resolver path: graph resolver
+  - replayability: partial unless snapshots are retained
 
 ## Storage and Indexing Strategy
 
