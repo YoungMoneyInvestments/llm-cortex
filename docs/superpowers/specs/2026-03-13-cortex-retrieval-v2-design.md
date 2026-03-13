@@ -396,6 +396,23 @@ Update state model:
 - `memory_open` reads the published version unless a future admin/debug path explicitly requests pending state
 - when rebuild completes, layers, embeddings, and links swap atomically from pending to published
 
+Update state transitions:
+
+1. source change detected
+   - published object remains queryable
+   - pending rebuild state is created
+   - published `overview_freshness` and `detail_freshness` remain whatever they were before the change
+   - published `embedding_freshness` and `link_freshness` may become `stale` immediately if the source change invalidates them
+
+2. rebuild in progress
+   - `memory_query` continues serving the published object
+   - `memory_open` continues serving the published object
+   - warnings/debug may note pending rebuild and stale derived artifacts
+
+3. rebuild complete
+   - new layers, embeddings, and links become the published version atomically
+   - freshness fields reset to `fresh` for the rebuilt artifacts
+
 ### Why this model matters
 
 Current Cortex data is spread across multiple storage forms with different semantics. Retrieval v2 needs one consistent object shape so every source can participate in shared ranking and context expansion.
@@ -496,7 +513,7 @@ class ResolvedLayerResult:
     status: Literal["success", "absent", "stale", "not_found"]
     payload: ContentLayer
     resolved_text: str | None
-    warnings: list[str]
+    warnings: list["Warning"]
 ```
 
 Resolver invariants:
@@ -889,14 +906,14 @@ Each result must include:
 
 - dedupe by `object_id`
 - order by global neighbor score descending in `mode="relevance"`
-- order by timestamp ascending in `mode="chronology"`, with the seed row inserted at its natural chronological position
+- chronology mode selects the nearest timestamped neighbors before and after the seed object first, then orders the final slice chronologically with the seed row at its natural position
 - ties break by stronger link strength, then newer timestamp if available, then lexical object ID
 - returned neighbors include `abstract` always and `overview_layer` only if a future request flag explicitly asks for it; initial v2 should default `overview_layer` to `None`
 - `mode="chronology"` must include the seed object in the returned sequence
 - in `mode="chronology"`, `limit` includes the seed row
 - the seed row must set `is_seed=true`, `link_type="seed"`, `link_strength=0.0`, and `support_count=1`
 - when timestamps are missing, place those rows after timestamped rows using lexical `object_id` tie-breaks
-- chronology mode should prefer the nearest before/after neighbors around the seed within the requested `limit`
+- chronology mode should balance before/after neighbors around the seed when possible within the requested `limit`
 
 `memory_neighbors` behavior table:
 
