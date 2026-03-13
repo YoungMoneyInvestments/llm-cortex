@@ -406,10 +406,44 @@ class NeighborPreview:
 class OpenLayerResult:
     object_id: str
     layer: Literal["abstract", "overview", "detail"]
+    status: Literal["success", "absent", "stale", "not_found"]
     payload: ContentLayer
     resolved_text: str | None
     warnings: list[str]
+
+@dataclass
+class QueryResult:
+    object_id: str
+    source_family: str
+    object_type: str
+    abstract: str
+    score: float
+    score_components: list["ScoreComponent"]
+    overview_layer: ContentLayer | None
+    neighbor_previews: list[NeighborPreview]
+
+@dataclass
+class NeighborResult:
+    object_id: str
+    abstract: str
+    global_score: float
+    link_type: str
+    link_strength: float
+    support_count: int
+    overview_layer: ContentLayer | None
 ```
+
+`memory_open` response mapping:
+
+- resolver `success` maps to `OpenLayerResult.status="success"`
+- resolver `absent` maps to `OpenLayerResult.status="absent"`
+- resolver `stale` maps to `OpenLayerResult.status="stale"`
+- resolver `not_found` maps to `OpenLayerResult.status="not_found"`
+
+Canonical warnings location:
+
+- warnings live only in `OpenLayerResult.warnings`
+- the top-level `memory_open` response must not duplicate warnings separately
 
 ### NeighborhoodLink
 
@@ -513,7 +547,7 @@ The current MCP tools should remain available temporarily, but the new engine sh
 `memory_query` response:
 
 - `query_plan`
-- `results`
+- `results: list[QueryResult]`
 - `debug` optional
 - `warnings` optional
 
@@ -528,6 +562,13 @@ Each result must include:
 - `overview_layer` optional, included only when `include_overview=true`
 - `neighbor_previews: list[NeighborPreview]`
 
+`include_overview=true` invariant:
+
+- when `include_overview=true`, `overview_layer` in `QueryResult` must always be returned as a resolved inline `ContentLayer`
+- if the source stored a ref-backed overview, the server must resolve it before returning the query result
+- if that resolution fails, `overview_layer` must be `None` and the result warnings/debug output must record the failure
+- `memory_open` remains the authoritative path for `detail` and for explicit status inspection
+
 `memory_open` request:
 
 - `object_id: str` required
@@ -536,7 +577,6 @@ Each result must include:
 `memory_open` response:
 
 - `OpenLayerResult`
-- `warnings` if the layer is absent or stale
 
 `memory_neighbors` request:
 
@@ -546,8 +586,16 @@ Each result must include:
 
 `memory_neighbors` response:
 
-- ordered list of linked objects
-- link metadata for each neighbor
+- `results: list[NeighborResult]`
+- optional `debug`
+- optional `warnings`
+
+`memory_neighbors` ordering and dedupe:
+
+- dedupe by `object_id`
+- order by global neighbor score descending
+- ties break by stronger link strength, then newer timestamp if available, then lexical object ID
+- returned neighbors include `abstract` always and `overview_layer` only if a future request flag explicitly asks for it; initial v2 should default `overview_layer` to `None`
 
 `memory_feedback` request:
 
