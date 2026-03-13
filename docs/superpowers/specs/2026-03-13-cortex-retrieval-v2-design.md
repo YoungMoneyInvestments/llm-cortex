@@ -136,14 +136,22 @@ Candidate fields:
 - `object_id`
 - `source_family`
 - `object_type`
+- `authority_tier`
+- `state`
+- `source_ref`
+- `provenance_namespace`
+- `authoritative_content_hash`
 - `family_local_score`
 - `timestamp`
 - `entities`
 - `task_markers`
 - `decision_markers`
+- `related_object_ids`
+- `provenance_object_ids`
 - `abstract`
 - `overview_layer`
 - `detail_layer`
+- `metadata`
 
 Adapters are responsible for source-specific retrieval logic, including:
 
@@ -274,13 +282,11 @@ Merge policy:
 
 Source authority precedence for merged duplicates:
 
-1. native migrated source family object
-2. observation object with direct provenance
-3. handoff or working-memory object with explicit linkage
-4. session summary or note object
-5. compatibility-generated synthetic object
+1. higher configured source authority for the candidate's `(source_family, object_type, authority_tier)`
+2. newer timestamp
+3. lexical `object_id`
 
-When duplicates merge, the highest-authority candidate survives as the canonical returned object. Lower-authority duplicates contribute provenance metadata and debug evidence but are not separately returned.
+When duplicates merge, the candidate that wins under the same source-authority mapping and deterministic tie-break sequence used by the ranker survives as the canonical returned object. Lower-authority duplicates contribute provenance metadata and debug evidence but are not separately returned.
 
 Field merge rules for exact duplicates:
 
@@ -333,9 +339,9 @@ The contract for layered content is authoritative and must be used consistently 
 
 Published/pending representation rule:
 
-- the canonical `MemoryObject` fields `abstract`, `overview_layer`, `detail_layer`, freshness fields, and generation metadata always represent the currently published artifact set
+- the canonical `MemoryObject` fields `abstract`, marker fields, `overview_layer`, `detail_layer`, freshness fields, and generation metadata always represent the currently published artifact set
 - `published_artifact_version` names the artifact set currently exposed through query/open APIs
-- `pending_artifact_version` and `pending_artifact_state` represent the next artifact set being built off-path; its concrete layers, embeddings, and links live in side tables keyed by that pending version until publish
+- `pending_artifact_version` and `pending_artifact_state` represent the next artifact set being built off-path; its pending `abstract`, marker fields, generation metadata, concrete layers, embeddings, and links live in side tables keyed by that pending version until publish
 - `published_source_version` and `pending_source_version` track which source snapshot each artifact set was derived from
 
 `abstract` is always inline text. `overview` and `detail` are always represented as `ContentLayer` objects, whether the bytes are inline or referenced externally. The system must not mix plain inline strings in one layer and ad hoc `*_ref` fields elsewhere.
@@ -597,12 +603,14 @@ Formal grammar:
 - `/` is not allowed inside `object_id`
 - malformed refs must raise typed `Error(code="invalid_ref", scope="resolver")`, not `not_found`
 - well-formed refs with missing targets must resolve to `not_found`
+- the ref scheme must match the namespace encoded in `object_id`; for example `wm://obs:123/detail` is `invalid_ref`, not `not_found`
 
 Resolver rules:
 
 - each source family must register a resolver for its own `content_ref` namespace
 - resolvers must return a `ResolvedLayerResult`
 - `memory_open` must use the registered resolver rather than source-specific branching in the MCP layer
+- resolver namespace validation must happen before target lookup, and any scheme/object-id namespace mismatch must raise `Error(code="invalid_ref", scope="resolver")`
 
 Resolver return contract:
 
@@ -1264,8 +1272,8 @@ Retrieval v2 must define how source changes propagate into derived state.
 Published/pending persistence contract:
 
 - the canonical `MemoryObject` row tracks one published artifact set through `published_artifact_version` and zero or one pending artifact set through `pending_artifact_version`
-- pending layers, embeddings, and links must be written under `pending_artifact_version` in side tables before publish
-- publish is one atomic transaction that swaps `published_artifact_version` to the prior `pending_artifact_version`, copies the pending source-version pointer into `published_source_version`, updates searchable indexes, clears the pending pointer/state, and marks the previous version superseded
+- pending `abstract`, marker fields, generation metadata, layers, embeddings, and links must be written under `pending_artifact_version` in side tables before publish
+- publish is one atomic transaction that swaps `published_artifact_version` to the prior `pending_artifact_version`, copies the pending source-version pointer into `published_source_version`, copies the pending `abstract`, marker fields, generation metadata, layers, and freshness fields into the canonical `MemoryObject` row, updates searchable indexes, clears the pending pointer/state, and marks the previous version superseded
 - query and open paths must never mix published and pending artifacts within the same response
 
 ### Delete or tombstone
