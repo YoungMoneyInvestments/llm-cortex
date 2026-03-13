@@ -136,7 +136,7 @@ Candidate fields:
 - `object_id`
 - `source_family`
 - `object_type`
-- `score_components`
+- `family_local_score`
 - `timestamp`
 - `entities`
 - `task_markers`
@@ -158,6 +158,8 @@ Candidate emission rules:
 
 - no adapter may emit more than its allocated per-family budget
 - adapters must return candidates already ordered by family-local relevance
+- adapters must populate `family_local_score`
+- adapters must leave `global_score=None` and `score_components=None`; those fields are populated only after cross-source ranking
 - adapters must expose deterministic tie-break behavior for equal local scores
 
 ### 4. CrossSourceRanker
@@ -631,8 +633,8 @@ class NormalizedCandidate:
     overview_layer: ContentLayer
     detail_layer: ContentLayer
     family_local_score: float
-    global_score: float
-    score_components: list["ScoreComponent"]
+    global_score: float | None
+    score_components: list["ScoreComponent"] | None
     metadata: dict[str, Any]
 ```
 
@@ -653,6 +655,7 @@ Per-family timestamp source:
 - knowledge graph: entity creation or first-seen timestamp; update time only as explicit fallback
 
 Ranker and query logic must use `NormalizedCandidate.state` directly rather than hidden store lookups.
+Pre-rank adapter outputs must therefore have `global_score=None` and `score_components=None`; ranked outputs must populate both.
 
 ### ScoreComponent
 
@@ -878,11 +881,15 @@ The current MCP tools should remain available temporarily, but the new engine sh
 `memory_query` request:
 
 - `query: str` required
-- `limit: int` optional, default 10, max 50
+- `limit: int` optional, default 10, min 1, max 50
 - `source_families: list[str]` optional
 - `include_debug: bool` optional, default false
 - `include_overview: bool` optional, default false
 - `expand_neighbors: bool` optional, default true
+
+`memory_query` request bounds:
+
+- `limit < 1` or `limit > 50` is a typed MCP error with `Error.scope="request"`
 
 `memory_query` response:
 
@@ -933,8 +940,15 @@ Each result must include:
 - `query_execution_id: str | None` optional
 - `object_id: str` required
 - `layer: Literal["abstract", "overview", "detail"]` required
-- `offset: int` optional, default 0, only for `layer="detail"`
-- `limit_bytes: int` optional, default 65536, only for `layer="detail"`
+- `offset: int` optional, default 0, min 0, only for `layer="detail"`
+- `limit_bytes: int` optional, default 65536, min 1, max 262144, only for `layer="detail"`
+
+`memory_open` request bounds:
+
+- negative `offset` is a typed MCP error with `Error.scope="request"`
+- `limit_bytes < 1` or `limit_bytes > 262144` is a typed MCP error with `Error.scope="request"`
+- `offset` has no fixed maximum, but implementations must treat it as a seek into stored detail content rather than materializing skipped bytes
+- providing `offset` or `limit_bytes` when `layer != "detail"` is a typed MCP error with `Error.scope="request"`
 
 `memory_open` response:
 
@@ -944,9 +958,13 @@ Each result must include:
 
 - `query_execution_id: str | None` optional
 - `object_id: str` required
-- `limit: int` optional, default 10
+- `limit: int` optional, default 10, min 1, max 50
 - `link_types: list[str]` optional
 - `mode: Literal["relevance", "chronology"]` optional, default `"relevance"`
+
+`memory_neighbors` request bounds:
+
+- `limit < 1` or `limit > 50` is a typed MCP error with `Error.scope="request"`
 
 `memory_neighbors` response:
 
@@ -972,6 +990,14 @@ Each result must include:
 - in `mode="chronology"`, `limit` includes the seed row
 - the seed row must set `is_seed=true`, `link_type="seed"`, `link_strength=0.0`, and `support_count=1`
 - when timestamps are missing, place those rows after timestamped rows using lexical `object_id` tie-breaks
+
+Direct `NeighborResult` collapse semantics:
+
+- after any `link_types` filtering and object-level dedupe, multiple surviving links between the seed object and one neighbor must collapse into a single displayed `NeighborResult`
+- displayed `link_type` uses the same deterministic priority as `seed_link_type` in `neighbor_previews`: deterministic non-time link types first, then `semantic_neighbor`, then `time_adjacent`
+- ties between candidate displayed link types break by stronger link strength, then lexical link-type name
+- displayed `link_strength` is the strongest surviving link strength for the displayed `link_type`
+- `support_count` is the number of surviving qualifying seed-to-neighbor links after filtering and before displayed-link collapse
 
 `memory_neighbors` behavior table:
 
@@ -1402,7 +1428,9 @@ Shadow-read pass/fail rule:
 - any failed metric resets the 7-day parity window after the fix is deployed
 - shadow-read context usefulness is computed on the evaluable shadow-query set only
 - an evaluable shadow query is one that, during the parity window, has either explicit `memory_feedback` attached to its `query_execution_id` or a lineage trace showing at least one accepted object interaction on the user-visible legacy path
-- lineage-derived accepted seed objects are the legacy result objects opened by the user for that `query_execution_id`; lineage-derived accepted neighbors are the neighbor objects subsequently opened or selected from the same seed context within the configured evaluation window
+- the lineage evaluation window is fixed at 15 minutes after the originating `query_execution_id` is created
+- lineage-derived accepted seed objects are the legacy result objects opened by the user for that `query_execution_id` within that 15-minute window
+- lineage-derived accepted neighbors are the neighbor objects opened via a detail-fetch path or recorded by an explicit `neighbor_selected` interaction event on the same `query_execution_id` within that 15-minute window and originating from the same seed context
 - queries with neither explicit feedback nor accepted lineage are excluded from the usefulness denominator and reported as `unevaluable_shadow_queries`
 - `production_estimated_context_usefulness = useful_shadow_queries / evaluable_shadow_queries`
 - a shadow query counts as `useful_shadow_queries` only if the shadow result set contains at least one accepted seed object and, when accepted neighbors exist, the shadow result set includes that accepted neighbor set in `neighbor_previews` or `memory_neighbors`
