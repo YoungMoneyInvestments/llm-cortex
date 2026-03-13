@@ -1352,10 +1352,18 @@ This prevents v2 queries from becoming incomplete during migration.
 
 ### Shadow-read parity criteria
 
-- no severe correctness regression on top-3 hit rate
-- improved or equal context usefulness
-- bounded latency increase
-- stable object resolution for `memory_open` on migrated families
+- minimum 7 consecutive days of shadow traffic for the family
+- minimum 200 shadowed queries in that window
+- top-3 hit rate must not regress by more than 2 percentage points versus the legacy path
+- production-estimated context usefulness must be equal or better versus the legacy path
+- p95 latency must not worsen by more than 20 percent
+- `memory_open` object resolution must remain stable for migrated families
+
+Shadow-read pass/fail rule:
+
+- the family passes only if all parity metrics pass over the full 7-day window
+- any failed metric resets the 7-day parity window after the fix is deployed
+- production-estimated context usefulness is computed from labeled feedback and query-lineage traces collected during the shadow window
 
 ### Cutover rule
 
