@@ -264,6 +264,7 @@ class MemoryObject:
     object_id: str
     source_family: str
     object_type: str
+    visibility: Literal["active", "tombstoned"]
     created_at: str | None
     updated_at: str | None
     session_id: str | None
@@ -278,6 +279,10 @@ class MemoryObject:
     abstract: str
     overview_layer: ContentLayer
     detail_layer: ContentLayer
+    overview_freshness: Literal["fresh", "stale", "missing"]
+    detail_freshness: Literal["fresh", "stale", "missing"]
+    embedding_freshness: Literal["fresh", "stale", "missing", "disabled"]
+    link_freshness: Literal["fresh", "stale", "missing"]
     metadata: dict[str, Any]
 ```
 
@@ -315,6 +320,16 @@ Compatibility invariants:
 
 - translating a supported legacy ID to `object_id` and back must be stable within a rollout phase
 - shadow-mode comparisons must assert that legacy fetches and translated `object_id` fetches resolve to the same underlying provenance
+
+### State contract
+
+- `visibility="active"` objects are eligible for ranking
+- `visibility="tombstoned"` objects remain openable by ID but are excluded from default ranking and neighbor expansion
+- `overview_freshness`, `detail_freshness`, `embedding_freshness`, and `link_freshness` are authoritative per-object state fields
+- ranking must exclude stale embeddings and stale links
+- `memory_query` must surface relevant state through warnings/debug when stale data affects ranking
+- `memory_open` must surface layer freshness through `status` and warnings
+- `memory_neighbors` must exclude stale or tombstoned neighbors by default unless explicitly requested by a future extension
 
 ### Why this model matters
 
@@ -705,6 +720,14 @@ The current MCP tools should remain available temporarily, but the new engine sh
 - `results: list[QueryResult]`
 - `debug` optional
 - `warnings: list[Warning]` optional
+
+`source_families` semantics:
+
+- `source_families`, when present, is a hard allowlist for seed retrieval
+- the router may only allocate candidate budget to listed families
+- unsupported or unavailable listed families must produce structured warnings
+- omitted families must not appear as seed results
+- neighbor expansion may still return linked objects from omitted families only if those neighbors are explicitly labeled as expanded context rather than seed matches
 
 Each result must include:
 
