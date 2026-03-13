@@ -177,6 +177,18 @@ Ranking features should include:
 - source diversity bonus
 - duplicate or near-duplicate penalties
 
+Source authority contract:
+
+- source authority is a versioned global ranking config keyed by `source_family` and `object_type`
+- the default precedence is:
+  1. native migrated source family object
+  2. observation object with direct provenance
+  3. handoff or working-memory object with explicit linkage
+  4. session summary or note object
+  5. compatibility-generated synthetic object
+- ranking uses this same ordered mapping for the source-authority feature and for deterministic final tie-breaks
+- the mapping is invariant by default, not query-intent-specific
+
 The ranker produces:
 
 - final score
@@ -195,9 +207,15 @@ Final ranked results must use deterministic tie-breaks after equal final score:
 Duplicate detection keys:
 
 - exact `source_ref`
-- exact `content_hash`
+- exact `authoritative_content_hash`
 - explicit `related_object_ids` linkage
 - compatibility provenance pointing at the same underlying legacy item
+
+Duplicate hash contract:
+
+- `authoritative_content_hash` is the only canonical cross-object duplicate hash
+- adapters must compute it from the canonical content representation for the object
+- layer-level `ContentLayer.content_hash` values are not used for cross-object dedupe unless explicitly copied into `authoritative_content_hash`
 
 Merge policy:
 
@@ -607,7 +625,6 @@ class OpenLayerResult:
     resolved_text: str | None
     byte_range: tuple[int, int] | None
     has_more: bool
-    next_cursor: str | None
     warnings: list["Warning"]
 
 @dataclass
@@ -686,7 +703,8 @@ Canonical warnings location:
 - native v2 callers may receive chunked detail
 - default inline detail chunk limit for native v2 callers: 64 KB of UTF-8 text
 - `offset` and `limit_bytes` control which detail chunk is returned
-- if more detail remains after the returned chunk, emit a truncation warning and expose `next_cursor`
+- if more detail remains after the returned chunk, emit a truncation warning and set `has_more=true`
+- native callers request the next chunk by advancing `offset` to the previous `byte_range[1]`
 - compatibility-backed `cami_memory_details` calls must retrieve full detail for migrated families, even if that requires internal pagination or multiple fetches behind the compatibility adapter
 - the response must set `payload.token_estimate` for the returned chunk or full body
 
