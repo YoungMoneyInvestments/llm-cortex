@@ -504,9 +504,13 @@ class NormalizedCandidate:
     source_family: str
     object_type: str
     timestamp: str | None
+    source_ref: str | None
+    authoritative_content_hash: str | None
     entities: list[str]
     task_markers: list[str]
     decision_markers: list[str]
+    related_object_ids: list[str]
+    provenance_object_ids: list[str]
     abstract: str
     overview_layer: ContentLayer
     detail_layer: ContentLayer
@@ -1209,10 +1213,20 @@ Each benchmark item must include:
 ### Metric definitions
 
 `context usefulness rate`
-- percentage of queries where the returned result set includes enough seed plus neighbor context to answer without opening unrelated items
+- percentage of queries where the returned result set includes an acceptable seed object plus the labeled acceptable neighbor set, without requiring unrelated objects
 
 `average tokens required`
 - estimated tokens consumed to reach an acceptable answer path, including the initial query response and any required `memory_open` or `memory_neighbors` calls
+
+Benchmark annotations required for context usefulness:
+
+- acceptable seed object IDs
+- acceptable neighbor object IDs, if context is required
+- acceptable seed-plus-neighbor sets when multiple combinations are valid
+
+Harness rule:
+
+- a query counts as context-useful only if at least one acceptable seed object is returned and one labeled acceptable context set is fully satisfied by the returned neighbors
 
 ### Acceptance criteria
 
