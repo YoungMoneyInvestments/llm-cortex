@@ -214,8 +214,12 @@ Normative final-score formula:
 Source diversity bonus contract:
 
 - diversity bonus is prefix-dependent and applies only to seed-ranking rows
-- for a candidate at rank position `r`, `diversity_bonus(candidate, r)` equals the configured per-family bonus only if no higher-ranked seed candidate in positions `< r` has the same `source_family`
+- seed ranking uses a greedy prefix-selection algorithm rather than a single global sort
+- first compute `base_score` for every eligible seed candidate using the weighted feature sum, masked-feature renormalization, and duplicate penalties, but excluding the diversity bonus
+- for rank position `r`, evaluate every remaining candidate with `effective_score = clip(base_score + diversity_bonus, 0, 1)`
+- `diversity_bonus(candidate, r)` equals the configured per-family bonus only if no already-selected seed candidate in positions `< r` has the same `source_family`
 - otherwise `diversity_bonus(candidate, r) = 0.0`
+- the candidate with the highest `effective_score` wins rank `r`; ties break with the deterministic final tie-break sequence defined below
 - the diversity bonus may therefore be applied at most once per `source_family` within a ranked query result set
 - duplicate collapse and duplicate penalties run before diversity-bonus eligibility is evaluated
 
@@ -232,17 +236,18 @@ Duplicate detection keys:
 
 - exact `source_ref`
 - exact `authoritative_content_hash`
-- explicit `related_object_ids` linkage
 - compatibility provenance pointing at the same underlying legacy item
 
 Duplicate hash contract:
 
 - `authoritative_content_hash` is the only canonical cross-object duplicate hash
 - adapters must compute it from a canonical JSON envelope with stable key order
-- the canonical envelope must include: canonical `object_type`, normalized primary textual content, and canonical provenance identifier when needed to disambiguate identical text from different sources
+- the canonical envelope must include: canonical `object_type`, normalized primary textual content, canonical provenance namespace, and canonical immutable provenance identifier
 - normalization must trim surrounding whitespace, normalize line endings to `\n`, and normalize Unicode to NFC before hashing
 - the hash algorithm must be SHA-256 recorded under the active config version
 - layer-level `ContentLayer.content_hash` values are not used for cross-object dedupe unless explicitly copied into `authoritative_content_hash`
+- `related_object_ids` are general semantic relationships and must never be interpreted as exact-duplicate evidence
+- if a future adapter wants to contribute explicit duplicate assertions, it must do so through a dedicated duplicate-provenance field rather than `related_object_ids`
 
 Merge policy:
 
@@ -382,6 +387,7 @@ Legacy translation rules:
 - legacy message IDs must translate directly to `msg:<platform>:<id>` when platform is known
 - compatibility adapters must expose deterministic translation helpers for legacy IDs they still support
 - `memory_open` and `memory_neighbors` must accept either canonical `object_id` values or legacy IDs that a compatibility adapter can translate unambiguously
+- both APIs must canonicalize accepted legacy IDs to canonical `object_id` before object lookup and logging
 
 Immutable key rules:
 
@@ -406,7 +412,8 @@ Identity migration rule:
 
 - `visibility="active"` objects are eligible for ranking
 - `visibility="tombstoned"` objects remain openable by ID but are excluded from default ranking and neighbor expansion
-- `overview_freshness`, `detail_freshness`, `embedding_freshness`, and `link_freshness` are authoritative per-object state fields
+- `overview_freshness`, `detail_freshness`, `embedding_freshness`, and `link_freshness` are authoritative per-object state fields for the currently published artifact set only
+- a newer unseen source revision does not by itself flip published `overview_freshness` or `detail_freshness` to `stale`; that condition must instead surface as a warning/debug state such as `source_newer_than_published`
 - ranking must exclude stale embeddings and stale links
 - ranking may continue to use the last fully fresh `abstract` and `overview_layer` until replacement text and indexes are ready, then atomically swap to the rebuilt version
 - `memory_query` must surface relevant state through warnings/debug when stale data affects ranking
@@ -426,8 +433,9 @@ Update state transitions:
 1. source change detected
    - published object remains queryable
    - pending rebuild state is created
-   - published `overview_freshness` and `detail_freshness` remain whatever they were before the change
+   - published `overview_freshness` and `detail_freshness` remain whatever they were before the change because they describe the published artifact set, not source recency
    - published `embedding_freshness` and `link_freshness` may become `stale` immediately if the source change invalidates them
+   - query/open warnings must indicate that the source is newer than the published artifact set until the rebuild publishes
 
 2. rebuild in progress
    - `memory_query` continues serving the published object
@@ -756,6 +764,7 @@ Canonical warnings location:
 `memory_open` behavior table:
 
 - malformed request or unsupported `layer` token: typed MCP error with `Error.scope="request"`
+- untranslatable legacy ID: typed MCP error with `Error.scope="object"`
 - nonexistent `object_id`: successful `OpenLayerResult` with `status="not_found"`
 - existing object, requested layer absent: successful `OpenLayerResult` with `status="absent"`
 - existing object, requested ref stale: successful `OpenLayerResult` with `status="stale"`
@@ -948,14 +957,20 @@ Each result must include:
 
 - dedupe by `object_id`
 - order by global neighbor score descending in `mode="relevance"`
-- chronology mode selects the nearest timestamped neighbors before and after the seed object first, then orders the final slice chronologically with the seed row at its natural position
+- chronology mode uses the following deterministic selection algorithm
+- if the seed has a timestamp:
+  1. partition eligible deduped neighbors into `before`, `after`, and `untimestamped`
+  2. sort `before` by absolute time delta to the seed ascending, then stronger link strength, then newer timestamp, then lexical `object_id`
+  3. sort `after` by absolute time delta to the seed ascending, then stronger link strength, then older timestamp, then lexical `object_id`
+  4. fill the `limit - 1` non-seed slots by alternating between the head of `before` and the head of `after`, starting with whichever side has the smaller head delta; if one side is exhausted, continue with the other side; only after both timestamped sides are exhausted may `untimestamped` rows fill remaining slots
+  5. render the selected timestamped rows in ascending timestamp order with the seed row inserted between the selected `before` and `after` rows at the seed timestamp position; append selected `untimestamped` rows after all timestamped rows
+- if the seed timestamp is missing, chronology mode selects the non-seed rows using the same candidate order as `mode="relevance"`; the rendered order is then: seed row first, selected timestamped rows in ascending timestamp order, then selected untimestamped rows in lexical `object_id` order
 - ties break by stronger link strength, then newer timestamp if available, then lexical object ID
 - returned neighbors include `abstract` always and `overview_layer` only if a future request flag explicitly asks for it; initial v2 should default `overview_layer` to `None`
 - `mode="chronology"` must include the seed object in the returned sequence
 - in `mode="chronology"`, `limit` includes the seed row
 - the seed row must set `is_seed=true`, `link_type="seed"`, `link_strength=0.0`, and `support_count=1`
 - when timestamps are missing, place those rows after timestamped rows using lexical `object_id` tie-breaks
-- chronology mode should balance before/after neighbors around the seed when possible within the requested `limit`
 
 `memory_neighbors` behavior table:
 
@@ -1139,10 +1154,11 @@ Retrieval v2 must define how source changes propagate into derived state.
 
 ### Update
 
-- on source update, mark the existing object stale
+- on source update, create or refresh a pending rebuild for the next published version
 - regenerate layers and markers
 - rebuild embeddings if overview text changed or embedding version changed
 - recompute affected neighborhood links
+- if the source change invalidates published embeddings or links before rebuild completes, mark only those derived artifacts stale on the published version and emit `source_newer_than_published` warnings until publish
 
 Published/pending persistence contract:
 
