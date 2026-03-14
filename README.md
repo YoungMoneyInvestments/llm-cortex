@@ -130,4 +130,4 @@ See the [Architecture Overview](docs/01-ARCHITECTURE-OVERVIEW.md) to understand 
 
 ## License
 
-MIT
+Copyright (c) 2026 Cameron Bennion / Young Money Investments. All rights reserved. Patent pending.
