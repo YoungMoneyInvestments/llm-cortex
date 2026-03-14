@@ -1,2 +1,45 @@
+# OS
 .DS_Store
+Thumbs.db
+
+# Git worktrees
 .worktrees/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+venv/
+.venv/
+*.egg
+
+# Environment / secrets
+.env
+.env.*
+*.key
+*.pem
+*.cert
+credentials.json
+auth-profiles.json
+
+# Databases (runtime data — never commit)
+*.db
+*.sqlite
+*.sqlite3
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Planning artifacts (local)
+.planning/
+
+# Coverage / test artifacts
+.coverage
+htmlcov/
+.pytest_cache/

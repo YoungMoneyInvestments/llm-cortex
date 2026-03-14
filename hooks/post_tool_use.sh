@@ -9,6 +9,8 @@
 #   CORTEX_WORKER_PORT — Worker port (default: 37778)
 #   CORTEX_WORKER_API_KEY — Required bearer token for POST endpoints
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PYTHON="${CORTEX_PYTHON:-python3}"
 WORKER_PORT="${CORTEX_WORKER_PORT:-37778}"
 WORKER_URL="http://127.0.0.1:$WORKER_PORT"
 AUTH_KEY="${CORTEX_WORKER_API_KEY:-}"
@@ -60,5 +62,11 @@ curl -s --max-time 2 \
             raw_output: $output
         }'
     )" > /dev/null 2>&1 &
+
+# AIR: Feed event to Adaptive Inference Routing harvester (fire-and-forget)
+AIR_CLI="$SCRIPT_DIR/../scripts/air_cli.py"
+if [ -f "$AIR_CLI" ]; then
+    echo "$INPUT_JSON" | "$PYTHON" "$AIR_CLI" ingest > /dev/null 2>&1 &
+fi
 
 exit 0
