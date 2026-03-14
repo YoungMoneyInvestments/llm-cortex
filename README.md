@@ -92,6 +92,33 @@ For AIR, set `AIR_CLASSIFIER_MODE=local` for zero-cost local classification, or 
 
 ---
 
+## How This Compares
+
+There are other memory tools out there. Here's what makes LLM Cortex different:
+
+| Project | What It Does | What's Missing |
+|---------|-------------|----------------|
+| [Mem0](https://mem0.ai/) | Generic memory layer for AI apps ($24M funded) | Flat memory store — no layered architecture, no tool dispatch optimization |
+| [Claude-Mem](https://github.com/thedotmack/claude-mem) | Claude Code session capture plugin | Single-layer capture, no knowledge graph, no AIR |
+| [Memory-MCP](https://github.com/yuvalsuede/memory-mcp) | Two-tier MCP memory server | No observation pipeline, no pattern learning, no working memory |
+| [Hindsight](https://hindsight.vectorize.io/) | MCP retain/recall/reflect | No tool dispatch optimization, no session bootstrap |
+
+**On the routing side**, academic research ([RouteLLM](https://openreview.net/forum?id=8sSqNntaMr), [BEST-Route](https://arxiv.org/html/2506.22716v1), [MoMA](https://arxiv.org/html/2509.07571)) focuses on routing queries between *different models* (send easy questions to a cheap model, hard ones to an expensive model). That's model selection.
+
+**AIR solves a different problem entirely:** it optimizes which *tool* your model reaches for based on what's actually worked for *you*. No existing framework does per-user, within-session tool dispatch optimization. This is a new category.
+
+LLM Cortex is the only project that combines brain-inspired layered memory *and* adaptive tool routing in one system. Each piece works independently, but together they compound.
+
+---
+
+## Contributing
+
+Contributions are welcome. If you're interested in improving memory retrieval, extending AIR pattern detection, adding support for new LLM agents, or anything else — open an issue or submit a PR.
+
+See the [Architecture Overview](docs/01-ARCHITECTURE-OVERVIEW.md) to understand how the layers connect before diving in.
+
+---
+
 ## Recent Updates
 
 - **Adaptive Inference Routing (AIR)** — Learns tool-call patterns, eliminates unnecessary lookups, gets faster per user over time
