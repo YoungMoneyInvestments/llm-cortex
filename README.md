@@ -9,51 +9,42 @@ Claude Code forgets everything between sessions. Cortex fixes that — it gives 
 ## What It Does
 
 ```
-                         ┌─────────────────────────────────────┐
-                         │           Claude Code Session        │
-                         │                                     │
-                         │   Knows: current time, active goals,│
-                         │   recent work, pending items,       │
-                         │   relationships, optimized routes   │
-                         └──────────┬──────────┬───────────────┘
-                                    │          │
-                    ┌───────────────┘          └────────────────┐
-                    ▼                                           ▼
-    ┌───────────────────────────┐           ┌──────────────────────────────┐
-    │     MEMORY SYSTEM         │           │    ADAPTIVE INFERENCE        │
-    │                           │           │    ROUTING (AIR)             │
-    │  Observations    Search   │           │                              │
-    │  ┌──────────┐  ┌───────┐ │           │  Observes tool-call patterns │
-    │  │ Every    │  │ Find  │ │           │  Learns optimized shortcuts  │
-    │  │ tool use │  │ past  │ │           │  Injects routes into context │
-    │  │ captured │  │ work  │ │           │  Gets faster over time       │
-    │  └──────────┘  └───────┘ │           │                              │
-    │                           │           │  ┌────────────────────────┐  │
-    │  Knowledge    Working    │           │  │ "commit changes"       │  │
-    │  Graph        Memory     │           │  │  → skip Skill lookup   │  │
-    │  ┌──────────┐ ┌───────┐ │           │  │  → git add && commit   │  │
-    │  │ Entity   │ │ Goals │ │           │  │  (learned from you)    │  │
-    │  │ links    │ │ state │ │           │  └────────────────────────┘  │
-    │  └──────────┘ └───────┘ │           │                              │
-    └───────────────────────────┘           └──────────────────────────────┘
-                    │                                           │
-                    └───────────────┬───────────────────────────┘
-                                    │
-                    ┌───────────────┴───────────────┐
-                    │      4 Lifecycle Hooks         │
-                    │                               │
-                    │  Session Start → Load context  │
-                    │  Tool Use     → Capture + AIR  │
-                    │  User Prompt  → Log + hint     │
-                    │  Session End  → Summarize      │
-                    └───────────────────────────────┘
+  ┌──────────────────────────────────────────────────────────┐
+  │                   CLAUDE CODE SESSION                    │
+  │                                                          │
+  │  Knows: current time, active goals, recent work,         │
+  │  pending items, relationships, optimized routes          │
+  └────────────────────────┬─────────────────────────────────┘
+                           │
+              ┌────────────┴────────────┐
+              ▼                         ▼
+  ┌────────────────────┐   ┌─────────────────────────────┐
+  │   MEMORY SYSTEM    │   │  ADAPTIVE INFERENCE         │
+  │                    │   │  ROUTING (AIR)              │
+  │  • Observations    │   │                             │
+  │  • Search          │   │  Observes tool-call patterns│
+  │  • Knowledge Graph │   │  Learns optimized shortcuts │
+  │  • Working Memory  │   │  Injects routes into context│
+  │  • Session History │   │  Gets faster over time      │
+  └─────────┬──────────┘   └──────────────┬──────────────┘
+            │                             │
+            └──────────┬──────────────────┘
+                       ▼
+         ┌───────────────────────────┐
+         │    4 LIFECYCLE HOOKS      │
+         │                           │
+         │  Session Start → Context  │
+         │  Tool Use    → Capture    │
+         │  User Prompt → Hint       │
+         │  Session End → Summarize  │
+         └───────────────────────────┘
 ```
 
 **9 memory layers**, each inspired by a different part of human cognition:
 
 | Layer | Inspired By | Purpose |
 |-------|------------|---------|
-| **AIR** | **Motor learning** | **Learns optimized tool-dispatch shortcuts at the routing layer** |
+| **Adaptive Inference Routing** | **Motor learning** | **Learns tool-call patterns, eliminates unnecessary lookups, gets faster per user over time** |
 | Observation Pipeline | Procedural memory | Captures every tool use and prompt automatically |
 | Session Bootstrap | Prospective memory | Loads recent context, goals, and pending work on startup |
 | Auto Memory | Long-term memory | Permanent notes Claude always sees (MEMORY.md) |
