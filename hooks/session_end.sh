@@ -38,4 +38,12 @@ curl -s --max-time 2 \
     -d "$(jq -n --arg sid "$SID" '{session_id: $sid}')" \
     > /dev/null 2>&1 &
 
+[removed]
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PYTHON="${CORTEX_PYTHON:-python3}"
+[removed]
+[removed]
+[removed]
+fi
+
 exit 0
