@@ -1,4 +1,4 @@
-# Claude Cortex: Implementation Guide
+# LLM Cortex: Implementation Guide
 ### Step-by-step setup for any project
 
 ---

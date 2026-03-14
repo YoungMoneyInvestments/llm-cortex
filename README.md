@@ -34,7 +34,7 @@ LLM Cortex solves the **memory problem**. AIR solves the **habits problem**. Tog
 ## How It Works
 
 <p align="center">
-  <img src="docs/claude_cortex_architecture.svg" alt="LLM Cortex Architecture" width="680">
+  <img src="docs/llm_cortex_architecture.svg" alt="LLM Cortex Architecture" width="680">
 </p>
 
 **9 memory layers**, each inspired by a different part of human cognition:
@@ -58,8 +58,8 @@ Each layer is independent — implement any one without the others.
 ## Get Started
 
 ```bash
-git clone https://github.com/YoungMoneyInvestments/claude-cortex.git
-cd claude-cortex
+git clone https://github.com/YoungMoneyInvestments/llm-cortex.git
+cd llm-cortex
 pip install -r requirements.txt
 ```
 
