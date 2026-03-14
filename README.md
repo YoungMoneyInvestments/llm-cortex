@@ -42,6 +42,7 @@ Neuroscience has identified distinct memory systems in the human brain, each ser
 | **Semantic memory** | General knowledge and relationships between concepts | Entity-relationship graph | **Knowledge Graph** |
 | **Associative recall** | Finding connections between related memories | Multi-source search fusion | **Hybrid Search** |
 | **Chunking** | Breaking complex info into manageable pieces | Graph-based context partitioning | **RLM-Graph** |
+| **Motor learning** | Muscle memory for repeated actions | Learned tool-dispatch shortcuts | **AIR** 🎯 |
 
 Humans don't have one type of memory. They have an interconnected system where different memory types reinforce each other. Your AI agent needs the same thing.
 
@@ -114,6 +115,9 @@ Claude's **semantic memory**. A NetworkX graph of entities (people, projects, co
 ### Layer 7: RLM-Graph
 Claude's **chunking ability**. When a query involves too many entities and relationships to fit in a single context window, RLM-Graph uses the knowledge graph's topology to create meaningful partitions, processes each one, then merges the results. Complex questions that would normally be truncated randomly are instead decomposed intelligently.
 
+### 🎯 AIR: Adaptive Inference Routing
+Claude's **motor learning**. Just as humans develop muscle memory for repeated actions, AIR observes tool-call patterns over time and learns optimized shortcuts. When you say "commit the changes" and Claude tries a Skill lookup, fails, then falls back to `git add && git commit` — AIR remembers. Next time, it skips the failed path entirely. The system gets measurably faster per user over time, without any changes to model weights. Supports both Claude API and local TF-IDF classification, with asymmetric confidence scoring (bad routes die fast, good routes accrete slowly). See the full [AIR specification](docs/superpowers/specs/adaptive-inference-routing.md).
+
 ---
 
 ## Production Results
@@ -167,34 +171,50 @@ The difference isn't incremental. It's the difference between working with someo
 
 ```
 claude-cortex/
-├── src/                        # Canonical public runtime surface
-│   ├── memory_worker.py        # Layer 0: Background observation processor
-│   ├── unified_vector_store.py # Layer 0: SQLite FTS5 + vector search
-│   ├── memory_retriever.py     # Layer 0: 3-layer token-efficient retrieval
-│   ├── mcp_memory_server.py    # Layer 0: MCP server for the five cami_* tools
-│   └── knowledge_graph.py      # Layer 6: Entity-relationship graph
-├── scripts/                    # Helpers and bootstrap utilities
-│   ├── context_loader.py       # Layer 2: Session bootstrap
-│   ├── working_memory.py       # Layer 3: Goals, scratchpad, state
-│   ├── hybrid_search.py        # Layer 5: Multi-source search fusion
-│   ├── query_knowledge_graph.py # Layer 6: Graph query CLI
-│   ├── rlm_graph.py            # Layer 7: Recursive context partitioning
-│   ├── seed_graph.py           # Layer 6: Graph seeding helper
-│   └── start_worker.sh         # Worker lifecycle management
-├── hooks/                      # Claude Code lifecycle hooks
-│   ├── session_start.sh        # Starts worker + runs context loader
-│   ├── post_tool_use.sh        # Captures tool observations
-│   ├── user_prompt_submit.sh   # Captures user prompts
-│   └── session_end.sh          # Finalizes sessions
-├── examples/                   # Example configurations
-│   ├── MEMORY.md               # Example MEMORY.md for Layer 1
-│   ├── settings.json           # Example Claude Code settings.json
+├── src/                          # Canonical public runtime surface
+│   ├── memory_worker.py          # Layer 0: Background observation processor
+│   ├── unified_vector_store.py   # Layer 0: SQLite FTS5 + vector search
+│   ├── memory_retriever.py       # Layer 0: 3-layer token-efficient retrieval
+│   ├── mcp_memory_server.py      # Layer 0: MCP server for the five cami_* tools
+│   ├── knowledge_graph.py        # Layer 6: Entity-relationship graph
+│   └── air/                      # 🎯 Adaptive Inference Routing
+│       ├── config.py             #    Configuration with env var overrides
+│       ├── storage.py            #    SQLite adapter for rules + events
+│       ├── harvester.py          #    Telemetry ingestion from hooks
+│       ├── compiler.py           #    Pattern detection (miss→recover)
+│       ├── classifier.py         #    Intent classification (API or local)
+│       ├── router.py             #    Hash-based route lookup engine
+│       ├── scorer.py             #    Confidence scoring + decay + pruning
+│       └── injector.py           #    CLAUDE.md + hook injection
+├── scripts/                      # Helpers and bootstrap utilities
+│   ├── air_cli.py                # 🎯 AIR CLI (ingest, compile, inject, hint)
+│   ├── context_loader.py         # Layer 2: Session bootstrap
+│   ├── working_memory.py         # Layer 3: Goals, scratchpad, state
+│   ├── hybrid_search.py          # Layer 5: Multi-source search fusion
+│   ├── query_knowledge_graph.py  # Layer 6: Graph query CLI
+│   ├── rlm_graph.py              # Layer 7: Recursive context partitioning
+│   ├── seed_graph.py             # Layer 6: Graph seeding helper
+│   └── start_worker.sh           # Worker lifecycle management
+├── hooks/                        # Claude Code lifecycle hooks (AIR-integrated)
+│   ├── session_start.sh          # Starts worker + context loader + AIR inject
+│   ├── post_tool_use.sh          # Captures observations + feeds AIR harvester
+│   ├── user_prompt_submit.sh     # Captures prompts + AIR per-message hints
+│   └── session_end.sh            # Finalizes sessions + AIR pattern compilation
+├── tests/                        # Offline-safe test suite
+│   ├── test_air/                 # AIR module tests (37 tests)
+│   └── ...                       # Memory system tests
+├── examples/                     # Example configurations
+│   ├── MEMORY.md                 # Example MEMORY.md for Layer 1
+│   ├── settings.json             # Example Claude Code settings.json
 │   └── working_memory_state.json # Example working memory state
-├── docs/                       # Architecture and implementation guides
+├── docs/                         # Architecture and implementation guides
 │   ├── 01-ARCHITECTURE-OVERVIEW.md
 │   ├── 02-IMPLEMENTATION-GUIDE.md
-│   └── 03-QUICK-START.md
-├── requirements.txt            # Python dependencies
+│   ├── 03-QUICK-START.md
+│   └── superpowers/specs/        # Design specifications
+│       ├── adaptive-inference-routing.md  # AIR conceptual framework
+│       └── 2026-03-14-air-implementation-design.md
+├── requirements.txt              # Python dependencies
 ├── LICENSE
 └── README.md
 ```
@@ -325,6 +345,8 @@ Runtime components use environment variables for configuration:
 | `CAMIROUTER_API_KEY` | unset | Required when `CAMIROUTER_URL` is set |
 | `CORTEX_ENV_FILE` | unset | Optional env file containing `OPENAI_API_KEY=...` |
 | `OPENAI_API_KEY` | unset | Optional embedding key when `CORTEX_EMBEDDING_PROVIDER=openai` |
+| `AIR_CLASSIFIER_MODE` | `api` | AIR intent classifier: `api` (Claude Haiku) or `local` (TF-IDF) |
+| `ANTHROPIC_API_KEY` | unset | Required when `AIR_CLASSIFIER_MODE=api` |
 
 ### Workspace Layout
 
@@ -343,7 +365,8 @@ $CORTEX_WORKSPACE/
 $CORTEX_DATA_DIR/
 ├── cortex-observations.db             # Layer 0: Observation store
 ├── cortex-vectors.db                  # Layer 0: FTS5 + vector search
-└── cortex-knowledge-graph.db          # Layer 6: Entity graph
+├── cortex-knowledge-graph.db          # Layer 6: Entity graph
+└── air-routing.db                     # 🎯 AIR: Routing rules + tool events
 
 $CORTEX_LOG_DIR/
 └── memory-worker.log                  # Worker logs
@@ -367,41 +390,199 @@ $CORTEX_LOG_DIR/
 - `networkx` (for Layer 6 knowledge graph)
 - Optional: `sqlite-vec`, `openai` (for vector similarity search)
 
-## How It Works
+## System Architecture
 
+### Complete Data Flow
+
+```mermaid
+flowchart TB
+    subgraph SESSION_START["🟢 Session Start"]
+        SS[SessionStart Hook]
+        CL[Context Loader<br/><i>Scans last 48h</i>]
+        AIR_INJ["AIR Injector<br/><i>Routes → CLAUDE.md</i>"]
+        AIR_COMP["AIR Compiler<br/><i>Compile patterns</i>"]
+        AIR_DECAY["AIR Decay<br/><i>Prune stale routes</i>"]
+    end
+
+    subgraph LIVE_SESSION["⚡ Live Session"]
+        USER([User Message])
+        UPS[UserPromptSubmit Hook]
+        AIR_HINT["AIR Hint Engine<br/><i>Per-message routing</i>"]
+        CLAUDE["Claude Code<br/><i>Full context: time, goals,<br/>memory, routes</i>"]
+        TOOLS[Tool Execution]
+        PTU[PostToolUse Hook]
+    end
+
+    subgraph MEMORY_LAYER["🧠 Memory System"]
+        OBS[(Observations DB<br/><i>SQLite</i>)]
+        VEC[(Vector Store<br/><i>FTS5 + Embeddings</i>)]
+        KG[(Knowledge Graph<br/><i>NetworkX</i>)]
+        MEM[MEMORY.md<br/><i>Permanent notes</i>]
+        WM[Working Memory<br/><i>Goals & scratchpad</i>]
+    end
+
+    subgraph AIR_LAYER["🎯 Adaptive Inference Routing"]
+        HARVEST[Harvester<br/><i>Capture tool events</i>]
+        EVENTS[(Tool Events DB)]
+        COMPILER[Pattern Compiler<br/><i>Detect miss→recover</i>]
+        CLASSIFIER[Intent Classifier<br/><i>API or Local</i>]
+        RULES[(Routing Rules<br/><i>Confidence-scored</i>)]
+        ROUTER[Router<br/><i>Hash-based lookup</i>]
+    end
+
+    subgraph MCP_TOOLS["🔧 MCP Tools"]
+        S1[cami_memory_search]
+        S2[cami_memory_timeline]
+        S3[cami_memory_details]
+        S4[cami_memory_save]
+        S5[cami_memory_graph_search]
+    end
+
+    subgraph SESSION_END["🔴 Session End"]
+        SE[SessionEnd Hook]
+        FIN[Finalize Session<br/><i>Summarize & index</i>]
+        AIR_SE["AIR Compile<br/><i>Session patterns</i>"]
+    end
+
+    %% Session Start Flow
+    SS --> CL
+    SS --> AIR_COMP
+    AIR_COMP --> AIR_DECAY
+    AIR_DECAY --> AIR_INJ
+    CL --> CLAUDE
+    AIR_INJ --> MEM
+
+    %% Live Session Flow
+    USER --> UPS
+    UPS --> AIR_HINT
+    AIR_HINT --> CLAUDE
+    CLAUDE --> TOOLS
+    TOOLS --> PTU
+    PTU --> OBS
+    PTU --> HARVEST
+
+    %% Memory Retrieval
+    CLAUDE <--> S1 & S2 & S3 & S4 & S5
+    S1 & S2 & S3 --> OBS & VEC
+    S5 --> KG
+    S4 --> VEC
+
+    %% AIR Pipeline
+    HARVEST --> EVENTS
+    COMPILER --> EVENTS
+    COMPILER --> CLASSIFIER
+    CLASSIFIER --> RULES
+    ROUTER --> RULES
+    AIR_HINT --> ROUTER
+
+    %% Session End
+    SE --> FIN
+    SE --> AIR_SE
+    FIN --> OBS
+    AIR_SE --> COMPILER
+
+    %% Styling
+    classDef start fill:#2d6a4f,stroke:#1b4332,color:#fff
+    classDef live fill:#1d3557,stroke:#0d1b2a,color:#fff
+    classDef memory fill:#5e548e,stroke:#231942,color:#fff
+    classDef air fill:#e76f51,stroke:#bc4749,color:#fff
+    classDef mcp fill:#2a9d8f,stroke:#264653,color:#fff
+    classDef end_s fill:#6c757d,stroke:#495057,color:#fff
+    classDef db fill:#ffd166,stroke:#ef476f,color:#000
+
+    class SS,CL,AIR_INJ,AIR_COMP,AIR_DECAY start
+    class USER,UPS,AIR_HINT,CLAUDE,TOOLS,PTU live
+    class MEM,WM memory
+    class HARVEST,COMPILER,CLASSIFIER,ROUTER air
+    class S1,S2,S3,S4,S5 mcp
+    class SE,FIN,AIR_SE end_s
+    class OBS,VEC,KG,EVENTS,RULES db
 ```
-SESSION START
-    |
-    v
-[SessionStart Hook] --> start_worker.sh + context_loader.py
-    |                        |
-    |   Worker captures:     |   Scans last 48h:
-    |   - tool observations  |   - memory files
-    |   - user prompts       |   - session handoffs
-    |   - session events     |   - working memory
-    |                        |   - incomplete items
-    v                        v
-[Worker running]       [Context injected]
-    |                        |
-    +--------+---------------+
-             |
-             v
-    Claude Code Session
-    (knows: time, goals, recent work, pending items, relationships)
-             |
-             |--- Recall past decisions --> cami_memory_search (MCP)
-             |--- Get context           --> cami_memory_timeline (MCP)
-             |--- Full details          --> cami_memory_details (MCP)
-             |--- Save a memory         --> cami_memory_save (MCP)
-             |--- Graph expansion       --> cami_memory_graph_search (MCP)
-             |--- Query relationships   --> knowledge graph
-             |--- Complex questions     --> RLM-Graph (recursive)
-             |--- Learn something new   --> writes to MEMORY.md + graph
-             |
-             v
-    SESSION END
-    [Stop Hook] --> session_end.sh
-    (session finalized, working memory persisted, observations indexed)
+
+### The AIR Pipeline (Adaptive Inference Routing)
+
+AIR learns from your tool-call patterns and eliminates unnecessary lookups over time:
+
+```mermaid
+flowchart LR
+    subgraph OBSERVE["1. Observe"]
+        A[Tool call happens] --> B[Hook captures event]
+        B --> C[Harvester normalizes<br/>& stores in DB]
+    end
+
+    subgraph COMPILE["2. Compile"]
+        D[Group events into cycles] --> E{Miss → Recover<br/>pattern?}
+        E -->|Yes| F[Classify intent<br/><i>API or TF-IDF</i>]
+        E -->|No| G[Skip]
+        F --> H[Create/reinforce<br/>routing rule]
+    end
+
+    subgraph SCORE["3. Score"]
+        I["✅ Success: +0.1"] --> J[Confidence<br/>0.0 → 1.0]
+        K["❌ Failure: −0.2"] --> J
+        L["⏰ Unused: ×0.95/wk"] --> J
+        J --> M{Threshold?}
+        M -->|"≥ 0.7"| N["CLAUDE.md injection"]
+        M -->|"0.5–0.7"| O["Per-message hint"]
+        M -->|"< 0.2"| P["Pruned"]
+    end
+
+    subgraph INJECT["4. Inject"]
+        Q["Session start:<br/>Top routes → CLAUDE.md"] --> R[Claude sees<br/>optimized shortcuts]
+        S["Each message:<br/>Pattern match → hint"] --> R
+    end
+
+    OBSERVE --> COMPILE --> SCORE --> INJECT
+
+    classDef observe fill:#264653,stroke:#2a9d8f,color:#fff
+    classDef compile fill:#2a9d8f,stroke:#264653,color:#fff
+    classDef score fill:#e9c46a,stroke:#f4a261,color:#000
+    classDef inject fill:#e76f51,stroke:#bc4749,color:#fff
+
+    class A,B,C observe
+    class D,E,F,G,H compile
+    class I,J,K,L,M,N,O,P score
+    class Q,R,S inject
+```
+
+### Memory Layer Architecture
+
+```mermaid
+graph TB
+    subgraph LAYERS["Memory Stack — Modeled After Human Cognition"]
+        direction TB
+        L7["Layer 7: RLM-Graph<br/><b>Chunking</b> — Partition large contexts intelligently"]
+        L6["Layer 6: Knowledge Graph<br/><b>Semantic Memory</b> — Entity relationships"]
+        L5["Layer 5: Hybrid Search<br/><b>Associative Recall</b> — Multi-source fusion"]
+        L4["Layer 4: Episodic Memory<br/><b>Autobiographical</b> — Past session recall"]
+        L3["Layer 3: Working Memory<br/><b>Mental Scratchpad</b> — Goals & state"]
+        L2["Layer 2: Session Bootstrap<br/><b>Prospective Memory</b> — Auto-load context"]
+        L1["Layer 1: Auto Memory<br/><b>Long-term Memory</b> — Permanent notes"]
+        L0["Layer 0: Observation Pipeline<br/><b>Procedural Memory</b> — Background capture"]
+        AIR["🎯 AIR: Adaptive Inference Routing<br/><b>Motor Learning</b> — Optimized tool dispatch"]
+    end
+
+    L7 ~~~ L6 ~~~ L5 ~~~ L4 ~~~ L3 ~~~ L2 ~~~ L1 ~~~ L0 ~~~ AIR
+
+    classDef layer7 fill:#780000,stroke:#c1121f,color:#fff
+    classDef layer6 fill:#6a040f,stroke:#9d0208,color:#fff
+    classDef layer5 fill:#9d0208,stroke:#d00000,color:#fff
+    classDef layer4 fill:#dc2f02,stroke:#e85d04,color:#fff
+    classDef layer3 fill:#e85d04,stroke:#f48c06,color:#fff
+    classDef layer2 fill:#f48c06,stroke:#faa307,color:#fff
+    classDef layer1 fill:#faa307,stroke:#ffba08,color:#000
+    classDef layer0 fill:#ffba08,stroke:#ffba08,color:#000
+    classDef air fill:#0077b6,stroke:#023e8a,color:#fff
+
+    class L7 layer7
+    class L6 layer6
+    class L5 layer5
+    class L4 layer4
+    class L3 layer3
+    class L2 layer2
+    class L1 layer1
+    class L0 layer0
+    class AIR air
 ```
 
 ## Key Design Principles
