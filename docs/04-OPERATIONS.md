@@ -1,4 +1,4 @@
-# Claude Cortex: Operations Guide
+# LLM Cortex: Operations Guide
 ### What runs, where, and how to operate it safely in a public setup
 
 ---

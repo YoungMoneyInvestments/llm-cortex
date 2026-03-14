@@ -1,4 +1,4 @@
-# Claude Cortex: Quick Start
+# LLM Cortex: Quick Start
 ### Get running in 30 minutes
 
 ---

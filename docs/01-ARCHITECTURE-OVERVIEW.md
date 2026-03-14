@@ -1,4 +1,4 @@
-# Claude Cortex: Architecture Guide
+# LLM Cortex: Architecture Guide
 ### How the 7-Layer Memory Stack Works
 
 **Based on:** Production system running since January 2026
