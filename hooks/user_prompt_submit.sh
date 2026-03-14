@@ -67,5 +67,16 @@ if [ -n "$PROMPT" ]; then
         )" > /dev/null 2>&1 &
 fi
 
+[removed]
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PYTHON="${CORTEX_PYTHON:-python3}"
+[removed]
+[removed]
+[removed]
+[removed]
+[removed]
+    fi
+fi
+
 echo "Success"
 exit 0
