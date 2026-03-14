@@ -8,37 +8,9 @@ Claude Code forgets everything between sessions. Cortex fixes that — it gives 
 
 ## What It Does
 
-```
-  ┌──────────────────────────────────────────────────────────┐
-  │                   CLAUDE CODE SESSION                    │
-  │                                                          │
-  │  Knows: current time, active goals, recent work,         │
-  │  pending items, relationships, optimized routes          │
-  └────────────────────────┬─────────────────────────────────┘
-                           │
-              ┌────────────┴────────────┐
-              ▼                         ▼
-  ┌────────────────────┐   ┌─────────────────────────────┐
-  │   MEMORY SYSTEM    │   │  ADAPTIVE INFERENCE         │
-  │                    │   │  ROUTING (AIR)              │
-  │  • Observations    │   │                             │
-  │  • Search          │   │  Observes tool-call patterns│
-  │  • Knowledge Graph │   │  Learns optimized shortcuts │
-  │  • Working Memory  │   │  Injects routes into context│
-  │  • Session History │   │  Gets faster over time      │
-  └─────────┬──────────┘   └──────────────┬──────────────┘
-            │                             │
-            └──────────┬──────────────────┘
-                       ▼
-         ┌───────────────────────────┐
-         │    4 LIFECYCLE HOOKS      │
-         │                           │
-         │  Session Start → Context  │
-         │  Tool Use    → Capture    │
-         │  User Prompt → Hint       │
-         │  Session End → Summarize  │
-         └───────────────────────────┘
-```
+<p align="center">
+  <img src="docs/claude_cortex_architecture.svg" alt="Claude Cortex Architecture" width="680">
+</p>
 
 **9 memory layers**, each inspired by a different part of human cognition:
 
