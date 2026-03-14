@@ -92,6 +92,33 @@ Then follow the [Quick Start Guide](docs/03-QUICK-START.md) to wire up hooks and
 
 ---
 
+## How This Compares
+
+There are other memory tools out there. Here's what makes LLM Cortex different:
+
+| Project | What It Does | What's Missing |
+|---------|-------------|----------------|
+| [Mem0](https://mem0.ai/) | Generic memory layer for AI apps ($24M funded) | Flat memory store — no layered architecture, no tool dispatch optimization |
+[removed]
+| [Memory-MCP](https://github.com/yuvalsuede/memory-mcp) | Two-tier MCP memory server | No observation pipeline, no pattern learning, no working memory |
+| [Hindsight](https://hindsight.vectorize.io/) | MCP retain/recall/reflect | No tool dispatch optimization, no session bootstrap |
+
+**On the routing side**, academic research ([RouteLLM](https://openreview.net/forum?id=8sSqNntaMr), [BEST-Route](https://arxiv.org/html/2506.22716v1), [MoMA](https://arxiv.org/html/2509.07571)) focuses on routing queries between *different models* (send easy questions to a cheap model, hard ones to an expensive model). That's model selection.
+
+[removed]
+
+LLM Cortex is the only project that combines brain-inspired layered memory *and* adaptive tool routing in one system. Each piece works independently, but together they compound.
+
+---
+
+## Contributing
+
+[removed]
+
+See the [Architecture Overview](docs/01-ARCHITECTURE-OVERVIEW.md) to understand how the layers connect before diving in.
+
+---
+
 ## Recent Updates
 
 [removed]
