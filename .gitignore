@@ -43,3 +43,7 @@ auth-profiles.json
 .coverage
 htmlcov/
 .pytest_cache/
+
+# AIR symlinks (private repo, never commit)
+src/air
+scripts/air_cli.py
