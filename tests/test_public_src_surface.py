@@ -21,6 +21,9 @@ class PublicSrcSurfaceImportTests(unittest.TestCase):
         for module_name in PUBLIC_MODULES:
             with self.subTest(module=module_name), tempfile.TemporaryDirectory() as temp_home:
                 env = os.environ.copy()
+                # Preserve user site-packages path before overriding HOME
+                if "PYTHONUSERBASE" not in env:
+                    env["PYTHONUSERBASE"] = str(Path.home() / "Library" / "Python" / "3.9")
                 env["HOME"] = temp_home
                 env["PYTHONPATH"] = str(REPO_ROOT)
 
