@@ -216,7 +216,7 @@ retention_task: Optional[asyncio.Task] = None
 summarization_task: Optional[asyncio.Task] = None
 retention_manager: Optional["RetentionManager"] = None
 ai_compressor: Optional["AICompressor"] = None
-shutdown_event = asyncio.Event()
+shutdown_event: Optional[asyncio.Event] = None
 
 # Rate limiter: {session_id: deque of timestamps}
 _rate_limit_buckets: dict[str, deque] = {}
@@ -1683,6 +1683,10 @@ async def lifespan(app: FastAPI):
     # Write PID file
     PID_FILE.parent.mkdir(parents=True, exist_ok=True)
     PID_FILE.write_text(str(os.getpid()))
+
+    # Initialize shutdown event and async primitives
+    global shutdown_event
+    shutdown_event = asyncio.Event()
 
     # Initialize database and async lock
     db = init_db()

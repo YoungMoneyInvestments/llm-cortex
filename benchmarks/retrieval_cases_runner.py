@@ -58,7 +58,7 @@ def run_case(name: str, limit: int) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("cases", nargs="*", choices=sorted(RANKING_CASES))
+    parser.add_argument("cases", nargs="*", default=[])
     parser.add_argument("--limit", type=int, default=5, help="Max results per case")
     parser.add_argument("--list", action="store_true", help="List available fixture cases")
     return parser
@@ -73,6 +73,9 @@ def main(argv: list[str] | None = None) -> int:
 
     selected = args.cases or sorted(RANKING_CASES)
     for name in selected:
+        if name not in RANKING_CASES:
+            print(f"Unknown case: {name}. Choose from: {sorted(RANKING_CASES)}", file=sys.stderr)
+            return 2
         run_case(name, args.limit)
     return 0
 
