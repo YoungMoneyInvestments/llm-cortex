@@ -20,17 +20,4 @@ PYTHON="${CORTEX_PYTHON:-python3}"
 # Run context loader to inject session bootstrap
 "$PYTHON" "$CORTEX_ROOT/scripts/context_loader.py" --hours 48
 
-[removed]
-[removed]
-[removed]
-    # Compile patterns from recent sessions (fire-and-forget)
-[removed]
-    # Apply confidence decay
-[removed]
-    # Inject routes into CLAUDE.md if it exists in the workspace
-    if [ -f "$WORKSPACE/CLAUDE.md" ]; then
-[removed]
-    fi
-fi
-
 exit 0

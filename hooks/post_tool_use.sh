@@ -63,10 +63,4 @@ curl -s --max-time 2 \
         }'
     )" > /dev/null 2>&1 &
 
-[removed]
-[removed]
-[removed]
-[removed]
-fi
-
 exit 0
