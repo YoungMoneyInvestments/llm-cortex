@@ -63,10 +63,4 @@ curl -s --max-time 2 \
         }'
     )" > /dev/null 2>&1 &
 
-# AIR: Feed event to Adaptive Inference Routing harvester (fire-and-forget)
-AIR_CLI="$SCRIPT_DIR/../scripts/air_cli.py"
-if [ -f "$AIR_CLI" ]; then
-    echo "$INPUT_JSON" | "$PYTHON" "$AIR_CLI" ingest > /dev/null 2>&1 &
-fi
-
 exit 0

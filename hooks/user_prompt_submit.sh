@@ -67,16 +67,5 @@ if [ -n "$PROMPT" ]; then
         )" > /dev/null 2>&1 &
 fi
 
-# AIR: Check for per-message routing hint
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PYTHON="${CORTEX_PYTHON:-python3}"
-AIR_CLI="$SCRIPT_DIR/../scripts/air_cli.py"
-if [ -f "$AIR_CLI" ] && [ -n "$PROMPT" ]; then
-    AIR_HINT=$("$PYTHON" "$AIR_CLI" hint "$PROMPT" 2>/dev/null)
-    if [ -n "$AIR_HINT" ]; then
-        echo "$AIR_HINT"
-    fi
-fi
-
 echo "Success"
 exit 0

@@ -20,17 +20,4 @@ PYTHON="${CORTEX_PYTHON:-python3}"
 # Run context loader to inject session bootstrap
 "$PYTHON" "$CORTEX_ROOT/scripts/context_loader.py" --hours 48
 
-# AIR: Inject high-confidence routes into CLAUDE.md and compile recent patterns
-AIR_CLI="$CORTEX_ROOT/scripts/air_cli.py"
-if [ -f "$AIR_CLI" ]; then
-    # Compile patterns from recent sessions (fire-and-forget)
-    "$PYTHON" "$AIR_CLI" compile --hours 48 > /dev/null 2>&1
-    # Apply confidence decay
-    "$PYTHON" "$AIR_CLI" decay > /dev/null 2>&1
-    # Inject routes into CLAUDE.md if it exists in the workspace
-    if [ -f "$WORKSPACE/CLAUDE.md" ]; then
-        "$PYTHON" "$AIR_CLI" inject "$WORKSPACE/CLAUDE.md" > /dev/null 2>&1
-    fi
-fi
-
 exit 0

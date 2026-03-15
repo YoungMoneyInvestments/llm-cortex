@@ -38,12 +38,4 @@ curl -s --max-time 2 \
     -d "$(jq -n --arg sid "$SID" '{session_id: $sid}')" \
     > /dev/null 2>&1 &
 
-# AIR: Compile patterns from this session (fire-and-forget)
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PYTHON="${CORTEX_PYTHON:-python3}"
-AIR_CLI="$SCRIPT_DIR/../scripts/air_cli.py"
-if [ -f "$AIR_CLI" ]; then
-    "$PYTHON" "$AIR_CLI" compile --hours 2 > /dev/null 2>&1 &
-fi
-
 exit 0

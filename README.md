@@ -6,46 +6,20 @@ It gives your LLM a real memory system — modeled after how the human brain org
 
 ---
 
-## The Habits Problem
-
-There's a second problem nobody talks about: even *within* a session, your LLM wastes time and money on mistakes it's made hundreds of times before.
-
-Here's why. Every LLM provider — Anthropic, OpenAI, Google, Meta, xAI — ships a **system prompt** that tells the model how to handle your requests. Part of that system prompt is a tool dispatch layer: a set of rules for deciding which tool to call when you ask for something. The problem is that this dispatch layer is **stateless**. It doesn't learn. It follows the same rigid lookup sequence every single time, regardless of what's worked before.
-
-So when you say "commit the changes," the model doesn't just run `git commit`. It follows its programmed dispatch rules: first it tries to find a skill called "commit," fails, tries another variant, fails again, then finally falls back to the thing it should have done immediately. You pay for every one of those failed lookups in latency and tokens. Every. Single. Session.
-
-This isn't a bug in any one provider. It's a structural limitation of how LLM tool dispatch works today. The system prompt resets every session, so the model can never learn that a particular lookup path is a dead end for *you*.
-
-**Adaptive Inference Routing (AIR)** fixes that. It sits between your input and the tool dispatch layer, watching what actually happens. It learns your vocabulary, identifies the retry loops, and builds a personalized routing table that short-circuits the failures before they happen. After it sees you say "commit" a few times and watches what actually works, it just... does it right the first time from then on.
-
-What that means in practice:
-- Your LLM stops fumbling on phrases you use constantly
-- Sessions start faster because less time is wasted on retry loops
-- You burn fewer tokens on errors that shouldn't happen
-- The longer you use it, the better it gets — it's genuinely learning your style
-- It works completely locally if you want. No API calls, no data leaving your machine, no ongoing cost
-
----
-
 ## Why Would You Want This?
 
-If you use LLMs seriously — on real projects, running long autonomous sessions overnight — the waste from repeated small failures adds up fast. It's the difference between working with a tool that's gotten to know you versus one that meets you for the first time every single day.
+If you use LLMs seriously — on real projects, running long autonomous sessions overnight — the amnesia problem costs you every single day. You re-explain context, repeat preferences, and watch your assistant make the same mistakes it made yesterday.
 
-LLM Cortex solves the **memory problem**. AIR solves the **habits problem**. Together they turn your LLM from a powerful-but-amnesiac assistant into something that actually feels like it's been on your team for months.
+LLM Cortex turns your LLM from a powerful-but-amnesiac assistant into something that actually feels like it's been on your team for months.
 
 ---
 
 ## How It Works
 
-<p align="center">
-  <img src="docs/llm_cortex_architecture.svg" alt="LLM Cortex Architecture" width="680">
-</p>
-
-**9 memory layers**, each inspired by a different part of human cognition:
+**8 memory layers**, each inspired by a different part of human cognition:
 
 | Layer | Inspired By | Purpose |
 |-------|------------|---------|
-| **Adaptive Inference Routing** | **Motor learning** | **Learns tool-call patterns, eliminates unnecessary lookups, gets faster per user over time** |
 | Observation Pipeline | Procedural memory | Captures every tool use and prompt automatically |
 | Session Bootstrap | Prospective memory | Loads recent context, goals, and pending work on startup |
 | Auto Memory | Long-term memory | Permanent notes your LLM always sees (MEMORY.md) |
@@ -69,8 +43,6 @@ pip install -r requirements.txt
 
 Then follow the [Quick Start Guide](docs/03-QUICK-START.md) to wire up hooks and start capturing memory. Takes about 15 minutes.
 
-For AIR, set `AIR_CLASSIFIER_MODE=local` for zero-cost local classification, or `AIR_CLASSIFIER_MODE=api` with your `ANTHROPIC_API_KEY` for higher accuracy.
-
 ---
 
 ## Documentation
@@ -80,7 +52,6 @@ For AIR, set `AIR_CLASSIFIER_MODE=local` for zero-cost local classification, or 
 | [Quick Start](docs/03-QUICK-START.md) | Get running in 15-30 minutes |
 | [Architecture Overview](docs/01-ARCHITECTURE-OVERVIEW.md) | Layer design, data flow, configuration |
 | [Implementation Guide](docs/02-IMPLEMENTATION-GUIDE.md) | Step-by-step code for every layer |
-| [AIR Specification](docs/superpowers/specs/adaptive-inference-routing.md) | Full Adaptive Inference Routing framework |
 
 ---
 
@@ -98,22 +69,18 @@ There are other memory tools out there. Here's what makes LLM Cortex different:
 
 | Project | What It Does | What's Missing |
 |---------|-------------|----------------|
-| [Mem0](https://mem0.ai/) | Generic memory layer for AI apps ($24M funded) | Flat memory store — no layered architecture, no tool dispatch optimization |
-| [Claude-Mem](https://github.com/thedotmack/claude-mem) | Claude Code session capture plugin | Single-layer capture, no knowledge graph, no AIR |
-| [Memory-MCP](https://github.com/yuvalsuede/memory-mcp) | Two-tier MCP memory server | No observation pipeline, no pattern learning, no working memory |
-| [Hindsight](https://hindsight.vectorize.io/) | MCP retain/recall/reflect | No tool dispatch optimization, no session bootstrap |
+| [Mem0](https://mem0.ai/) | Generic memory layer for AI apps ($24M funded) | Flat memory store — no layered architecture, no brain-inspired design |
+| [Claude-Mem](https://github.com/thedotmack/claude-mem) | Claude Code session capture plugin | Single-layer capture, no knowledge graph, no hybrid search |
+| [Memory-MCP](https://github.com/yuvalsuede/memory-mcp) | Two-tier MCP memory server | No observation pipeline, no working memory |
+| [Hindsight](https://hindsight.vectorize.io/) | MCP retain/recall/reflect | No session bootstrap, no knowledge graph |
 
-**On the routing side**, academic research ([RouteLLM](https://openreview.net/forum?id=8sSqNntaMr), [BEST-Route](https://arxiv.org/html/2506.22716v1), [MoMA](https://arxiv.org/html/2509.07571)) focuses on routing queries between *different models* (send easy questions to a cheap model, hard ones to an expensive model). That's model selection.
-
-**AIR solves a different problem entirely:** it optimizes which *tool* your model reaches for based on what's actually worked for *you*. No existing framework does per-user, within-session tool dispatch optimization. This is a new category.
-
-LLM Cortex is the only project that combines brain-inspired layered memory *and* adaptive tool routing in one system. Each piece works independently, but together they compound.
+LLM Cortex is the only project that combines brain-inspired layered memory in one system. Each piece works independently, but together they compound.
 
 ---
 
 ## Contributing
 
-Contributions are welcome. If you're interested in improving memory retrieval, extending AIR pattern detection, adding support for new LLM agents, or anything else — open an issue or submit a PR.
+Contributions are welcome. If you're interested in improving memory retrieval, adding support for new LLM agents, or anything else — open an issue or submit a PR.
 
 See the [Architecture Overview](docs/01-ARCHITECTURE-OVERVIEW.md) to understand how the layers connect before diving in.
 
@@ -121,7 +88,6 @@ See the [Architecture Overview](docs/01-ARCHITECTURE-OVERVIEW.md) to understand 
 
 ## Recent Updates
 
-- **Adaptive Inference Routing (AIR)** — Learns tool-call patterns, eliminates unnecessary lookups, gets faster per user over time
 - **Model-agnostic design** — Works with Claude Code, Codex, and any hook-compatible LLM agent
 - **Improved retrieval ranking** — Checked-in ranking fixtures and benchmark runner
 - **Public-safe defaults** — Generic `CORTEX_*` env vars, no machine-specific assumptions
@@ -130,4 +96,4 @@ See the [Architecture Overview](docs/01-ARCHITECTURE-OVERVIEW.md) to understand 
 
 ## License
 
-Copyright (c) 2026 Cameron Bennion / Young Money Investments. All rights reserved. Patent pending.
+MIT License. See [LICENSE](LICENSE) for details.
