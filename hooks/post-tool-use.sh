@@ -8,6 +8,7 @@
 WORKER_PORT="${CORTEX_WORKER_PORT:-37778}"
 WORKER_URL="http://127.0.0.1:$WORKER_PORT"
 AUTH_KEY="${CORTEX_WORKER_API_KEY:-}"
+AGENT_NAME="${CORTEX_AGENT_NAME:-main}"
 
 # Read stdin (Claude Code sends JSON)
 INPUT_JSON=$(cat)
@@ -47,11 +48,12 @@ curl -s --max-time 2 \
         --arg tool "$TOOL_NAME" \
         --arg input "$TOOL_INPUT" \
         --arg output "$TOOL_OUTPUT" \
+        --arg agent "$AGENT_NAME" \
         '{
             session_id: $sid,
             source: "post_tool_use",
             tool_name: $tool,
-            agent: "main",
+            agent: $agent,
             raw_input: $input,
             raw_output: $output
         }'

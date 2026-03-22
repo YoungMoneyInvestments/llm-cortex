@@ -45,6 +45,21 @@ Then follow the [Quick Start Guide](docs/03-QUICK-START.md) to wire up hooks and
 
 ---
 
+## Multi-LLM Support
+
+LLM Cortex isn't locked to one agent. Run Claude Code, Codex, Cursor, and Gemini against the same memory database — each one tags its writes so you can filter by who wrote what.
+
+```bash
+# Set per-agent identity via environment variable
+CORTEX_AGENT_NAME=claude-code  # in Claude Code hooks
+CORTEX_AGENT_NAME=codex        # in Codex MCP config
+CORTEX_AGENT_NAME=cursor       # in Cursor MCP config
+```
+
+See [Multi-LLM Setup](docs/05-MULTI-LLM-SETUP.md) for full configuration examples.
+
+---
+
 ## Documentation
 
 | Guide | What It Covers |
@@ -52,6 +67,7 @@ Then follow the [Quick Start Guide](docs/03-QUICK-START.md) to wire up hooks and
 | [Quick Start](docs/03-QUICK-START.md) | Get running in 15-30 minutes |
 | [Architecture Overview](docs/01-ARCHITECTURE-OVERVIEW.md) | Layer design, data flow, configuration |
 | [Implementation Guide](docs/02-IMPLEMENTATION-GUIDE.md) | Step-by-step code for every layer |
+| [Multi-LLM Setup](docs/05-MULTI-LLM-SETUP.md) | Claude Code, Codex, Cursor, Gemini — one shared brain |
 
 ---
 

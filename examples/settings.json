@@ -2,6 +2,7 @@
   "// Claude Code settings.json example": "Add these to ~/.claude/settings.json",
   "// Adjust paths to match your Cortex installation": "",
   "// Export CORTEX_WORKER_API_KEY in the shell that launches Claude Code": "The hooks read it from the environment.",
+  "// Set CORTEX_AGENT_NAME to identify which LLM is writing": "Each LLM gets its own agent tag in the database.",
 
   "hooks": {
     "SessionStart": [
@@ -10,7 +11,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/path/to/cortex/hooks/session_start.sh"
+            "command": "CORTEX_AGENT_NAME=claude-code /path/to/cortex/hooks/session_start.sh"
           }
         ]
       }
@@ -21,7 +22,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/path/to/cortex/hooks/user_prompt_submit.sh"
+            "command": "CORTEX_AGENT_NAME=claude-code /path/to/cortex/hooks/user_prompt_submit.sh"
           }
         ]
       }
@@ -32,7 +33,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/path/to/cortex/hooks/post_tool_use.sh"
+            "command": "CORTEX_AGENT_NAME=claude-code /path/to/cortex/hooks/post_tool_use.sh"
           }
         ]
       }
@@ -43,7 +44,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/path/to/cortex/hooks/session_end.sh"
+            "command": "CORTEX_AGENT_NAME=claude-code /path/to/cortex/hooks/session_end.sh"
           }
         ]
       }
@@ -55,7 +56,8 @@
       "command": "python3",
       "args": ["/path/to/cortex/src/mcp_memory_server.py"],
       "env": {
-        "CORTEX_DATA_DIR": "/path/to/.cortex/data"
+        "CORTEX_DATA_DIR": "/path/to/.cortex/data",
+        "CORTEX_AGENT_NAME": "claude-code"
       }
     }
   }
