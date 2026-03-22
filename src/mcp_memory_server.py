@@ -160,6 +160,10 @@ TOOLS = [
                     "type": "string",
                     "description": "Comma-separated tags for categorization",
                 },
+                "agent": {
+                    "type": "string",
+                    "description": "Agent identifier (e.g., claude-code, codex, cursor). Auto-detected from CORTEX_AGENT_NAME env var if not provided.",
+                },
             },
             "required": ["content"],
         },
@@ -253,6 +257,7 @@ class DetailsArguments(BaseModel):
 class SaveArguments(BaseModel):
     content: str
     tags: Optional[str] = None
+    agent: Optional[str] = None
 
     @field_validator("content")
     @classmethod
@@ -369,6 +374,8 @@ def handle_tool_call(name: str, arguments: dict) -> dict:
             metadata = {}
             if arguments.get("tags"):
                 metadata["tags"] = arguments["tags"]
+            agent = arguments.get("agent") or os.environ.get("CORTEX_AGENT_NAME", "main")
+            metadata["agent"] = agent
             mem_id = retriever.save_memory(arguments["content"], metadata)
             return {
                 "content": [

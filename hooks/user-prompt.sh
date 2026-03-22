@@ -8,6 +8,7 @@
 WORKER_PORT="${CORTEX_WORKER_PORT:-37778}"
 WORKER_URL="http://127.0.0.1:$WORKER_PORT"
 AUTH_KEY="${CORTEX_WORKER_API_KEY:-}"
+AGENT_NAME="${CORTEX_AGENT_NAME:-main}"
 
 # Read stdin (Claude Code sends JSON)
 INPUT_JSON=$(cat)
@@ -38,9 +39,10 @@ curl -s --max-time 2 \
     -d "$(jq -n \
         --arg sid "$SID" \
         --arg prompt "$PROMPT" \
+        --arg agent "$AGENT_NAME" \
         '{
             session_id: $sid,
-            agent: "main",
+            agent: $agent,
             user_prompt: $prompt
         }'
     )" > /dev/null 2>&1 &
@@ -54,10 +56,11 @@ if [ -n "$PROMPT" ]; then
         -d "$(jq -n \
             --arg sid "$SID" \
             --arg prompt "$PROMPT" \
+            --arg agent "$AGENT_NAME" \
             '{
                 session_id: $sid,
                 source: "user_prompt",
-                agent: "main",
+                agent: $agent,
                 raw_input: $prompt
             }'
         )" > /dev/null 2>&1 &
