@@ -6,7 +6,7 @@ Receives observations from lifecycle hooks (PostToolUse, UserPromptSubmit,
 SessionEnd) via HTTP, queues them in SQLite, and processes them asynchronously
 (AI compression, vector embedding, knowledge graph extraction).
 
-Inspired by claude-mem's async worker pattern, adapted for a Python-first stack.
+Inspired by claude-mem's async worker pattern, adapted for Cami's Python stack.
 
 Usage:
     # Start the worker
@@ -32,57 +32,25 @@ from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Literal, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import httpx
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field
 import uvicorn
+
+# Ensure scripts dir is on path for memory_retriever
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from memory_retriever import MemoryRetriever
 
 # ── Config ──────────────────────────────────────────────────────────────────
 
-def _optional_env(name: str) -> Optional[str]:
-    value = os.environ.get(name, "").strip()
-    return value or None
-
-
-def _path_from_env(name: str, default: Optional[Path]) -> Optional[Path]:
-    value = _optional_env(name)
-    if value:
-        return Path(value).expanduser()
-    return default
-
-
-def _int_from_env(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        return int(raw)
-    except ValueError as exc:
-        raise RuntimeError(f"{name} must be an integer, got {raw!r}") from exc
-
-
-def _default_cortex_home() -> Path:
-    return Path.home() / ".cortex"
-
-
-def _derive_camirouter_models_url(chat_url: Optional[str]) -> Optional[str]:
-    if not chat_url:
-        return None
-    stripped = chat_url.rstrip("/")
-    suffix = "/chat/completions"
-    if stripped.endswith(suffix):
-        return stripped[: -len(suffix)] + "/models"
-    return stripped + "/models"
-
-
-WORKER_PORT = _int_from_env("CORTEX_WORKER_PORT", 37778)
-DATA_DIR = _path_from_env("CORTEX_DATA_DIR", _default_cortex_home() / "data")
+WORKER_PORT = 37778
+DATA_DIR = Path.home() / "clawd" / "data"
 DB_PATH = DATA_DIR / "cortex-observations.db"
-PID_FILE = _path_from_env("CORTEX_PID_FILE", _default_cortex_home() / "worker.pid")
-LOG_DIR = _path_from_env("CORTEX_LOG_DIR", _default_cortex_home() / "logs")
+PID_FILE = Path.home() / ".openclaw" / "worker.pid"
+LOG_DIR = Path.home() / ".openclaw" / "logs"
 LOG_FILE = LOG_DIR / "memory-worker.log"
 
 # How often to process pending observations (seconds)
@@ -101,7 +69,7 @@ HIGH_SIGNAL_TOOLS = frozenset({
 })
 
 # ── API Authentication config ──────────────────────────────────────────
-CORTEX_API_KEY = _optional_env("CORTEX_WORKER_API_KEY")
+CORTEX_API_KEY = os.environ.get("CORTEX_WORKER_API_KEY", "cortex-local-2026")
 
 # ── Rate limiting config ───────────────────────────────────────────────
 RATE_LIMIT_MAX = 100           # max observations per minute per session_id
@@ -116,16 +84,15 @@ AI_FAILURE_ALERT_THRESHOLD = 3   # consecutive failures before alerting
 AI_BACKOFF_BASE = 30             # base backoff seconds after rate limit
 AI_BACKOFF_MAX = 600             # max backoff seconds (10 minutes)
 AI_RECOVERY_PROBE_INTERVAL = 120 # seconds between health probes when degraded
-AUTH_PROFILES_PATH = _path_from_env("CORTEX_AUTH_PROFILES_PATH", None)
+AUTH_PROFILES_PATH = Path.home() / ".openclaw" / "agents" / "main" / "agent" / "auth-profiles.json"
 
 # ── NER (Named Entity Recognition) config ────────────────────────────────
 NER_ENABLED = os.environ.get("CORTEX_NER_ENABLED", "true").lower() == "true"
 
 # ── CamiRouter config (preferred path — avoids OAuth rate limit contention) ──
-CAMIROUTER_URL = _optional_env("CAMIROUTER_URL")
-CAMIROUTER_MODELS_URL = _derive_camirouter_models_url(CAMIROUTER_URL)
-CAMIROUTER_API_KEY = _optional_env("CAMIROUTER_API_KEY")
-CAMIROUTER_MODEL = os.environ.get("CAMIROUTER_MODEL", "sonnet")
+CAMIROUTER_URL = "http://localhost:8317/v1/chat/completions"
+CAMIROUTER_API_KEY = "cami-router-2026"
+CAMIROUTER_MODEL = "sonnet"  # CamiRouter alias for claude-sonnet-4-6
 
 # ── Logging ─────────────────────────────────────────────────────────────────
 
@@ -216,7 +183,7 @@ retention_task: Optional[asyncio.Task] = None
 summarization_task: Optional[asyncio.Task] = None
 retention_manager: Optional["RetentionManager"] = None
 ai_compressor: Optional["AICompressor"] = None
-shutdown_event: Optional[asyncio.Event] = None
+shutdown_event = asyncio.Event()
 
 # Rate limiter: {session_id: deque of timestamps}
 _rate_limit_buckets: dict[str, deque] = {}
@@ -232,14 +199,6 @@ async def require_auth(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer_scheme),
 ):
     """Dependency that enforces bearer token auth on POST endpoints."""
-    if not CORTEX_API_KEY:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "CORTEX_WORKER_API_KEY is not configured. Set the same bearer token "
-                "in the worker and hook environments before using POST endpoints."
-            ),
-        )
     if credentials is None or credentials.credentials != CORTEX_API_KEY:
         raise HTTPException(
             status_code=401,
@@ -287,7 +246,7 @@ def _check_rate_limit(session_id: str) -> bool:
 class ObservationRequest(BaseModel):
     """Observation from a hook."""
     session_id: str
-    source: Literal["post_tool_use", "user_prompt", "session_end"]
+    source: str  # 'post_tool_use', 'user_prompt', 'session_end'
     tool_name: Optional[str] = None
     agent: str = "main"
     raw_input: Optional[str] = None
@@ -296,28 +255,6 @@ class ObservationRequest(BaseModel):
     # Truncation limits to avoid bloating the DB
     MAX_INPUT_LEN: int = Field(default=4000, exclude=True)
     MAX_OUTPUT_LEN: int = Field(default=8000, exclude=True)
-
-    @field_validator("session_id", "agent")
-    @classmethod
-    def _validate_nonempty_fields(cls, value: str) -> str:
-        value = value.strip()
-        if not value:
-            raise ValueError("must not be blank")
-        return value
-
-    @field_validator("tool_name")
-    @classmethod
-    def _normalize_tool_name(cls, value: Optional[str]) -> Optional[str]:
-        if value is None:
-            return None
-        value = value.strip()
-        return value or None
-
-    @model_validator(mode="after")
-    def _validate_tool_name_for_source(self):
-        if self.source == "post_tool_use" and not self.tool_name:
-            raise ValueError("tool_name is required when source='post_tool_use'")
-        return self
 
     def truncated_input(self) -> Optional[str]:
         if self.raw_input and len(self.raw_input) > self.MAX_INPUT_LEN:
@@ -336,26 +273,35 @@ class SessionStartRequest(BaseModel):
     agent: str = "main"
     user_prompt: Optional[str] = None
 
-    @field_validator("session_id", "agent")
-    @classmethod
-    def _validate_nonempty_fields(cls, value: str) -> str:
-        value = value.strip()
-        if not value:
-            raise ValueError("must not be blank")
-        return value
-
 
 class SessionEndRequest(BaseModel):
     """End a session and trigger summarization."""
     session_id: str
 
-    @field_validator("session_id")
-    @classmethod
-    def _validate_session_id(cls, value: str) -> str:
-        value = value.strip()
-        if not value:
-            raise ValueError("must not be blank")
-        return value
+
+class MemorySearchRequest(BaseModel):
+    """Cortex memory search (L1)."""
+    query: str
+    limit: Optional[int] = 15
+    source: Optional[str] = None
+    agent: Optional[str] = None
+
+
+class MemoryTimelineRequest(BaseModel):
+    """Cortex memory timeline (L2) around an observation."""
+    observation_id: int
+    window: Optional[int] = 5
+
+
+class MemoryDetailsRequest(BaseModel):
+    """Cortex memory full details (L3)."""
+    observation_ids: List[int]
+
+
+class MemorySaveRequest(BaseModel):
+    """Save an explicit memory for future retrieval."""
+    content: str
+    tags: Optional[str] = None
 
 
 class HealthResponse(BaseModel):
@@ -364,25 +310,6 @@ class HealthResponse(BaseModel):
     pending_observations: int
     total_observations: int
     active_sessions: int
-    configuration_issues: List[str] = Field(default_factory=list)
-
-
-def get_configuration_issues() -> list[str]:
-    """Return required configuration issues that affect the public worker surface."""
-    issues: list[str] = []
-    if not CORTEX_API_KEY:
-        issues.append(
-            "CORTEX_WORKER_API_KEY is not configured, so authenticated POST endpoints are unavailable."
-        )
-    if CAMIROUTER_URL and not CAMIROUTER_API_KEY:
-        issues.append(
-            "CAMIROUTER_URL is set without CAMIROUTER_API_KEY; router compression is disabled."
-        )
-    if CAMIROUTER_API_KEY and not CAMIROUTER_URL:
-        issues.append(
-            "CAMIROUTER_API_KEY is set without CAMIROUTER_URL; router compression is disabled."
-        )
-    return issues
 
 
 # ── Background processor ───────────────────────────────────────────────────
@@ -555,9 +482,9 @@ def _generate_summary_rule_based(
 class AICompressor:
     """AI-powered observation compression with dual-path routing.
 
-    Primary path: an OpenAI-compatible router configured through
-    CORTEX_ROUTER_URL / CAMIROUTER_URL so deployments can pick their own
-    endpoint and credentials without changing code.
+    Primary path: CamiRouter (localhost:8317) — OpenAI-compatible endpoint
+    that routes through Cursor subscription. Avoids OAuth rate limit
+    contention with Claude Code sessions.
 
     Fallback path: Direct Anthropic OAuth — used if CamiRouter is down.
     """
@@ -677,8 +604,6 @@ class AICompressor:
     async def _ensure_router_client(self) -> bool:
         """Set up or verify CamiRouter client."""
         try:
-            if not CAMIROUTER_URL or not CAMIROUTER_API_KEY:
-                return False
             if self._router_client is None:
                 self._router_client = httpx.AsyncClient(
                     headers={
@@ -690,7 +615,7 @@ class AICompressor:
             # Quick health check if we haven't confirmed availability
             if not self._router_available:
                 resp = await self._router_client.get(
-                    CAMIROUTER_MODELS_URL,
+                    "http://localhost:8317/v1/models",
                     timeout=3.0,
                 )
                 self._router_available = resp.status_code == 200
@@ -702,12 +627,6 @@ class AICompressor:
     async def _ensure_client(self) -> bool:
         """Load or refresh the OAuth token from auth-profiles (fallback path)."""
         try:
-            if AUTH_PROFILES_PATH is None:
-                logger.debug(
-                    "OAuth fallback disabled because CORTEX_AUTH_PROFILES_PATH is not configured"
-                )
-                return False
-
             if not AUTH_PROFILES_PATH.exists():
                 logger.warning(f"Auth profiles not found: {AUTH_PROFILES_PATH}")
                 return False
@@ -929,14 +848,18 @@ class EntityExtractor:
 
     # ── Known systems / tools (case-insensitive matching) ──
     KNOWN_SYSTEMS: Set[str] = {
-        "Cortex",
+        "BrokerBridge", "TradingCore", "OpenClaw", "CamiRouter",
+        "MoltyTrades", "Cortex", "Ralph", "IBC", "IBKR",
         "PostgreSQL", "SQLite", "NetworkX", "FastAPI", "Uvicorn",
         "Playwright", "ChromaDB", "Tailscale", "Docker", "Nginx",
+        "KPL", "Strat", "VWAP",
     }
     _KNOWN_SYSTEMS_LOWER: Dict[str, str] = {s.lower(): s for s in KNOWN_SYSTEMS}
 
     # ── Known project names ──
     KNOWN_PROJECTS: Set[str] = {
+        "Magnum Opus", "Young Money Investments", "YMI",
+        "Magnum Opus Capital",
     }
     _KNOWN_PROJECTS_LOWER: Dict[str, str] = {p.lower(): p for p in KNOWN_PROJECTS}
 
@@ -1042,6 +965,8 @@ class EntityExtractor:
         self._extract_project_dirs(combined, seen)
         self._extract_people(combined, seen)
         self._extract_companies(combined, seen)
+        self._extract_tickers(combined, seen)
+        self._extract_strategy_refs(combined, seen)
 
         return [(name, etype) for name, etype in seen.items()]
 
@@ -1102,6 +1027,230 @@ class EntityExtractor:
             # Avoid capturing things already tagged as projects
             if company.lower() not in self._KNOWN_PROJECTS_LOWER:
                 seen.setdefault(company, "company")
+
+    # ── Ticker extraction ──
+
+    # Known tickers whitelist — avoids matching common English words
+    KNOWN_TICKERS: Set[str] = {
+        # Major indices / futures
+        "SPY", "SPX", "QQQ", "IWM", "DIA", "VIX",
+        "ES", "NQ", "YM", "RTY", "MES", "MNQ", "MYM",
+        # Commodities futures
+        "CL", "GC", "SI", "NG", "HG", "ZB", "ZN", "ZC", "ZS", "ZW",
+        # Micro futures
+        "MCL", "MGC", "MBT",
+        # Crypto futures
+        "BTC", "ETH",
+        # Currency futures
+        "6E", "6J", "6B", "6A", "6C", "6S",
+        # Popular stocks
+        "AAPL", "MSFT", "GOOG", "GOOGL", "AMZN", "TSLA", "NVDA", "META",
+        "AMD", "INTC", "NFLX", "BABA", "PLTR", "SOFI", "COIN", "MARA",
+        "RIOT", "SQ", "PYPL", "SHOP", "SNAP", "UBER", "LYFT", "ABNB",
+        "DKNG", "CRWD", "NET", "SNOW", "RBLX", "RIVN", "LCID", "NIO",
+        "BA", "F", "GM", "JPM", "GS", "MS", "BAC", "WFC", "C",
+        "XOM", "CVX", "PFE", "JNJ", "UNH", "ABBV", "MRK", "LLY",
+        "WMT", "COST", "HD", "TGT", "LOW", "SBUX", "MCD", "DIS",
+        "V", "MA", "AXP",
+    }
+
+    # Common English words that look like tickers — exclude these
+    _TICKER_EXCLUDE: Set[str] = {
+        "I", "A", "IT", "IS", "IN", "ON", "AT", "TO", "BY", "OR",
+        "AN", "IF", "DO", "GO", "NO", "SO", "UP", "US", "WE", "HE",
+        "BE", "ME", "MY", "AM", "AS", "OF", "AI", "OK", "PM", "AM",
+        "ALL", "AND", "ARE", "BUT", "CAN", "DID", "FOR", "GET", "HAS",
+        "HAD", "HER", "HIS", "HOW", "ITS", "LET", "MAY", "NEW", "NOT",
+        "NOW", "OLD", "ONE", "OUR", "OUT", "OWN", "RAN", "RUN", "SAY",
+        "SET", "SHE", "THE", "TOO", "TRY", "TWO", "USE", "WAS", "WAY",
+        "WHO", "WHY", "WIN", "YET", "YOU",
+        "API", "CLI", "CPU", "CSS", "CSV", "DB", "DNS", "ENV", "FTP",
+        "GUI", "HTML", "HTTP", "IDE", "IP", "JSON", "LOG", "OS", "PC",
+        "PDF", "RAM", "RGB", "SDK", "SQL", "SSH", "SSL", "TCP", "TLS",
+        "UDP", "UI", "URL", "USB", "UTC", "VM", "VPN", "VPS", "XML",
+        "NER", "MCP", "TTL", "WAL", "FTS", "ORM", "AWS", "GCP",
+    }
+
+    # $TICKER pattern (always captured regardless of whitelist)
+    RE_DOLLAR_TICKER = re.compile(r'\$([A-Z]{1,5})\b')
+
+    # Standalone uppercase ticker (requires whitelist match)
+    RE_BARE_TICKER = re.compile(r'\b([A-Z][A-Z0-9]{0,4})\b')
+
+    def _extract_tickers(self, text: str, seen: Dict[str, str]):
+        """Extract stock/futures tickers from text.
+
+        Captures $TICKER patterns unconditionally and bare uppercase
+        tickers only if they appear in the KNOWN_TICKERS whitelist.
+        """
+        # $TICKER — always capture (explicit intent)
+        for match in self.RE_DOLLAR_TICKER.finditer(text):
+            ticker = match.group(1)
+            if ticker not in self._TICKER_EXCLUDE:
+                seen.setdefault(ticker, "ticker")
+
+        # Bare uppercase — only if in whitelist
+        for match in self.RE_BARE_TICKER.finditer(text):
+            ticker = match.group(1)
+            if ticker in self.KNOWN_TICKERS and ticker not in self._TICKER_EXCLUDE:
+                seen.setdefault(ticker, "ticker")
+
+    # ── Strategy reference extraction ──
+
+    RE_STRATEGY_REF = re.compile(
+        r'(?:strategy|setup|system|approach)\s+(?:called\s+|named\s+)?'
+        r'["\']?([A-Z][A-Za-z0-9_-]+)["\']?',
+        re.IGNORECASE,
+    )
+
+    def _extract_strategy_refs(self, text: str, seen: Dict[str, str]):
+        """Extract strategy/setup name references."""
+        for match in self.RE_STRATEGY_REF.finditer(text):
+            name = match.group(1).strip()
+            if len(name) > 1 and name not in self._CAMELCASE_EXCLUDE:
+                seen.setdefault(name, "system")
+
+    # ── Directed relationship extraction ──
+
+    # Pattern: "messaged X", "texted X", "DMed X", "replied to X"
+    RE_MESSAGED = re.compile(
+        r'(?:messaged|texted|DMed|DM\'?d|replied\s+to|pinged|sent\s+(?:a\s+)?message\s+to)\s+'
+        r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})',
+        re.IGNORECASE,
+    )
+
+    # Pattern: "trade with X", "X's account", "X's strategy", "trading X's"
+    RE_TRADED_WITH = re.compile(
+        r'(?:trad(?:e|ed|ing)\s+(?:with|for)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})|'
+        r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\'s\s+'
+        r'(?:account|strategy|position|portfolio|trade|setup))',
+        re.IGNORECASE,
+    )
+
+    # Pattern: "X is in Y", "X joined Y", "X is a member of Y"
+    RE_MEMBER_OF = re.compile(
+        r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\s+'
+        r'(?:is\s+(?:in|a\s+member\s+of|part\s+of)|joined|belongs?\s+to)\s+'
+        r'([A-Z][A-Za-z0-9_ ]+)',
+        re.IGNORECASE,
+    )
+
+    # Pattern: "X from Company", "X at Company", "X works at Company"
+    RE_WORKS_AT = re.compile(
+        r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\s+'
+        r'(?:from|at|works?\s+(?:at|for))\s+'
+        r'([A-Z][A-Za-z0-9& ]+(?:Inc\.?|LLC|Corp\.?|Capital|Fund|'
+        r'Investments?|Partners?|Holdings?|Services?|Group|Labs?)?)',
+        re.IGNORECASE,
+    )
+
+    # Pattern: Discord @role mentions
+    RE_DISCORD_ROLE = re.compile(
+        r'@([A-Za-z][A-Za-z0-9_ ]{2,30})\s+role',
+        re.IGNORECASE,
+    )
+
+    def _extract_directed_relationships(
+        self,
+        entities: List[Tuple[str, str]],
+        text: str,
+        obs_id: int,
+    ):
+        """Extract directed relationships from text patterns.
+
+        Creates messaged, discussed, traded_with, member_of, and works_at
+        relationships in the knowledge graph based on regex pattern matching.
+        """
+        if kg is None:
+            return
+
+        relationships_created = 0
+
+        # Build lookup sets for entity classification
+        person_entities = {name for name, etype in entities if etype == "person"}
+        system_entities = {name for name, etype in entities if etype in ("system", "project")}
+        company_entities = {name for name, etype in entities if etype == "company"}
+        ticker_entities = {name for name, etype in entities if etype == "ticker"}
+
+        # ── messaged ──
+        for match in self.RE_MESSAGED.finditer(text):
+            target = match.group(1).strip()
+            if target in self._CAMELCASE_EXCLUDE:
+                continue
+            # Find a person entity that could be the source (default to Cameron)
+            source = "Cameron"
+            kg.add_relationship(
+                source, "messaged", target,
+                context=f"obs:{obs_id}",
+                strength=0.7,
+                observation_id=obs_id,
+            )
+            relationships_created += 1
+
+        # ── traded_with ──
+        for match in self.RE_TRADED_WITH.finditer(text):
+            person = (match.group(1) or match.group(2) or "").strip()
+            if not person or person in self._CAMELCASE_EXCLUDE:
+                continue
+            kg.add_relationship(
+                "Cameron", "traded_with", person,
+                context=f"obs:{obs_id}",
+                strength=0.7,
+                observation_id=obs_id,
+            )
+            relationships_created += 1
+
+        # ── member_of ──
+        for match in self.RE_MEMBER_OF.finditer(text):
+            person = match.group(1).strip()
+            group = match.group(2).strip()
+            if person in self._CAMELCASE_EXCLUDE:
+                continue
+            kg.add_relationship(
+                person, "member_of", group,
+                context=f"obs:{obs_id}",
+                strength=0.7,
+                observation_id=obs_id,
+            )
+            relationships_created += 1
+
+        # ── works_at ──
+        for match in self.RE_WORKS_AT.finditer(text):
+            person = match.group(1).strip()
+            company = match.group(2).strip()
+            if person in self._CAMELCASE_EXCLUDE:
+                continue
+            kg.add_relationship(
+                person, "works_at", company,
+                context=f"obs:{obs_id}",
+                strength=0.7,
+                observation_id=obs_id,
+            )
+            relationships_created += 1
+
+        # ── discussed: person + system/project co-occurrence ──
+        for person in person_entities:
+            for system in system_entities:
+                kg.add_relationship(
+                    person, "discussed", system,
+                    context=f"obs:{obs_id}",
+                    strength=0.5,
+                    observation_id=obs_id,
+                )
+                relationships_created += 1
+
+        # ── discussed: person + ticker co-occurrence ──
+        for person in person_entities:
+            for ticker in ticker_entities:
+                kg.add_relationship(
+                    person, "discussed", ticker,
+                    context=f"obs:{obs_id}",
+                    strength=0.5,
+                    observation_id=obs_id,
+                )
+                relationships_created += 1
+
+        return relationships_created
 
     def get_stats(self) -> dict:
         """Return NER statistics."""
@@ -1165,11 +1314,22 @@ async def _extract_and_link_entities(
                     )
                     relationships_created += 1
 
+        # Extract directed relationships from text patterns
+        combined_text = "\n".join(
+            t for t in [summary, raw_input, raw_output] if t
+        )
+        directed_count = entity_extractor._extract_directed_relationships(
+            entities, combined_text, obs_id,
+        ) or 0
+        relationships_created += directed_count
+
         entity_extractor._relationships_created_total += relationships_created
 
         logger.debug(
-            "NER obs=%d: extracted %d entities, %d co_mentioned relationships",
+            "NER obs=%d: extracted %d entities, %d relationships "
+            "(%d co_mentioned, %d directed)",
             obs_id, len(entities), relationships_created,
+            relationships_created - directed_count, directed_count,
         )
 
     except Exception as e:
@@ -1684,10 +1844,6 @@ async def lifespan(app: FastAPI):
     PID_FILE.parent.mkdir(parents=True, exist_ok=True)
     PID_FILE.write_text(str(os.getpid()))
 
-    # Initialize shutdown event and async primitives
-    global shutdown_event
-    shutdown_event = asyncio.Event()
-
     # Initialize database and async lock
     db = init_db()
     db_lock = asyncio.Lock()
@@ -1747,7 +1903,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Cortex Memory Worker",
-    description="Background observation processor for the Cortex memory system",
+    description="Background observation processor for Cami's memory system",
     version="0.1.0",
     lifespan=lifespan,
 )
@@ -1777,12 +1933,11 @@ async def health():
         proc_status = "dead"
 
     return HealthResponse(
-        status="healthy" if proc_status == "running" and not get_configuration_issues() else "degraded",
+        status="healthy" if proc_status == "running" else "degraded",
         uptime_seconds=round(time.time() - start_time, 1),
         pending_observations=pending,
         total_observations=total,
         active_sessions=active,
-        configuration_issues=get_configuration_issues(),
     )
 
 
@@ -1943,6 +2098,93 @@ async def get_recent_sessions(limit: int = 10, offset: int = 0):
         "offset": offset,
         "limit": limit,
     }
+
+
+# ── Cortex memory retrieval API (for OpenClaw / Cami tools) ───────────────────
+
+
+def _get_retriever():
+    """Return a MemoryRetriever instance (same DB as worker)."""
+    return MemoryRetriever(obs_db_path=DB_PATH, vec_db_path=DATA_DIR / "cortex-vectors.db")
+
+
+@app.post("/api/memory/search")
+async def memory_search(req: MemorySearchRequest):
+    """L1: Search cortex memory (compact index). Used by Cami via OpenClaw tools."""
+    loop = asyncio.get_event_loop()
+    def _run():
+        r = _get_retriever()
+        results = r.search(
+            query=req.query,
+            limit=req.limit or 15,
+            source=req.source,
+            agent=req.agent,
+        )
+        return [dict(x) for x in results]
+    try:
+        results = await loop.run_in_executor(None, _run)
+        return {"results": results}
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        logger.exception("memory search failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/memory/timeline")
+async def memory_timeline(req: MemoryTimelineRequest):
+    """L2: Chronological context around an observation. Used by Cami via OpenClaw tools."""
+    loop = asyncio.get_event_loop()
+    def _run():
+        r = _get_retriever()
+        return r.timeline(observation_id=req.observation_id, window=req.window or 5)
+    try:
+        context = await loop.run_in_executor(None, _run)
+        return {"context": [dict(x) for x in context]}
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        logger.exception("memory timeline failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/memory/details")
+async def memory_details(req: MemoryDetailsRequest):
+    """L3: Full observation details. Used by Cami via OpenClaw tools."""
+    if not req.observation_ids:
+        return {"details": []}
+    loop = asyncio.get_event_loop()
+    def _run():
+        r = _get_retriever()
+        return r.get_details(req.observation_ids)
+    try:
+        details = await loop.run_in_executor(None, _run)
+        return {"details": [dict(x) for x in details]}
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        logger.exception("memory details failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/memory/save", dependencies=[Depends(require_auth)])
+async def memory_save(req: MemorySaveRequest):
+    """Save an explicit memory. Used by Cami via OpenClaw tools."""
+    metadata = {}
+    if req.tags:
+        metadata["tags"] = req.tags
+    loop = asyncio.get_event_loop()
+    def _run():
+        r = _get_retriever()
+        return r.save_memory(req.content, metadata)
+    try:
+        mem_id = await loop.run_in_executor(None, _run)
+        return {"id": mem_id, "status": "saved"}
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        logger.exception("memory save failed")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/compression/status")
