@@ -2,12 +2,13 @@
 """
 MCP Memory Server — Exposes Cortex memory retrieval as MCP tools.
 
-Provides 5 MCP tools that follow the token-efficient 3-layer pattern:
+Provides 6 MCP tools that follow the token-efficient 3-layer pattern:
   1. cami_memory_search       — L1: Compact index search (~20 tokens/result)
   2. cami_memory_timeline     — L2: Chronological context (~100 tokens/item)
   3. cami_memory_details      — L3: Full observation text (variable)
   4. cami_memory_save         — Save a memory for future retrieval
   5. cami_memory_graph_search — Graph-augmented search with entity expansion
+  6. cami_message_search      — Semantic search over iMessage/Discord via pgvector
 
 Usage:
     # Start as MCP server (stdio transport)
@@ -17,19 +18,17 @@ Usage:
     {
       "mcpServers": {
         "cortex-memory": {
-          "command": "/path/to/your/venv/bin/python3",
-          "args": ["/path/to/cortex/src/mcp_memory_server.py"]
+          "command": "/Users/cameronbennion/clawd/venv/bin/python3",
+          "args": ["/Users/cameronbennion/clawd/scripts/mcp_memory_server.py"]
         }
       }
     }
 """
 
 import json
+import os
 import sys
 from pathlib import Path
-from typing import Optional
-
-from pydantic import BaseModel, ValidationError, field_validator, model_validator
 
 # Add scripts dir to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
@@ -41,6 +40,20 @@ from memory_retriever import MemoryRetriever
 # Implements the MCP protocol using stdin/stdout JSON-RPC 2.0.
 # This is the simplest transport — no HTTP server needed.
 
+_TRANSPORT_MODE = "content-length"
+
+
+def _write_message(payload: dict):
+    """Write a JSON-RPC payload using the negotiated transport framing."""
+    msg = json.dumps(payload)
+    if _TRANSPORT_MODE == "line":
+        sys.stdout.write(msg + "\n")
+        sys.stdout.flush()
+        return
+
+    sys.stdout.write(f"Content-Length: {len(msg)}\r\n\r\n{msg}")
+    sys.stdout.flush()
+
 
 def send_response(request_id, result):
     """Send a JSON-RPC 2.0 response."""
@@ -49,9 +62,7 @@ def send_response(request_id, result):
         "id": request_id,
         "result": result,
     }
-    msg = json.dumps(response)
-    sys.stdout.write(f"Content-Length: {len(msg)}\r\n\r\n{msg}")
-    sys.stdout.flush()
+    _write_message(response)
 
 
 def send_error(request_id, code, message):
@@ -61,9 +72,18 @@ def send_error(request_id, code, message):
         "id": request_id,
         "error": {"code": code, "message": message},
     }
-    msg = json.dumps(response)
-    sys.stdout.write(f"Content-Length: {len(msg)}\r\n\r\n{msg}")
-    sys.stdout.flush()
+    _write_message(response)
+
+
+def _load_env():
+    """Load environment variables from .env.local"""
+    env_path = Path.home() / "clawd" / ".env.local"
+    if env_path.exists():
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith('#') and '=' in line:
+                key, _, value = line.partition('=')
+                os.environ.setdefault(key.strip(), value.strip().strip('"'))
 
 
 # ── Tool definitions ────────────────────────────────────────────────────────
@@ -72,7 +92,7 @@ TOOLS = [
     {
         "name": "cami_memory_search",
         "description": (
-            "Search Cortex memory across observations, conversations, and knowledge. "
+            "Search Cami's memory across observations, conversations, and knowledge. "
             "Returns a compact index of results (~20 tokens each). Use this first, "
             "then drill into specific results with cami_memory_timeline or cami_memory_details."
         ),
@@ -162,7 +182,7 @@ TOOLS = [
                 },
                 "agent": {
                     "type": "string",
-                    "description": "Agent identifier (e.g., claude-code, codex, cursor). Auto-detected from CORTEX_AGENT_NAME env var if not provided.",
+                    "description": "Agent identifier (e.g., claude-code, codex, cursor, cami). Auto-detected from CORTEX_AGENT_NAME env var if not provided.",
                 },
             },
             "required": ["content"],
@@ -197,111 +217,43 @@ TOOLS = [
             "required": ["query"],
         },
     },
+    {
+        "name": "cami_message_search",
+        "description": (
+            "Search iMessage and Discord conversation history using semantic similarity. "
+            "Finds relevant message chunks from Cameron's conversations across platforms. "
+            "Returns matching conversation snippets with sender, timestamp, and platform info."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Natural language search query (e.g., 'discussion about trading strategy with Jake')",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max results to return (default: 5)",
+                    "default": 5,
+                },
+                "source": {
+                    "type": "string",
+                    "description": "Filter by message source",
+                    "enum": ["imessage", "discord"],
+                },
+                "contact": {
+                    "type": "string",
+                    "description": "Filter by contact/participant name (partial match)",
+                },
+                "days_back": {
+                    "type": "integer",
+                    "description": "Only search messages from the last N days",
+                },
+            },
+            "required": ["query"],
+        },
+    },
 ]
-
-
-class SearchArguments(BaseModel):
-    query: str
-    limit: int = 15
-    source: Optional[str] = None
-    agent: Optional[str] = None
-
-    @field_validator("query")
-    @classmethod
-    def _validate_query(cls, value: str) -> str:
-        value = value.strip()
-        if not value:
-            raise ValueError("query must not be blank")
-        return value
-
-    @field_validator("limit")
-    @classmethod
-    def _validate_limit(cls, value: int) -> int:
-        if value < 1:
-            raise ValueError("limit must be >= 1")
-        return value
-
-
-class TimelineArguments(BaseModel):
-    observation_id: int
-    window: int = 5
-
-    @field_validator("observation_id")
-    @classmethod
-    def _validate_observation_id(cls, value: int) -> int:
-        if value < 1:
-            raise ValueError("observation_id must be >= 1")
-        return value
-
-    @field_validator("window")
-    @classmethod
-    def _validate_window(cls, value: int) -> int:
-        if value < 0:
-            raise ValueError("window must be >= 0")
-        return value
-
-
-class DetailsArguments(BaseModel):
-    observation_ids: list[int]
-
-    @field_validator("observation_ids")
-    @classmethod
-    def _validate_observation_ids(cls, value: list[int]) -> list[int]:
-        if not value:
-            raise ValueError("observation_ids must not be empty")
-        if any(item < 1 for item in value):
-            raise ValueError("observation_ids must only contain positive integers")
-        return value
-
-
-class SaveArguments(BaseModel):
-    content: str
-    tags: Optional[str] = None
-    agent: Optional[str] = None
-
-    @field_validator("content")
-    @classmethod
-    def _validate_content(cls, value: str) -> str:
-        value = value.strip()
-        if not value:
-            raise ValueError("content must not be blank")
-        return value
-
-
-class GraphSearchArguments(SearchArguments):
-    graph_depth: int = 1
-
-    @field_validator("graph_depth")
-    @classmethod
-    def _validate_graph_depth(cls, value: int) -> int:
-        if value not in (1, 2):
-            raise ValueError("graph_depth must be 1 or 2")
-        return value
-
-
-TOOL_ARGUMENT_MODELS = {
-    "cami_memory_search": SearchArguments,
-    "cami_memory_timeline": TimelineArguments,
-    "cami_memory_details": DetailsArguments,
-    "cami_memory_save": SaveArguments,
-    "cami_memory_graph_search": GraphSearchArguments,
-}
-
-
-def _format_validation_error(tool_name: str, error: ValidationError) -> str:
-    parts = []
-    for item in error.errors():
-        field = ".".join(str(part) for part in item["loc"]) or "arguments"
-        parts.append(f"{field}: {item['msg']}")
-    return f"Invalid arguments for {tool_name}: " + "; ".join(parts)
-
-
-def _validate_tool_arguments(name: str, arguments: dict) -> dict:
-    model = TOOL_ARGUMENT_MODELS.get(name)
-    if model is None:
-        return arguments
-    validated = model.model_validate(arguments)
-    return validated.model_dump(exclude_none=True)
 
 
 # ── Tool handlers ───────────────────────────────────────────────────────────
@@ -309,14 +261,6 @@ def _validate_tool_arguments(name: str, arguments: dict) -> dict:
 
 def handle_tool_call(name: str, arguments: dict) -> dict:
     """Handle a tool call and return the result."""
-    try:
-        arguments = _validate_tool_arguments(name, arguments)
-    except ValidationError as error:
-        return {
-            "content": [{"type": "text", "text": _format_validation_error(name, error)}],
-            "isError": True,
-        }
-
     retriever = MemoryRetriever()
 
     try:
@@ -414,17 +358,181 @@ def handle_tool_call(name: str, arguments: dict) -> dict:
                         lines.append(f"    related: {', '.join(related)}{suffix}")
             return {"content": [{"type": "text", "text": "\n".join(lines)}]}
 
+        elif name == "cami_message_search":
+            _load_env()
+
+            import psycopg2
+            import openai
+
+            openai_key = os.environ.get("OPENAI_API_KEY")
+            if not openai_key:
+                return {
+                    "content": [{"type": "text", "text": "Error: OPENAI_API_KEY not found"}],
+                    "isError": True,
+                }
+
+            client = openai.OpenAI(api_key=openai_key)
+
+            # Embed the query
+            resp = client.embeddings.create(
+                input=[arguments["query"]], model="text-embedding-3-small"
+            )
+            query_vec = resp.data[0].embedding
+
+            # Build SQL query with filters
+            conn = psycopg2.connect(
+                host="100.67.112.3",
+                port=5432,
+                dbname="tradingcore",
+                user="trading_user",
+                password="TradingCore2025!",
+            )
+            try:
+                cur = conn.cursor()
+
+                conditions = []
+                params = []
+
+                if arguments.get("source"):
+                    conditions.append("source_type = %s")
+                    params.append(arguments["source"])
+
+                if arguments.get("contact"):
+                    conditions.append("metadata::text ILIKE %s")
+                    params.append(f"%{arguments['contact']}%")
+
+                if arguments.get("days_back"):
+                    conditions.append("created_at > NOW() - (%s * INTERVAL '1 day')")
+                    params.append(arguments["days_back"])
+
+                where = (" AND " + " AND ".join(conditions)) if conditions else ""
+                limit = arguments.get("limit", 5)
+
+                # Format the vector as a string for pgvector
+                vec_str = "[" + ",".join(str(v) for v in query_vec) + "]"
+
+                # Fetch extra rows to allow post-filtering by similarity threshold
+                fetch_limit = max(limit * 4, 40)
+                cur.execute(
+                    f"""
+                    SELECT content_preview, source_type, source_id, metadata,
+                           1 - (embedding <=> %s::vector) as similarity,
+                           created_at
+                    FROM vec.embeddings
+                    WHERE 1=1 {where}
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s
+                    """,
+                    [vec_str] + params + [vec_str, fetch_limit],
+                )
+
+                rows = cur.fetchall()
+
+                if not rows:
+                    return {
+                        "content": [{"type": "text", "text": "No matching messages found."}]
+                    }
+
+                # --- Similarity threshold + recency-weighted ranking ---
+                SIMILARITY_THRESHOLD = 0.35
+                from datetime import datetime, timezone
+
+                def _recency_score(created_at):
+                    """Return recency score 1.0/0.8/0.6/0.4 based on age."""
+                    if created_at is None:
+                        return 0.5
+                    try:
+                        if isinstance(created_at, str):
+                            # Parse ISO string; handle both naive and aware
+                            ts = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                        else:
+                            ts = created_at
+                        # Make timezone-aware if naive
+                        if ts.tzinfo is None:
+                            ts = ts.replace(tzinfo=timezone.utc)
+                        age_days = (datetime.now(timezone.utc) - ts).days
+                        if age_days <= 7:
+                            return 1.0
+                        elif age_days <= 30:
+                            return 0.8
+                        elif age_days <= 90:
+                            return 0.6
+                        else:
+                            return 0.4
+                    except Exception:
+                        return 0.5
+
+                def _composite_score(similarity, created_at):
+                    return similarity * 0.7 + _recency_score(created_at) * 0.3
+
+                # Filter by threshold, then sort by composite score, then trim to limit
+                filtered = [
+                    row for row in rows if row[4] >= SIMILARITY_THRESHOLD
+                ]
+                filtered.sort(key=lambda r: _composite_score(r[4], r[5]), reverse=True)
+                filtered = filtered[:limit]
+
+                if not filtered:
+                    return {
+                        "content": [{"type": "text", "text": f"No matching messages found (similarity threshold: {SIMILARITY_THRESHOLD})."}]
+                    }
+
+                lines = [f"Found {len(filtered)} matching conversation(s):\n"]
+                for i, row in enumerate(filtered, 1):
+                    chunk_text, source, source_id, metadata, similarity, created_at = row
+                    meta = (
+                        metadata
+                        if isinstance(metadata, dict)
+                        else json.loads(metadata) if metadata else {}
+                    )
+                    start_time = meta.get("start_time")
+                    end_time = meta.get("end_time")
+                    # Use created_at as date if meta times not available
+                    date_val = start_time or (created_at.isoformat() if hasattr(created_at, 'isoformat') else str(created_at) if created_at else None)
+
+                    def _fmt_ts(ts):
+                        if ts is None:
+                            return "?"
+                        if isinstance(ts, str):
+                            return ts[:16] if len(ts) >= 16 else ts
+                        if hasattr(ts, "strftime"):
+                            return ts.strftime("%Y-%m-%d %H:%M")
+                        return str(ts)
+                    time_str = ""
+                    if start_time or end_time:
+                        time_str = f" ({_fmt_ts(start_time)} - {_fmt_ts(end_time)})"
+
+                    composite = _composite_score(similarity, created_at)
+
+                    # Truncate chunk text for display
+                    display_text = (
+                        (chunk_text or "")[:500] + "..." if len(chunk_text or "") > 500 else (chunk_text or "")
+                    )
+
+                    lines.append(
+                        f"--- [{source}] Match {i} (similarity: {similarity:.3f}, score: {composite:.3f}){time_str} ---"
+                    )
+                    if date_val:
+                        lines.append(f"Date: {_fmt_ts(date_val)}")
+                    if meta.get("participants"):
+                        lines.append(
+                            f"Participants: {', '.join(meta['participants'][:5])}"
+                        )
+                    elif meta.get("channel"):
+                        lines.append(f"Channel: {meta['channel']}")
+                    lines.append(display_text)
+                    lines.append("")
+
+                return {"content": [{"type": "text", "text": "\n".join(lines)}]}
+            finally:
+                conn.close()
+
         else:
             return {
                 "content": [{"type": "text", "text": f"Unknown tool: {name}"}],
                 "isError": True,
             }
 
-    except ValidationError as e:
-        return {
-            "content": [{"type": "text", "text": _format_validation_error(name, e)}],
-            "isError": True,
-        }
     except Exception as e:
         return {
             "content": [{"type": "text", "text": f"Error: {str(e)}"}],
@@ -438,25 +546,34 @@ def handle_tool_call(name: str, arguments: dict) -> dict:
 
 
 def read_message() -> dict:
-    """Read a JSON-RPC message from stdin (Content-Length framing)."""
-    # Read headers
-    content_length = 0
-    while True:
-        line = sys.stdin.readline()
-        if not line:
+    """Read a JSON-RPC message from stdin with framing auto-detection."""
+    global _TRANSPORT_MODE
+
+    first_line = sys.stdin.readline()
+    while first_line and not first_line.strip():
+        first_line = sys.stdin.readline()
+
+    if not first_line:
+        raise EOFError("stdin closed")
+
+    stripped = first_line.strip()
+
+    if stripped.lower().startswith("content-length:"):
+        _TRANSPORT_MODE = "content-length"
+        content_length = int(stripped.split(":", 1)[1].strip())
+        while True:
+            line = sys.stdin.readline()
+            if not line:
+                raise EOFError("stdin closed")
+            if line in ("\r\n", "\n", ""):
+                break
+        body = sys.stdin.read(content_length)
+        if not body:
             raise EOFError("stdin closed")
-        line = line.strip()
-        if not line:
-            break
-        if line.lower().startswith("content-length:"):
-            content_length = int(line.split(":")[1].strip())
+        return json.loads(body)
 
-    if content_length == 0:
-        raise ValueError("No Content-Length header")
-
-    # Read body
-    body = sys.stdin.read(content_length)
-    return json.loads(body)
+    _TRANSPORT_MODE = "line"
+    return json.loads(stripped)
 
 
 def handle_message(msg: dict):
