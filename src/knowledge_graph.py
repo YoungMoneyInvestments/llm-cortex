@@ -3,25 +3,24 @@
 Knowledge Graph Layer - Explicit Relationship Tracking
 
 Converts implicit relationships buried in prose into first-class entities.
-Persists to SQLite (by default under ~/.cortex/data) with NetworkX
+Persists to SQLite (~/clawd/data/cortex-knowledge-graph.db) with NetworkX
 MultiDiGraph for fast in-memory traversal.
 
 Examples:
     from knowledge_graph import KnowledgeGraph
 
     kg = KnowledgeGraph()
-    kg.add_relationship("Alice", "knows", "Bob",
-                       context="met at conference")
-    kg.add_relationship("ProjectX", "blocked_by", "VendorCo",
-                       context="API access pending")
+    kg.add_relationship("Cameron", "knows", "Preston",
+                       context="capital raiser, day job conflict")
+    kg.add_relationship("Magnum Opus", "blocked_by", "NAV Fund Services",
+                       context="IB read-only access needed")
 
     # Query
-    blocked = kg.get_relationships("ProjectX", rel_type="blocked_by")
+    blocked = kg.get_relationships("Magnum Opus", rel_type="blocked_by")
 """
 
 import json
 import logging
-import os
 import re
 import sqlite3
 import sys
@@ -35,7 +34,7 @@ import networkx as nx
 
 # ── Config ──────────────────────────────────────────────────────────────────
 
-DATA_DIR = Path(os.environ.get("CORTEX_DATA_DIR", str(Path.home() / ".cortex" / "data"))).expanduser()
+DATA_DIR = Path.home() / "clawd" / "data"
 DB_PATH = DATA_DIR / "cortex-knowledge-graph.db"
 
 # ── Logging ─────────────────────────────────────────────────────────────────
@@ -53,13 +52,14 @@ if not logger.handlers:
 
 ALLOWED_ENTITY_TYPES: Set[str] = {
     "person", "company", "system", "concept", "project",
-    "tool", "location", "unknown",
+    "tool", "location", "ticker", "unknown",
 }
 
 ALLOWED_RELATIONSHIP_TYPES: Set[str] = {
     "knows", "uses", "owns", "blocked_by", "competes_with",
     "works_on", "depends_on", "frustrated_with", "implements",
     "manages", "created", "part_of", "co_mentioned",
+    "messaged", "discussed", "traded_with", "member_of", "works_at",
 }
 
 
