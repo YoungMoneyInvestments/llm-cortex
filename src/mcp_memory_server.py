@@ -35,6 +35,13 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from memory_retriever import MemoryRetriever
 
+# Input validation helpers inserted by CI patch
+VALID_TOOL_NAMES = {"cami_memory_graph_search","cami_memory_details","cami_memory_search"}
+
+def _validation_error(msg: str):
+    return {"isError": True, "content": [{"type": "text", "text": msg}]}
+
+
 # ── MCP Protocol (stdio transport) ─────────────────────────────────────────
 #
 # Implements the MCP protocol using stdin/stdout JSON-RPC 2.0.
@@ -260,7 +267,19 @@ TOOLS = [
 
 
 def handle_tool_call(name: str, arguments: dict) -> dict:
-    """Handle a tool call and return the result."""
+
+    # Early validation before touching retriever
+    if name not in VALID_TOOL_NAMES:
+        return _validation_error(f"Unknown tool: {name}")
+    if name == "cami_memory_graph_search":
+        gd = int(arguments.get("graph_depth", 1))
+        if gd not in (0,1,2):
+            return _validation_error("Invalid parameter: graph_depth must be 0,1,2")
+    if name == "cami_memory_details":
+        ids = arguments.get("observation_ids", None)
+        if not ids:
+            return _validation_error("Missing required parameter: observation_ids")
+
     retriever = MemoryRetriever()
 
     try:
