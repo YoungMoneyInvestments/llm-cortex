@@ -38,4 +38,4 @@ jobs:
         run: python -m pip install pytest
 
       - name: Run offline-safe test suite
-        run: python -m unittest discover -s tests -v
+        run: python -m pytest tests -v
