@@ -43,6 +43,7 @@ import uvicorn
 # Ensure scripts dir is on path for memory_retriever
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from memory_retriever import MemoryRetriever
+from subscription import DEFAULT_TIER, get_tier_config, parse_tier
 
 # ── Config ──────────────────────────────────────────────────────────────────
 
@@ -75,6 +76,7 @@ CORTEX_API_KEY = os.environ.get("CORTEX_WORKER_API_KEY", "cortex-local-2026")
 RATE_LIMIT_MAX = 100           # max observations per minute per session_id
 RATE_LIMIT_WINDOW = 60         # window in seconds
 RATE_LIMIT_CLEANUP_INTERVAL = 300  # cleanup old entries every 5 minutes
+DEFAULT_SUBSCRIPTION_TIER = os.environ.get("CORTEX_SUBSCRIPTION_TIER", DEFAULT_TIER.value)
 
 # ── AI compression config ────────────────────────────────────────────
 AI_MODEL = "claude-sonnet-4-6"
@@ -139,6 +141,7 @@ def init_db() -> sqlite3.Connection:
             summary TEXT,                  -- AI-compressed summary (filled async)
             status TEXT DEFAULT 'pending', -- 'pending', 'processed', 'failed'
             vector_synced INTEGER DEFAULT 0,
+            subscription_tier TEXT DEFAULT 'claude_standard',
             created_at TEXT DEFAULT (datetime('now')),
             processed_at TEXT
         );
@@ -151,7 +154,17 @@ def init_db() -> sqlite3.Connection:
             user_prompt TEXT,              -- first user prompt
             summary TEXT,                  -- AI session summary (filled at end)
             observation_count INTEGER DEFAULT 0,
+            subscription_tier TEXT DEFAULT 'claude_standard',
             status TEXT DEFAULT 'active'   -- 'active', 'ended', 'summarized'
+        );
+
+        CREATE TABLE IF NOT EXISTS quota_usage (
+            usage_date TEXT NOT NULL,
+            subscription_tier TEXT NOT NULL,
+            observations_count INTEGER DEFAULT 0,
+            estimated_tokens INTEGER DEFAULT 0,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (usage_date, subscription_tier)
         );
 
         CREATE TABLE IF NOT EXISTS session_summaries (
@@ -169,9 +182,26 @@ def init_db() -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_obs_timestamp ON observations(timestamp);
         CREATE INDEX IF NOT EXISTS idx_obs_tool ON observations(tool_name);
         CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
+        CREATE INDEX IF NOT EXISTS idx_obs_tier ON observations(subscription_tier);
+        CREATE INDEX IF NOT EXISTS idx_quota_tier ON quota_usage(subscription_tier, usage_date);
     """)
+
+    # Backward-compatible migrations for existing DBs
+    _ensure_column_exists(conn, "observations", "subscription_tier", "TEXT DEFAULT 'claude_standard'")
+    _ensure_column_exists(conn, "sessions", "subscription_tier", "TEXT DEFAULT 'claude_standard'")
+
     conn.commit()
     return conn
+
+
+def _ensure_column_exists(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+    """Add column to an existing table when the column is missing."""
+    columns = {
+        row["name"]
+        for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
 
 # ── Global state ────────────────────────────────────────────────────────────
@@ -188,6 +218,7 @@ shutdown_event = asyncio.Event()
 # Rate limiter: {session_id: deque of timestamps}
 _rate_limit_buckets: dict[str, deque] = {}
 _rate_limit_last_cleanup: float = 0.0
+quota_manager: Optional["QuotaManager"] = None
 
 
 # ── API Authentication ─────────────────────────────────────────────────────
@@ -240,6 +271,109 @@ def _check_rate_limit(session_id: str) -> bool:
     bucket.append(now)
     return True
 
+
+class SubscriptionRateLimiter:
+    """Per-tier and per-session in-memory rate limiter."""
+
+    def __init__(self):
+        self._tier_buckets: dict[str, deque] = {}
+        self._session_buckets: dict[str, deque] = {}
+        self._last_cleanup: float = 0.0
+
+    def _prune(self, bucket: deque, cutoff: float):
+        while bucket and bucket[0] < cutoff:
+            bucket.popleft()
+
+    def _bucket_for(self, storage: dict[str, deque], key: str) -> deque:
+        bucket = storage.get(key)
+        if bucket is None:
+            bucket = deque()
+            storage[key] = bucket
+        return bucket
+
+    def check(self, session_id: str, tier: str) -> tuple[bool, str]:
+        now = time.monotonic()
+        if now - self._last_cleanup > RATE_LIMIT_CLEANUP_INTERVAL:
+            self._cleanup(now)
+            self._last_cleanup = now
+
+        cutoff = now - RATE_LIMIT_WINDOW
+        tier_cfg = get_tier_config(tier)
+
+        session_bucket = self._bucket_for(self._session_buckets, session_id)
+        self._prune(session_bucket, cutoff)
+        if len(session_bucket) >= RATE_LIMIT_MAX:
+            return False, (
+                f"session rate limit exceeded: max {RATE_LIMIT_MAX} observations "
+                f"per {RATE_LIMIT_WINDOW}s"
+            )
+
+        tier_bucket = self._bucket_for(self._tier_buckets, tier_cfg.tier.value)
+        self._prune(tier_bucket, cutoff)
+        if len(tier_bucket) >= tier_cfg.limits.observations_per_minute:
+            return False, (
+                f"subscription tier {tier_cfg.tier.value} exhausted: max "
+                f"{tier_cfg.limits.observations_per_minute} observations per minute"
+            )
+
+        session_bucket.append(now)
+        tier_bucket.append(now)
+        return True, ""
+
+    def _cleanup(self, now: float):
+        cutoff = now - RATE_LIMIT_WINDOW
+        for buckets in (self._session_buckets, self._tier_buckets):
+            stale = [k for k, v in buckets.items() if not v or v[-1] < cutoff]
+            for key in stale:
+                del buckets[key]
+
+
+class QuotaManager:
+    """Tracks per-tier daily estimated token usage."""
+
+    def __init__(self, conn: sqlite3.Connection):
+        self._conn = conn
+
+    def _today(self) -> str:
+        return datetime.now(timezone.utc).date().isoformat()
+
+    @staticmethod
+    def estimate_tokens(raw_input: Optional[str], raw_output: Optional[str]) -> int:
+        # lightweight estimation to avoid expensive tokenization in hot path
+        chars = len(raw_input or "") + len(raw_output or "")
+        return max(1, chars // 4)
+
+    def consume(self, tier: str, raw_input: Optional[str], raw_output: Optional[str]) -> tuple[bool, int, int]:
+        tier_cfg = get_tier_config(tier)
+        budget = tier_cfg.limits.daily_token_budget
+        tokens = self.estimate_tokens(raw_input, raw_output)
+        usage_date = self._today()
+        now = datetime.now(timezone.utc).isoformat()
+        self._conn.execute(
+            "INSERT INTO quota_usage (usage_date, subscription_tier, observations_count, "
+            "estimated_tokens, updated_at) VALUES (?, ?, 0, 0, ?) "
+            "ON CONFLICT(usage_date, subscription_tier) DO NOTHING",
+            (usage_date, tier_cfg.tier.value, now),
+        )
+        row = self._conn.execute(
+            "SELECT estimated_tokens FROM quota_usage WHERE usage_date = ? AND subscription_tier = ?",
+            (usage_date, tier_cfg.tier.value),
+        ).fetchone()
+        used = int(row["estimated_tokens"]) if row else 0
+        if used + tokens > budget:
+            return False, used, budget
+
+        self._conn.execute(
+            "UPDATE quota_usage SET observations_count = observations_count + 1, "
+            "estimated_tokens = estimated_tokens + ?, updated_at = ? "
+            "WHERE usage_date = ? AND subscription_tier = ?",
+            (tokens, now, usage_date, tier_cfg.tier.value),
+        )
+        return True, used + tokens, budget
+
+
+subscription_rate_limiter = SubscriptionRateLimiter()
+
 # ── Pydantic models ─────────────────────────────────────────────────────────
 
 
@@ -249,6 +383,7 @@ class ObservationRequest(BaseModel):
     source: str  # 'post_tool_use', 'user_prompt', 'session_end'
     tool_name: Optional[str] = None
     agent: str = "main"
+    subscription_tier: str = DEFAULT_SUBSCRIPTION_TIER
     raw_input: Optional[str] = None
     raw_output: Optional[str] = None
 
@@ -271,6 +406,7 @@ class SessionStartRequest(BaseModel):
     """Register a new session."""
     session_id: str
     agent: str = "main"
+    subscription_tier: str = DEFAULT_SUBSCRIPTION_TIER
     user_prompt: Optional[str] = None
 
 
@@ -1836,7 +1972,7 @@ async def _processor_watchdog():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage worker lifecycle."""
-    global db, db_lock, processor_task, retention_task, summarization_task, retention_manager, ai_compressor, entity_extractor, kg
+    global db, db_lock, processor_task, retention_task, summarization_task, retention_manager, ai_compressor, entity_extractor, kg, quota_manager
 
     logger.info(f"Cortex Worker starting on port {WORKER_PORT}")
 
@@ -1847,6 +1983,7 @@ async def lifespan(app: FastAPI):
     # Initialize database and async lock
     db = init_db()
     db_lock = asyncio.Lock()
+    quota_manager = QuotaManager(db)
     logger.info(f"Database initialized at {DB_PATH}")
 
     # Initialize AI compressor
@@ -1947,19 +2084,35 @@ async def receive_observation(req: ObservationRequest):
     if db is None or db_lock is None:
         raise HTTPException(status_code=503, detail="Database not initialized")
 
+    tier_value = parse_tier(req.subscription_tier).value
+
     # Rate limit check
-    if not _check_rate_limit(req.session_id):
+    allowed, reason = subscription_rate_limiter.check(req.session_id, tier_value)
+    if not allowed:
         raise HTTPException(
             status_code=429,
-            detail=f"Rate limit exceeded: max {RATE_LIMIT_MAX} observations per minute per session",
+            detail=reason,
         )
 
     now = datetime.now(timezone.utc).isoformat()
 
     async with db_lock:
+        if quota_manager is not None:
+            quota_ok, used_tokens, budget = quota_manager.consume(
+                tier_value, req.truncated_input(), req.truncated_output()
+            )
+            if not quota_ok:
+                raise HTTPException(
+                    status_code=429,
+                    detail=(
+                        f"Daily token quota exceeded for {tier_value}: "
+                        f"{used_tokens}/{budget} estimated tokens consumed"
+                    ),
+                )
+
         db.execute(
             "INSERT INTO observations (session_id, timestamp, source, tool_name, "
-            "agent, raw_input, raw_output) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "agent, raw_input, raw_output, subscription_tier) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 req.session_id,
                 now,
@@ -1968,6 +2121,7 @@ async def receive_observation(req: ObservationRequest):
                 req.agent,
                 req.truncated_input(),
                 req.truncated_output(),
+                tier_value,
             ),
         )
 
@@ -1981,7 +2135,7 @@ async def receive_observation(req: ObservationRequest):
 
     logger.info(
         f"Observation received: session={req.session_id[:8]}... "
-        f"source={req.source} tool={req.tool_name}"
+        f"source={req.source} tool={req.tool_name} tier={tier_value}"
     )
     return {"status": "queued"}
 
@@ -1992,19 +2146,23 @@ async def start_session(req: SessionStartRequest):
     if db is None or db_lock is None:
         raise HTTPException(status_code=503, detail="Database not initialized")
 
+    tier_value = parse_tier(req.subscription_tier).value
     now = datetime.now(timezone.utc).isoformat()
 
     async with db_lock:
         # Upsert — session might already exist from a hook that fired before this
         db.execute(
-            "INSERT INTO sessions (id, agent, started_at, user_prompt) "
-            "VALUES (?, ?, ?, ?) "
-            "ON CONFLICT(id) DO UPDATE SET user_prompt = excluded.user_prompt",
-            (req.session_id, req.agent, now, req.user_prompt),
+            "INSERT INTO sessions (id, agent, started_at, user_prompt, subscription_tier) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET user_prompt = excluded.user_prompt, "
+            "subscription_tier = excluded.subscription_tier",
+            (req.session_id, req.agent, now, req.user_prompt, tier_value),
         )
         db.commit()
 
-    logger.info(f"Session started: {req.session_id[:8]}... agent={req.agent}")
+    logger.info(
+        f"Session started: {req.session_id[:8]}... agent={req.agent} tier={tier_value}"
+    )
     return {"status": "started", "session_id": req.session_id}
 
 
