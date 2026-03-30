@@ -1272,12 +1272,18 @@ class UnifiedVectorStore:
         if not terms:
             return '""'
 
-        # Use OR with prefix matching for better recall
+        # Use OR with prefix matching for better recall.
+        # FTS5 treats "col:term" as column filter; hyphens in "foo-bar*" break into
+        # invalid column names (e.g. health-probe -> column "health", "probe").
         parts = []
         for t in terms:
-            if t:
-                # Add both exact and prefix forms
-                parts.append(f'"{t}" OR {t}*')
+            if not t:
+                continue
+            quoted = f'"{t}"'
+            if "-" in t:
+                parts.append(quoted)
+            else:
+                parts.append(f'{quoted} OR {t}*')
         return " OR ".join(parts)
 
     def _rows_to_results(self, rows, score_key: str = "score") -> list[dict]:
