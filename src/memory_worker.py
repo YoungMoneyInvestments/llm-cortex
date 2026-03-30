@@ -30,7 +30,7 @@ import sys
 import time
 from collections import deque
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -43,6 +43,7 @@ import uvicorn
 # Ensure scripts dir is on path for memory_retriever
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from memory_retriever import MemoryRetriever
+from subscription import DEFAULT_TIER, get_tier_config, parse_tier
 
 # ── Config ──────────────────────────────────────────────────────────────────
 
@@ -75,6 +76,7 @@ CORTEX_API_KEY = os.environ.get("CORTEX_WORKER_API_KEY", "cortex-local-2026")
 RATE_LIMIT_MAX = 100           # max observations per minute per session_id
 RATE_LIMIT_WINDOW = 60         # window in seconds
 RATE_LIMIT_CLEANUP_INTERVAL = 300  # cleanup old entries every 5 minutes
+DEFAULT_SUBSCRIPTION_TIER = os.environ.get("CORTEX_SUBSCRIPTION_TIER", DEFAULT_TIER.value)
 
 # ── AI compression config ────────────────────────────────────────────
 AI_MODEL = "claude-sonnet-4-6"
@@ -169,8 +171,68 @@ def init_db() -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_obs_timestamp ON observations(timestamp);
         CREATE INDEX IF NOT EXISTS idx_obs_tool ON observations(tool_name);
         CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
+
+        CREATE TABLE IF NOT EXISTS quota_usage (
+            usage_date TEXT NOT NULL,
+            subscription_tier TEXT NOT NULL,
+            observations_count INTEGER DEFAULT 0,
+            estimated_tokens INTEGER DEFAULT 0,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (usage_date, subscription_tier)
+        );
+
+        CREATE TABLE IF NOT EXISTS profile (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            category TEXT NOT NULL,  -- 'expertise', 'preference', 'style', 'context'
+            key TEXT NOT NULL,
+            value TEXT NOT NULL,
+            confidence REAL DEFAULT 0.5,
+            updated_at TEXT DEFAULT (datetime('now')),
+            UNIQUE(category, key) ON CONFLICT REPLACE
+        );
+
+        CREATE TABLE IF NOT EXISTS memcells (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            observation_ids TEXT NOT NULL,
+            summary TEXT,
+            chunk_type TEXT DEFAULT 'auto',
+            timestamp TEXT NOT NULL,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_memcells_session ON memcells(session_id);
+
+        CREATE TABLE IF NOT EXISTS foresight (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            prediction TEXT NOT NULL,
+            evidence TEXT,
+            valid_until TEXT NOT NULL,
+            created_at TEXT DEFAULT (datetime('now')),
+            used INTEGER DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_foresight_valid ON foresight(valid_until);
+
+        CREATE INDEX IF NOT EXISTS idx_obs_tier ON observations(subscription_tier);
+        CREATE INDEX IF NOT EXISTS idx_quota_tier ON quota_usage(subscription_tier, usage_date);
+        CREATE INDEX IF NOT EXISTS idx_profile_category ON profile(category);
     """)
     conn.commit()
+
+    # Add memory_type and entities columns to observations if not present.
+    # SQLite does not support IF NOT EXISTS on ALTER TABLE — use try/except.
+    for col_def in (
+        "ALTER TABLE observations ADD COLUMN subscription_tier TEXT DEFAULT 'claude_standard'",
+        "ALTER TABLE observations ADD COLUMN memory_type TEXT",
+        "ALTER TABLE observations ADD COLUMN entities TEXT",
+        "ALTER TABLE sessions ADD COLUMN subscription_tier TEXT DEFAULT 'claude_standard'",
+    ):
+        try:
+            conn.execute(col_def)
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
     return conn
 
 
@@ -188,6 +250,7 @@ shutdown_event = asyncio.Event()
 # Rate limiter: {session_id: deque of timestamps}
 _rate_limit_buckets: dict[str, deque] = {}
 _rate_limit_last_cleanup: float = 0.0
+quota_manager: Optional["QuotaManager"] = None
 
 
 # ── API Authentication ─────────────────────────────────────────────────────
@@ -239,6 +302,109 @@ def _check_rate_limit(session_id: str) -> bool:
 
     bucket.append(now)
     return True
+
+
+class SubscriptionRateLimiter:
+    """Per-tier and per-session in-memory rate limiter."""
+
+    def __init__(self):
+        self._tier_buckets: dict[str, deque] = {}
+        self._session_buckets: dict[str, deque] = {}
+        self._last_cleanup: float = 0.0
+
+    def _prune(self, bucket: deque, cutoff: float):
+        while bucket and bucket[0] < cutoff:
+            bucket.popleft()
+
+    def _bucket_for(self, storage: dict[str, deque], key: str) -> deque:
+        bucket = storage.get(key)
+        if bucket is None:
+            bucket = deque()
+            storage[key] = bucket
+        return bucket
+
+    def check(self, session_id: str, tier: str) -> tuple[bool, str]:
+        now = time.monotonic()
+        if now - self._last_cleanup > RATE_LIMIT_CLEANUP_INTERVAL:
+            self._cleanup(now)
+            self._last_cleanup = now
+
+        cutoff = now - RATE_LIMIT_WINDOW
+        tier_cfg = get_tier_config(tier)
+
+        session_bucket = self._bucket_for(self._session_buckets, session_id)
+        self._prune(session_bucket, cutoff)
+        if len(session_bucket) >= RATE_LIMIT_MAX:
+            return False, (
+                f"session rate limit exceeded: max {RATE_LIMIT_MAX} observations "
+                f"per {RATE_LIMIT_WINDOW}s"
+            )
+
+        tier_bucket = self._bucket_for(self._tier_buckets, tier_cfg.tier.value)
+        self._prune(tier_bucket, cutoff)
+        if len(tier_bucket) >= tier_cfg.limits.observations_per_minute:
+            return False, (
+                f"subscription tier {tier_cfg.tier.value} exhausted: max "
+                f"{tier_cfg.limits.observations_per_minute} observations per minute"
+            )
+
+        session_bucket.append(now)
+        tier_bucket.append(now)
+        return True, ""
+
+    def _cleanup(self, now: float):
+        cutoff = now - RATE_LIMIT_WINDOW
+        for buckets in (self._session_buckets, self._tier_buckets):
+            stale = [k for k, v in buckets.items() if not v or v[-1] < cutoff]
+            for key in stale:
+                del buckets[key]
+
+
+class QuotaManager:
+    """Tracks per-tier daily estimated token usage."""
+
+    def __init__(self, conn: sqlite3.Connection):
+        self._conn = conn
+
+    def _today(self) -> str:
+        return datetime.now(timezone.utc).date().isoformat()
+
+    @staticmethod
+    def estimate_tokens(raw_input: Optional[str], raw_output: Optional[str]) -> int:
+        # lightweight estimation to avoid expensive tokenization in hot path
+        chars = len(raw_input or "") + len(raw_output or "")
+        return max(1, chars // 4)
+
+    def consume(self, tier: str, raw_input: Optional[str], raw_output: Optional[str]) -> tuple[bool, int, int]:
+        tier_cfg = get_tier_config(tier)
+        budget = tier_cfg.limits.daily_token_budget
+        tokens = self.estimate_tokens(raw_input, raw_output)
+        usage_date = self._today()
+        now = datetime.now(timezone.utc).isoformat()
+        self._conn.execute(
+            "INSERT INTO quota_usage (usage_date, subscription_tier, observations_count, "
+            "estimated_tokens, updated_at) VALUES (?, ?, 0, 0, ?) "
+            "ON CONFLICT(usage_date, subscription_tier) DO NOTHING",
+            (usage_date, tier_cfg.tier.value, now),
+        )
+        row = self._conn.execute(
+            "SELECT estimated_tokens FROM quota_usage WHERE usage_date = ? AND subscription_tier = ?",
+            (usage_date, tier_cfg.tier.value),
+        ).fetchone()
+        used = int(row["estimated_tokens"]) if row else 0
+        if used + tokens > budget:
+            return False, used, budget
+
+        self._conn.execute(
+            "UPDATE quota_usage SET observations_count = observations_count + 1, "
+            "estimated_tokens = estimated_tokens + ?, updated_at = ? "
+            "WHERE usage_date = ? AND subscription_tier = ?",
+            (tokens, now, usage_date, tier_cfg.tier.value),
+        )
+        return True, used + tokens, budget
+
+
+subscription_rate_limiter = SubscriptionRateLimiter()
 
 # ── Pydantic models ─────────────────────────────────────────────────────────
 
@@ -312,14 +478,181 @@ class HealthResponse(BaseModel):
     active_sessions: int
 
 
+# ── MemCell boundary detection ────────────────────────────────────────────────
+
+# Tool categories for topic-shift detection
+_TOOL_CATEGORY_MAP = {
+    "Read": "read", "Glob": "read", "Grep": "read",
+    "Edit": "write", "Write": "write",
+    "Bash": "exec",
+    "WebFetch": "web", "WebSearch": "web",
+    "Task": "task",
+}
+
+_MEMCELL_TIME_WINDOW = 90   # seconds — observations within this gap stay together
+_MEMCELL_MAX_SIZE = 5       # max observations per chunk
+
+
+def _tool_category(tool_name: Optional[str]) -> str:
+    """Map a tool name to a broad category for topic-shift detection."""
+    if tool_name is None:
+        return "other"
+    # Handle MCP tools (mcp__server__tool) as their own category
+    if tool_name.startswith("mcp__"):
+        return "mcp"
+    return _TOOL_CATEGORY_MAP.get(tool_name, "other")
+
+
+def _detect_topic_boundaries(observations: list[dict]) -> list[list[dict]]:
+    """Group raw observations into coherent topic chunks before AI compression.
+
+    Rules:
+    - Observations within 90 seconds of each other stay in the same chunk.
+    - Max 5 observations per chunk.
+    - A new chunk starts when the tool category changes significantly
+      (e.g., read → exec, write → web).
+
+    Args:
+        observations: List of dicts with at least 'timestamp', 'tool_name' keys.
+
+    Returns:
+        List of chunks, each chunk being a list of observation dicts.
+    """
+    if not observations:
+        return []
+
+    chunks: list[list[dict]] = []
+    current_chunk: list[dict] = []
+    prev_ts: Optional[float] = None
+    prev_category: Optional[str] = None
+
+    for obs in observations:
+        # Parse timestamp to epoch float for gap calculation
+        try:
+            ts_str = obs.get("timestamp", "")
+            # Handle both 'Z' and '+00:00' suffixes
+            ts_str_clean = ts_str.replace("Z", "+00:00")
+            ts_epoch = datetime.fromisoformat(ts_str_clean).timestamp()
+        except (ValueError, TypeError):
+            ts_epoch = None
+
+        category = _tool_category(obs.get("tool_name"))
+
+        # Decide whether to start a new chunk
+        start_new = False
+        if len(current_chunk) >= _MEMCELL_MAX_SIZE:
+            start_new = True
+        elif prev_ts is not None and ts_epoch is not None:
+            gap = ts_epoch - prev_ts
+            if gap > _MEMCELL_TIME_WINDOW:
+                start_new = True
+            elif prev_category is not None and category != prev_category:
+                # Topic shift: different tool category
+                meaningful_categories = {"read", "write", "exec", "web", "task", "mcp"}
+                if category in meaningful_categories and prev_category in meaningful_categories:
+                    start_new = True
+
+        if start_new and current_chunk:
+            chunks.append(current_chunk)
+            current_chunk = []
+
+        current_chunk.append(obs)
+        prev_ts = ts_epoch if ts_epoch is not None else prev_ts
+        prev_category = category
+
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    return chunks
+
+
+# ── Foresight extraction ──────────────────────────────────────────────────────
+
+
+async def _extract_foresight(
+    session_id: str,
+    summary: str,
+    compressor: "AICompressor",
+) -> Optional[dict]:
+    """Make a second AI call to extract time-bounded predictions from a chunk summary.
+
+    Returns parsed foresight dict or None if the call fails or yields nothing.
+    """
+    if not summary or not summary.strip():
+        return None
+
+    prompt = (
+        "Given this work summary, what will this user likely need in future sessions? "
+        "Extract 0-2 time-bounded predictions. Return JSON only:\n"
+        "{\"foresight\": [{\"prediction\": \"...\", \"evidence\": \"...\", \"valid_days\": 7}]}\n"
+        "If no strong predictions, return {\"foresight\": []}.\n\n"
+        f"Summary: {summary}"
+    )
+
+    try:
+        raw = await _call_ai_for_summary(prompt)
+        if not raw:
+            return None
+
+        clean = raw.strip()
+        if clean.startswith("```"):
+            clean = re.sub(r"^```(?:json)?\s*", "", clean)
+            clean = re.sub(r"\s*```$", "", clean)
+
+        parsed = json.loads(clean)
+        return parsed
+    except (json.JSONDecodeError, KeyError, TypeError) as e:
+        logger.debug(f"Foresight parse failed: {e}")
+        return None
+    except Exception as e:
+        logger.debug(f"Foresight extraction failed: {e}")
+        return None
+
+
+async def _store_foresight(session_id: str, foresight_data: dict):
+    """Persist foresight predictions to the foresight table."""
+    if db is None or db_lock is None:
+        return
+
+    predictions = foresight_data.get("foresight", [])
+    if not predictions:
+        return
+
+    now = datetime.now(timezone.utc)
+    rows_to_insert = []
+    for item in predictions:
+        prediction = item.get("prediction", "").strip()
+        if not prediction:
+            continue
+        evidence = item.get("evidence", "")
+        valid_days = int(item.get("valid_days", 7))
+        valid_until = (now + timedelta(days=valid_days)).date().isoformat()
+        rows_to_insert.append((session_id, prediction, evidence, valid_until))
+
+    if not rows_to_insert:
+        return
+
+    async with db_lock:
+        db.executemany(
+            "INSERT INTO foresight (session_id, prediction, evidence, valid_until) "
+            "VALUES (?, ?, ?, ?)",
+            rows_to_insert,
+        )
+        db.commit()
+
+    logger.debug(f"Stored {len(rows_to_insert)} foresight prediction(s) for session {session_id[:8]}...")
+
+
 # ── Background processor ───────────────────────────────────────────────────
 
 
 async def process_pending_observations():
-    """Background task: process pending observations.
+    """Background task: process pending observations in coherent topic chunks.
 
-    Currently generates simple summaries from raw data.
-    Future: AI compression, vector embedding, graph extraction.
+    Fetches pending observations, groups them into MemCell chunks via
+    _detect_topic_boundaries(), then compresses each chunk together.
+    The resulting summary is written to all observations in the chunk and
+    a memcells row is inserted.  Foresight extraction runs after each chunk.
     """
     consecutive_errors = 0
     while not shutdown_event.is_set():
@@ -328,110 +661,202 @@ async def process_pending_observations():
                 await asyncio.sleep(PROCESS_INTERVAL)
                 continue
 
-            # Serialize DB access with route handlers
+            # Fetch pending observations — include session_id and timestamp for chunking
             async with db_lock:
                 rows = db.execute(
-                    "SELECT id, source, tool_name, agent, raw_input, raw_output "
+                    "SELECT id, session_id, timestamp, source, tool_name, agent, "
+                    "raw_input, raw_output "
                     "FROM observations WHERE status = 'pending' ORDER BY id LIMIT 20"
                 ).fetchall()
 
+            if not rows:
+                consecutive_errors = 0
+                await asyncio.sleep(PROCESS_INTERVAL)
+                continue
+
+            # Convert sqlite3.Row → plain dicts so _detect_topic_boundaries can use them
+            obs_dicts = [dict(r) for r in rows]
+
+            # Group into coherent topic chunks
+            chunks = _detect_topic_boundaries(obs_dicts)
+
             processed_count = 0
-            for row in rows:
+            for chunk in chunks:
                 if shutdown_event.is_set():
                     break
-                obs_id = row["id"]
+
+                # Determine the representative session_id for the chunk (first obs wins)
+                chunk_session_id = chunk[0].get("session_id", "")
+                chunk_obs_ids = [obs["id"] for obs in chunk]
+
+                # Determine if this chunk should get AI compression:
+                # true if *any* observation in the chunk qualifies.
+                def _obs_qualifies(obs: dict) -> bool:
+                    source = obs.get("source", "")
+                    tool_name = obs.get("tool_name")
+                    raw_input = obs.get("raw_input") or ""
+                    if source in ("user_prompt", "session_end"):
+                        if source == "user_prompt" and raw_input.startswith("<task-notification>"):
+                            return False
+                        return True
+                    return tool_name in HIGH_SIGNAL_TOOLS
+
+                use_ai = (
+                    ai_compressor is not None
+                    and ai_compressor.is_available()
+                    and any(_obs_qualifies(obs) for obs in chunk)
+                )
+
+                chunk_summary: Optional[str] = None
+                chunk_memory_type: Optional[str] = None
+                chunk_entities_json: Optional[str] = None
                 try:
-                    source = row["source"]
-                    tool_name = row["tool_name"]
-                    raw_input = row["raw_input"]
-
-                    # Determine if this observation should get AI compression
-                    use_ai = (
-                        ai_compressor is not None
-                        and ai_compressor.is_available()
-                        and (
-                            source == "user_prompt"
-                            or source == "session_end"
-                            or tool_name in HIGH_SIGNAL_TOOLS
-                        )
-                        # Skip task-notification system prompts
-                        and not (
-                            source == "user_prompt"
-                            and raw_input
-                            and raw_input.startswith("<task-notification>")
-                        )
-                    )
-
-                    summary = None
                     if use_ai:
-                        summary = await ai_compressor.compress(
-                            source=source,
-                            tool_name=tool_name,
-                            agent=row["agent"],
-                            raw_input=raw_input,
-                            raw_output=row["raw_output"],
-                        )
-                        if summary is None:
-                            ai_compressor._fallback_count += 1
+                        # For multi-observation chunks, compress the whole chunk together.
+                        if len(chunk) == 1:
+                            obs = chunk[0]
+                            chunk_summary = await ai_compressor.compress(
+                                source=obs["source"],
+                                tool_name=obs.get("tool_name"),
+                                agent=obs.get("agent", "main"),
+                                raw_input=obs.get("raw_input"),
+                                raw_output=obs.get("raw_output"),
+                            )
+                            if chunk_summary is None:
+                                ai_compressor._fallback_count += 1
+                            else:
+                                chunk_memory_type = ai_compressor._last_memory_type
+                                chunk_entities_json = ai_compressor._last_entities_json
+                        else:
+                            # Multi-obs chunk: build a condensed combined text and compress once
+                            combined_parts = []
+                            for obs in chunk:
+                                tn = obs.get("tool_name") or obs.get("source", "")
+                                inp = (obs.get("raw_input") or "")[:400]
+                                out = (obs.get("raw_output") or "")[:400]
+                                combined_parts.append(
+                                    f"[{tn}] input={inp!r} output={out!r}"
+                                )
+                            combined_text = "\n".join(combined_parts)
+                            first = chunk[0]
+                            chunk_summary = await ai_compressor.compress(
+                                source=first["source"],
+                                tool_name=first.get("tool_name"),
+                                agent=first.get("agent", "main"),
+                                raw_input=combined_text,
+                                raw_output=None,
+                            )
+                            if chunk_summary is None:
+                                ai_compressor._fallback_count += 1
+                            else:
+                                chunk_memory_type = ai_compressor._last_memory_type
+                                chunk_entities_json = ai_compressor._last_entities_json
 
-                    if summary is None:  # AI failed or not applicable
-                        summary = _generate_summary_rule_based(
-                            source=source,
-                            tool_name=tool_name,
-                            agent=row["agent"],
-                            raw_input=raw_input,
-                            raw_output=row["raw_output"],
-                        )
+                    if chunk_summary is None:
+                        # Rule-based fallback: join per-obs rule-based summaries
+                        rb_parts = [
+                            _generate_summary_rule_based(
+                                source=obs["source"],
+                                tool_name=obs.get("tool_name"),
+                                agent=obs.get("agent", "main"),
+                                raw_input=obs.get("raw_input"),
+                                raw_output=obs.get("raw_output"),
+                            )
+                            for obs in chunk
+                        ]
+                        chunk_summary = " | ".join(rb_parts)
+                        chunk_memory_type = "episodic"
+                        chunk_entities_json = json.dumps([])
 
+                    now_iso = datetime.now(timezone.utc).isoformat()
+
+                    # Mark all observations in this chunk as processed with the chunk summary
                     async with db_lock:
+                        placeholders = ",".join("?" * len(chunk_obs_ids))
                         db.execute(
-                            "UPDATE observations SET summary = ?, status = 'processed', "
-                            "processed_at = ? WHERE id = ?",
-                            (summary, datetime.now(timezone.utc).isoformat(), obs_id),
+                            f"UPDATE observations SET summary = ?, status = 'processed', "
+                            f"processed_at = ?, memory_type = ?, entities = ? "
+                            f"WHERE id IN ({placeholders})",
+                            [chunk_summary, now_iso, chunk_memory_type, chunk_entities_json]
+                            + chunk_obs_ids,
+                        )
+
+                        # Insert memcell record
+                        db.execute(
+                            "INSERT INTO memcells (session_id, observation_ids, summary, "
+                            "chunk_type, timestamp) VALUES (?, ?, ?, ?, ?)",
+                            (
+                                chunk_session_id,
+                                json.dumps(chunk_obs_ids),
+                                chunk_summary,
+                                "auto",
+                                now_iso,
+                            ),
                         )
                         db.commit()
 
-                    # Sync to vector store (if available)
-                    await _sync_to_vector_store(obs_id, summary, row)
+                    # Sync each observation to vector store and run NER
+                    for obs in chunk:
+                        obs_id = obs["id"]
+                        source = obs["source"]
+                        tool_name = obs.get("tool_name")
+                        # find the sqlite3.Row matching this obs_id
+                        matching_row = next((r for r in rows if r["id"] == obs_id), None)
+                        if matching_row is not None:
+                            await _sync_to_vector_store(obs_id, chunk_summary, matching_row)
 
-                    # NER: extract entities and link in knowledge graph
-                    if (
-                        NER_ENABLED
-                        and entity_extractor is not None
-                        and kg is not None
-                        and (
-                            source == "user_prompt"
-                            or source == "session_end"
-                            or tool_name in HIGH_SIGNAL_TOOLS
-                        )
-                        and summary
-                        and len(summary) > 50
-                    ):
-                        await _extract_and_link_entities(
-                            obs_id, summary,
-                            row["raw_input"], row["raw_output"],
-                        )
+                        if (
+                            NER_ENABLED
+                            and entity_extractor is not None
+                            and kg is not None
+                            and (
+                                source == "user_prompt"
+                                or source == "session_end"
+                                or tool_name in HIGH_SIGNAL_TOOLS
+                            )
+                            and chunk_summary
+                            and len(chunk_summary) > 50
+                        ):
+                            await _extract_and_link_entities(
+                                obs_id, chunk_summary,
+                                obs.get("raw_input"), obs.get("raw_output"),
+                            )
 
-                    processed_count += 1
+                    # Foresight extraction — fire after each chunk, non-blocking
+                    if ai_compressor is not None and ai_compressor.is_available() and chunk_summary:
+                        try:
+                            foresight_data = await _extract_foresight(
+                                chunk_session_id, chunk_summary, ai_compressor
+                            )
+                            if foresight_data:
+                                await _store_foresight(chunk_session_id, foresight_data)
+                        except Exception as fe:
+                            logger.debug(f"Foresight extraction skipped: {fe}")
+
+                    processed_count += len(chunk)
 
                     # Rate control between AI calls
                     if use_ai:
                         await asyncio.sleep(AI_COMPRESSION_DELAY)
 
                 except Exception as e:
-                    logger.error(f"Failed to process observation {obs_id}: {e}", exc_info=True)
+                    # Mark all observations in this chunk as failed
+                    logger.error(
+                        f"Failed to process chunk {chunk_obs_ids}: {e}", exc_info=True
+                    )
                     try:
                         async with db_lock:
+                            placeholders = ",".join("?" * len(chunk_obs_ids))
                             db.execute(
-                                "UPDATE observations SET status = 'failed' WHERE id = ?",
-                                (obs_id,),
+                                f"UPDATE observations SET status = 'failed' WHERE id IN ({placeholders})",
+                                chunk_obs_ids,
                             )
                             db.commit()
                     except Exception:
-                        pass  # Don't crash the loop for cleanup failures
+                        pass
 
             if processed_count > 0:
-                logger.info(f"Processed {processed_count} observations")
+                logger.info(f"Processed {processed_count} observations in {len(chunks)} chunk(s)")
 
             consecutive_errors = 0  # Reset on successful iteration
 
@@ -510,6 +935,9 @@ class AICompressor:
         self._last_probe_time: float = 0  # last time we probed during degraded state
         self._using_router = False      # True when CamiRouter is the active path
         self._router_available = True   # False if CamiRouter probe failed
+        # Typed extraction fields — set after each successful compress() call
+        self._last_memory_type: Optional[str] = None
+        self._last_entities_json: Optional[str] = None
 
     def _record_success(self):
         """Reset failure tracking on successful compression."""
@@ -663,29 +1091,45 @@ class AICompressor:
         raw_input: Optional[str],
         raw_output: Optional[str],
     ) -> Optional[str]:
-        """Compress an observation with AI. Tries CamiRouter first, falls back to OAuth."""
+        """Compress an observation with AI. Tries CamiRouter first, falls back to OAuth.
+
+        Returns the content string (dense summary).  After a successful call,
+        self._last_memory_type and self._last_entities_json are set so the
+        caller can persist typed fields without changing the return signature.
+        """
+        # Reset typed fields for this call
+        self._last_memory_type = None
+        self._last_entities_json = None
+
         # Track probe time when degraded (for self-healing probes)
         self._last_probe_time = time.monotonic()
 
         prompt = self._build_prompt(source, tool_name, agent, raw_input, raw_output)
 
+        raw_result: Optional[str] = None
+
         # Try CamiRouter first (separate rate limit pool)
-        result = await self._compress_via_router(prompt)
-        if result is not None:
+        raw_result = await self._compress_via_router(prompt)
+        if raw_result is not None:
             self._ai_count += 1
             self._using_router = True
             self._record_success()
-            return result
+        else:
+            # Fall back to direct Anthropic OAuth
+            raw_result = await self._compress_via_oauth(prompt)
+            if raw_result is not None:
+                self._ai_count += 1
+                self._using_router = False
+                self._record_success()
 
-        # Fall back to direct Anthropic OAuth
-        result = await self._compress_via_oauth(prompt)
-        if result is not None:
-            self._ai_count += 1
-            self._using_router = False
-            self._record_success()
-            return result
+        if raw_result is None:
+            return None
 
-        return None
+        # Parse the structured JSON response; populate typed fields
+        content, memory_type, entities_json = self._parse_typed_response(raw_result)
+        self._last_memory_type = memory_type
+        self._last_entities_json = entities_json
+        return content
 
     async def _compress_via_router(self, prompt: str) -> Optional[str]:
         """Try compression through CamiRouter (OpenAI-compatible)."""
@@ -786,19 +1230,56 @@ class AICompressor:
         raw_input: Optional[str],
         raw_output: Optional[str],
     ) -> str:
-        """Build the compression prompt."""
-        return (
-            "Compress this tool observation into a dense, searchable summary.\n"
-            "Capture: WHAT happened, WHY it matters, KEY details "
-            "(file paths, function names, decisions, errors, outcomes).\n"
-            "Drop: boilerplate, redundant context, formatting artifacts, "
-            "system prompt noise.\n\n"
+        """Build the compression prompt requesting structured JSON output."""
+        observation_text = (
             f"Source: {source}\n"
             f"Tool: {tool_name or 'N/A'}\n"
             f"Agent: {agent}\n"
             f"Input: {raw_input or 'N/A'}\n"
             f"Output: {raw_output or 'N/A'}"
         )
+        return (
+            "Compress this Claude Code work into a structured memory. "
+            "Return ONLY valid JSON, no other text:\n"
+            "{\n"
+            '  "type": "episodic|decision|preference|fact",\n'
+            '  "content": "dense summary under 200 chars",\n'
+            '  "entities": ["list", "of", "key", "entities"]\n'
+            "}\n\n"
+            "Types:\n"
+            "- episodic: what happened (actions taken, files changed)\n"
+            "- decision: a choice made or approach chosen\n"
+            "- preference: user likes/dislikes/working style\n"
+            "- fact: a technical fact learned\n\n"
+            f"Observation:\n{observation_text}"
+        )
+
+    @staticmethod
+    def _parse_typed_response(raw_text: str) -> tuple[str, Optional[str], Optional[str]]:
+        """Parse a typed JSON compression response.
+
+        Returns (content, memory_type, entities_json).
+        Falls back gracefully if JSON is invalid or fields are missing.
+        """
+        VALID_TYPES = {"episodic", "decision", "preference", "fact"}
+        try:
+            clean = raw_text.strip()
+            if clean.startswith("```"):
+                clean = re.sub(r"^```(?:json)?\s*", "", clean)
+                clean = re.sub(r"\s*```$", "", clean)
+            parsed = json.loads(clean)
+            content = str(parsed.get("content", raw_text)).strip() or raw_text
+            memory_type = parsed.get("type")
+            if memory_type not in VALID_TYPES:
+                memory_type = "episodic"
+            entities = parsed.get("entities", [])
+            if not isinstance(entities, list):
+                entities = []
+            # Coerce all entity items to strings
+            entities = [str(e) for e in entities if e]
+            return content, memory_type, json.dumps(entities)
+        except (json.JSONDecodeError, TypeError, KeyError):
+            return raw_text, "episodic", json.dumps([])
 
 
 async def _sync_to_vector_store(obs_id: int, summary: str, row: sqlite3.Row):
@@ -1554,6 +2035,77 @@ async def run_retention_loop():
 # ── Session Summarization ──────────────────────────────────────────────────
 
 
+async def _update_user_profile(session_id: str, session_summary: str, compressor: "AICompressor"):
+    """Extract lasting profile facts from a session summary and upsert into the profile table.
+
+    Called after a session summary is written to the DB. Makes an AI call to extract
+    durable facts about the user's expertise, preferences, style, and context.
+    Fails silently so it never disrupts the summarization pipeline.
+    """
+    if db is None or db_lock is None:
+        return
+    if not session_summary or not session_summary.strip():
+        return
+    if compressor is None or not compressor.is_available():
+        return
+
+    prompt = (
+        "From this session summary, extract lasting facts about this user's profile. "
+        "Return ONLY valid JSON:\n"
+        "{\n"
+        '  "expertise": {"area": "description"},\n'
+        '  "preference": {"topic": "what they prefer"},\n'
+        '  "style": {"aspect": "how they work"},\n'
+        '  "context": {"key": "important ongoing context"}\n'
+        "}\n"
+        "Only include high-confidence, durable facts. Return {} for any category with nothing notable.\n\n"
+        f"Session summary:\n{session_summary}"
+    )
+
+    try:
+        raw = await _call_ai_for_summary(prompt)
+        if not raw:
+            return
+
+        clean = raw.strip()
+        if clean.startswith("```"):
+            clean = re.sub(r"^```(?:json)?\s*", "", clean)
+            clean = re.sub(r"\s*```$", "", clean)
+
+        extracted: dict = json.loads(clean)
+        if not isinstance(extracted, dict):
+            return
+
+        valid_categories = {"expertise", "preference", "style", "context"}
+        now = datetime.now(timezone.utc).isoformat()
+
+        async with db_lock:
+            for category, entries in extracted.items():
+                if category not in valid_categories:
+                    continue
+                if not isinstance(entries, dict):
+                    continue
+                for key, value in entries.items():
+                    if not key or not value:
+                        continue
+                    db.execute(
+                        "INSERT INTO profile (category, key, value, confidence, updated_at) "
+                        "VALUES (?, ?, ?, 0.8, ?) "
+                        "ON CONFLICT(category, key) DO UPDATE SET "
+                        "value = excluded.value, confidence = excluded.confidence, "
+                        "updated_at = excluded.updated_at",
+                        (category, str(key), str(value), now),
+                    )
+            db.commit()
+
+        logger.info(f"Profile updated from session {session_id[:8]}...")
+
+    except (json.JSONDecodeError, KeyError, TypeError) as e:
+        logger.debug(f"Profile extraction parse failed for {session_id[:8]}...: {e}")
+    except Exception as e:
+        logger.debug(f"Profile update failed for {session_id[:8]}...: {e}")
+
+
 async def _generate_session_summary(session_id: str):
     """Generate and store a summary for a completed session.
 
@@ -1622,6 +2174,10 @@ async def _generate_session_summary(session_id: str):
             f"Session {session_id[:8]}... summarized "
             f"({'AI' if ai_summary else 'rule-based'}, {len(rows)} observations)"
         )
+
+        # Extract durable profile facts from this session's summary
+        if overall_summary and ai_compressor is not None:
+            await _update_user_profile(session_id, overall_summary, ai_compressor)
 
     except Exception as e:
         logger.error(f"Session summarization failed for {session_id[:8]}...: {e}", exc_info=True)
@@ -1814,8 +2370,10 @@ start_time = time.time()
 async def _processor_watchdog():
     """Watchdog that restarts the processor, retention, and summarization loops if they die."""
     global processor_task, retention_task, summarization_task
+    check_interval_s = 5.0
     while not shutdown_event.is_set():
-        await asyncio.sleep(30)
+        await asyncio.sleep(check_interval_s)
+        check_interval_s = 30.0
         if processor_task and processor_task.done() and not shutdown_event.is_set():
             exc = processor_task.exception() if not processor_task.cancelled() else None
             logger.error(f"Processor task died unexpectedly! Exception: {exc}")
@@ -1915,6 +2473,7 @@ app = FastAPI(
 @app.get("/api/health", response_model=HealthResponse)
 async def health():
     """Health check endpoint."""
+    global processor_task
     if db is None or db_lock is None:
         raise HTTPException(status_code=503, detail="Database not initialized")
 
@@ -2325,6 +2884,35 @@ async def get_ner_stats():
     return stats
 
 
+# ── Profile endpoints ─────────────────────────────────────────────────────
+
+
+@app.get("/api/profile")
+async def get_profile():
+    """Return all user profile entries grouped by category, ordered by confidence."""
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+
+    rows = db.execute(
+        "SELECT category, key, value, confidence, updated_at "
+        "FROM profile ORDER BY category ASC, confidence DESC"
+    ).fetchall()
+
+    grouped: dict[str, list[dict]] = {}
+    for r in rows:
+        cat = r["category"]
+        if cat not in grouped:
+            grouped[cat] = []
+        grouped[cat].append({
+            "key": r["key"],
+            "value": r["value"],
+            "confidence": r["confidence"],
+            "updated_at": r["updated_at"],
+        })
+
+    return {"profile": grouped, "total_entries": len(rows)}
+
+
 # ── Signal handling ─────────────────────────────────────────────────────────
 
 
@@ -2340,8 +2928,11 @@ signal.signal(signal.SIGINT, handle_signal)
 # ── Entry point ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    # Pass `app` directly so this process has a single module namespace. Using
+    # "memory_worker:app" re-imports the file as `memory_worker`, duplicating globals
+    # and breaking lifespan vs. __main__ state.
     uvicorn.run(
-        "memory_worker:app",
+        app,
         host="127.0.0.1",
         port=WORKER_PORT,
         log_level="info",
