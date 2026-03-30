@@ -2,13 +2,14 @@
 """
 MCP Memory Server — Exposes Cortex memory retrieval as MCP tools.
 
-Provides 6 MCP tools that follow the token-efficient 3-layer pattern:
+Provides 7 MCP tools that follow the token-efficient 3-layer pattern:
   1. cami_memory_search       — L1: Compact index search (~20 tokens/result)
   2. cami_memory_timeline     — L2: Chronological context (~100 tokens/item)
   3. cami_memory_details      — L3: Full observation text (variable)
   4. cami_memory_save         — Save a memory for future retrieval
   5. cami_memory_graph_search — Graph-augmented search with entity expansion
   6. cami_message_search      — Semantic search over iMessage/Discord via pgvector
+  7. cami_contact_search      — Search unified contacts database
 
 Usage:
     # Start as MCP server (stdio transport)
@@ -27,6 +28,7 @@ Usage:
 
 import json
 import os
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -253,7 +255,172 @@ TOOLS = [
             "required": ["query"],
         },
     },
+    {
+        "name": "cami_contact_search",
+        "description": (
+            "Search Cameron's unified contacts database. Find people by name, phone, email, "
+            "relationship type, or notes. Returns structured contact profiles with communication "
+            "history across iMessage, Discord, Facebook, and Instagram."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Name, phone number, email, or keyword to search for",
+                },
+                "relationship_type": {
+                    "type": "string",
+                    "description": "Filter by: family, friend, business, family_business, romantic, acquaintance",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max results (default: 10)",
+                    "default": 10,
+                },
+            },
+            "required": ["query"],
+        },
+    },
 ]
+
+
+# ── Contact search ─────────────────────────────────────────────────────────
+
+CONTACTS_DB_PATH = "/Users/cameronbennion/clawd/data/unified_contacts.db"
+
+
+def search_contacts(query: str, relationship_type: str = None, limit: int = 10) -> str:
+    """Search the unified contacts database and return formatted results."""
+    if not os.path.exists(CONTACTS_DB_PATH):
+        return "Contacts DB not built yet. Run build_unified_contacts_db.py"
+
+    conn = sqlite3.connect(f"file:{CONTACTS_DB_PATH}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        cur = conn.cursor()
+        rows = []
+        stripped = query.strip()
+
+        # Detect phone number queries (digits only, 10-11 chars)
+        digits_only = stripped.replace("-", "").replace("(", "").replace(")", "").replace(" ", "").replace("+", "")
+        is_phone = digits_only.isdigit() and 10 <= len(digits_only) <= 11
+
+        if is_phone:
+            cur.execute(
+                "SELECT contact_id FROM phone_lookup WHERE phone_normalized LIKE ?",
+                (f"%{digits_only[-10:]}%",),
+            )
+            contact_ids = [r["contact_id"] for r in cur.fetchall()]
+            if contact_ids:
+                placeholders = ",".join("?" * len(contact_ids))
+                sql = f"SELECT * FROM contacts WHERE id IN ({placeholders})"
+                params = list(contact_ids)
+                if relationship_type:
+                    sql += " AND relationship_type = ?"
+                    params.append(relationship_type)
+                sql += " LIMIT ?"
+                params.append(limit)
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+
+        elif "@" in stripped:
+            cur.execute(
+                "SELECT contact_id FROM email_lookup WHERE email LIKE ?",
+                (f"%{stripped}%",),
+            )
+            contact_ids = [r["contact_id"] for r in cur.fetchall()]
+            if contact_ids:
+                placeholders = ",".join("?" * len(contact_ids))
+                sql = f"SELECT * FROM contacts WHERE id IN ({placeholders})"
+                params = list(contact_ids)
+                if relationship_type:
+                    sql += " AND relationship_type = ?"
+                    params.append(relationship_type)
+                sql += " LIMIT ?"
+                params.append(limit)
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+
+        else:
+            # Try FTS5 first
+            try:
+                fts_query = stripped.replace('"', '""')
+                sql = (
+                    "SELECT c.* FROM contacts_fts fts "
+                    "JOIN contacts c ON c.id = fts.rowid "
+                    "WHERE contacts_fts MATCH ?"
+                )
+                params = [f'"{fts_query}"']
+                if relationship_type:
+                    sql += " AND c.relationship_type = ?"
+                    params.append(relationship_type)
+                sql += " LIMIT ?"
+                params.append(limit)
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+            except sqlite3.OperationalError:
+                # FTS table may not exist
+                rows = []
+
+            # Fall back to LIKE on display_name if FTS returned nothing
+            if not rows:
+                sql = "SELECT * FROM contacts WHERE display_name LIKE ?"
+                params = [f"%{stripped}%"]
+                if relationship_type:
+                    sql += " AND relationship_type = ?"
+                    params.append(relationship_type)
+                sql += " LIMIT ?"
+                params.append(limit)
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+
+        if not rows:
+            return f'No contacts found matching "{query}".'
+
+        lines = [f'Found {len(rows)} contact(s) matching "{query}":\n']
+        for i, row in enumerate(rows, 1):
+            row_dict = dict(row)
+            display_name = row_dict.get("display_name", "Unknown")
+            rel_type = row_dict.get("relationship_type", "unknown")
+            notes = row_dict.get("notes", "")
+            profile_path = row_dict.get("profile_path", "")
+            total_messages = row_dict.get("total_messages", 0)
+
+            # Parse JSON arrays safely
+            def _parse_json_list(val):
+                if not val:
+                    return []
+                try:
+                    parsed = json.loads(val)
+                    return parsed if isinstance(parsed, list) else [str(parsed)]
+                except (json.JSONDecodeError, TypeError):
+                    return [str(val)] if val else []
+
+            phones = _parse_json_list(row_dict.get("phones"))
+            emails = _parse_json_list(row_dict.get("emails"))
+            platforms = _parse_json_list(row_dict.get("platforms"))
+            aliases = _parse_json_list(row_dict.get("aliases"))
+
+            lines.append(f"{i}. **{display_name}** ({rel_type})")
+            phone_str = ", ".join(phones) if phones else "—"
+            email_str = ", ".join(emails) if emails else "—"
+            lines.append(f"   Phone: {phone_str} | Email: {email_str}")
+            platform_str = ", ".join(platforms) if platforms else "—"
+            lines.append(f"   Platforms: {platform_str} | Messages: {total_messages or 0}")
+            if aliases:
+                lines.append(f"   Aliases: {', '.join(aliases)}")
+            if notes:
+                # Truncate long notes
+                note_display = notes[:200] + "..." if len(notes) > 200 else notes
+                lines.append(f"   Notes: {note_display}")
+            if profile_path:
+                lines.append(f"   Profile: {profile_path}")
+            lines.append("")
+
+        return "\n".join(lines)
+    finally:
+        conn.close()
 
 
 # ── Tool handlers ───────────────────────────────────────────────────────────
@@ -381,11 +548,11 @@ def handle_tool_call(name: str, arguments: dict) -> dict:
 
             # Build SQL query with filters
             conn = psycopg2.connect(
-                host="100.67.112.3",
-                port=5432,
-                dbname="tradingcore",
-                user="trading_user",
-                password="TradingCore2025!",
+                host=os.environ.get("CORTEX_PG_HOST", "100.67.112.3"),
+                port=int(os.environ.get("CORTEX_PG_PORT", "5432")),
+                dbname=os.environ.get("CORTEX_PG_DB", "tradingcore"),
+                user=os.environ.get("CORTEX_PG_USER", "trading_user"),
+                password=os.environ.get("CORTEX_PG_PASSWORD", ""),
             )
             try:
                 cur = conn.cursor()
@@ -526,6 +693,14 @@ def handle_tool_call(name: str, arguments: dict) -> dict:
                 return {"content": [{"type": "text", "text": "\n".join(lines)}]}
             finally:
                 conn.close()
+
+        elif name == "cami_contact_search":
+            result_text = search_contacts(
+                query=arguments["query"],
+                relationship_type=arguments.get("relationship_type"),
+                limit=arguments.get("limit", 10),
+            )
+            return {"content": [{"type": "text", "text": result_text}]}
 
         else:
             return {
