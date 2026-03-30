@@ -36,7 +36,7 @@ DB_HOST = os.getenv("POSTGRES_HOST", "100.67.112.3")
 DB_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
 DB_NAME = os.getenv("POSTGRES_DB", "tradingcore")
 DB_USER = os.getenv("POSTGRES_USER", "trading_user")
-DB_PASS = os.getenv("POSTGRES_PASSWORD", "TradingCore2025!")
+DB_PASS = os.getenv("POSTGRES_PASSWORD", "")
 
 # KPL instruments Tyler posts daily
 KPL_INSTRUMENTS = ["ES", "NQ", "YM", "RTY", "GC", "SI", "CL", "NG",

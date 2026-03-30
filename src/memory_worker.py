@@ -70,7 +70,7 @@ HIGH_SIGNAL_TOOLS = frozenset({
 })
 
 # ── API Authentication config ──────────────────────────────────────────
-CORTEX_API_KEY = os.environ.get("CORTEX_WORKER_API_KEY", "cortex-local-2026")
+CORTEX_API_KEY = os.environ.get("CORTEX_WORKER_API_KEY", "")
 
 # ── Rate limiting config ───────────────────────────────────────────────
 RATE_LIMIT_MAX = 100           # max observations per minute per session_id
@@ -93,7 +93,7 @@ NER_ENABLED = os.environ.get("CORTEX_NER_ENABLED", "true").lower() == "true"
 
 # ── CamiRouter config (preferred path — avoids OAuth rate limit contention) ──
 CAMIROUTER_URL = "http://localhost:8317/v1/chat/completions"
-CAMIROUTER_API_KEY = "cami-router-2026"
+CAMIROUTER_API_KEY = os.environ.get("CAMIROUTER_API_KEY", "")
 CAMIROUTER_MODEL = "sonnet"  # CamiRouter alias for claude-sonnet-4-6
 
 # ── Logging ─────────────────────────────────────────────────────────────────
