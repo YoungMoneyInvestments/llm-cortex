@@ -192,8 +192,6 @@ def init_db() -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_obs_timestamp ON observations(timestamp);
         CREATE INDEX IF NOT EXISTS idx_obs_tool ON observations(tool_name);
         CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
-        CREATE INDEX IF NOT EXISTS idx_obs_tier ON observations(subscription_tier);
-        CREATE INDEX IF NOT EXISTS idx_quota_tier ON quota_usage(subscription_tier, usage_date);
         CREATE INDEX IF NOT EXISTS idx_profile_category ON profile(category);
 
         CREATE TABLE IF NOT EXISTS memcells (
@@ -222,7 +220,17 @@ def init_db() -> sqlite3.Connection:
     # Backward-compatible migrations for existing DBs
     _ensure_column_exists(conn, "observations", "subscription_tier", "TEXT DEFAULT 'claude_standard'")
     _ensure_column_exists(conn, "sessions", "subscription_tier", "TEXT DEFAULT 'claude_standard'")
+    conn.commit()
 
+    # Tier indexes must come AFTER the ALTER TABLE migrations above
+    for idx_sql in (
+        "CREATE INDEX IF NOT EXISTS idx_obs_tier ON observations(subscription_tier)",
+        "CREATE INDEX IF NOT EXISTS idx_quota_tier ON quota_usage(subscription_tier, usage_date)",
+    ):
+        try:
+            conn.execute(idx_sql)
+        except sqlite3.OperationalError:
+            pass
     conn.commit()
 
     # Add memory_type and entities columns to observations if not present.
