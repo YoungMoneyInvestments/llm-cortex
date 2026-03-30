@@ -5,8 +5,8 @@ Cortex Memory MCP Server — Streamable HTTP transport.
 Runs as a persistent daemon so all Codex/Cursor sessions share one process
 instead of each spawning their own copy.
 
-Port: 37779
-URL:  http://127.0.0.1:37779/mcp
+Port: 37781
+URL:  http://127.0.0.1:37781/mcp
 
 Usage:
     python mcp_memory_server_sse.py [--port 37781]
@@ -110,7 +110,7 @@ def cami_message_search(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Cortex Memory MCP server (streamable HTTP)")
-    parser.add_argument("--port", type=int, default=37779)
+    parser.add_argument("--port", type=int, default=37781)
     args = parser.parse_args()
 
     mcp.settings.port = args.port
