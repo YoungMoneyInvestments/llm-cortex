@@ -15,6 +15,7 @@ Configure:
 import argparse
 import os
 import re
+import sqlite3
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -113,6 +114,64 @@ class MemoryBootstrap:
                 continue
         return sorted(handoffs, key=lambda h: h["mtime"], reverse=True)
 
+    def _load_profile(self) -> str:
+        """Load user profile entries from the Cortex SQLite DB and return a formatted string.
+
+        Uses CORTEX_DATA_DIR env var, defaulting to ~/.cortex/data/.
+        Returns empty string if the DB does not exist or has no profile entries.
+        """
+        data_dir_env = os.environ.get("CORTEX_DATA_DIR", "").strip()
+        if data_dir_env:
+            db_path = Path(data_dir_env).expanduser() / "cortex-observations.db"
+        else:
+            db_path = Path.home() / ".cortex" / "data" / "cortex-observations.db"
+
+        if not db_path.exists():
+            return ""
+
+        try:
+            conn = sqlite3.connect(str(db_path), check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT category, key, value FROM profile "
+                "ORDER BY category ASC, confidence DESC"
+            ).fetchall()
+            conn.close()
+        except Exception:
+            return ""
+
+        if not rows:
+            return ""
+
+        # Group by category
+        grouped: Dict[str, List[str]] = {}
+        for r in rows:
+            cat = r["category"]
+            if cat not in grouped:
+                grouped[cat] = []
+            grouped[cat].append(f"{r['key']}: {r['value']}")
+
+        label_map = {
+            "expertise": "Expertise",
+            "preference": "Preferences",
+            "style": "Style",
+            "context": "Context",
+        }
+
+        lines = ["## User Profile"]
+        for cat in ("expertise", "preference", "style", "context"):
+            if cat not in grouped:
+                continue
+            label = label_map.get(cat, cat.capitalize())
+            lines.append(f"**{label}:** {', '.join(grouped[cat])}")
+
+        # Any categories not in the canonical set
+        for cat, entries in grouped.items():
+            if cat not in label_map:
+                lines.append(f"**{cat.capitalize()}:** {', '.join(entries)}")
+
+        return "\n".join(lines)
+
     def generate_summary(self) -> str:
         """Generate context summary injected at session start."""
         self.recent_files = self.find_recent_memory_files()
@@ -127,6 +186,12 @@ class MemoryBootstrap:
         )
         lines.append("=" * 60)
         lines.append("")
+
+        # === USER PROFILE (from Cortex DB) ===
+        profile_section = self._load_profile()
+        if profile_section:
+            lines.append(profile_section)
+            lines.append("")
 
         # === WORKING MEMORY ===
         if self.working_memory:
