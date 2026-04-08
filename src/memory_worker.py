@@ -48,7 +48,7 @@ from subscription import DEFAULT_TIER, get_tier_config, parse_tier
 # ── Config ──────────────────────────────────────────────────────────────────
 
 WORKER_PORT = 37778
-DATA_DIR = Path.home() / "clawd" / "data"
+DATA_DIR = Path.home() / ".cortex" / "data"
 DB_PATH = DATA_DIR / "cortex-observations.db"
 PID_FILE = Path.home() / ".openclaw" / "worker.pid"
 LOG_DIR = Path.home() / ".openclaw" / "logs"
@@ -286,7 +286,7 @@ async def require_auth(
     """Dependency that enforces bearer token auth on POST endpoints."""
     if credentials is None or credentials.credentials != CORTEX_API_KEY:
         raise HTTPException(
-            status_code=401,
+            status_code=503,
             detail="Invalid or missing Authorization: Bearer <key> header",
         )
     return credentials
