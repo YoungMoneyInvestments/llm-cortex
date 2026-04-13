@@ -8,7 +8,7 @@ Provides 7 MCP tools that follow the token-efficient 3-layer pattern:
   3. cami_memory_details      — L3: Full observation text (variable)
   4. cami_memory_save         — Save a memory for future retrieval
   5. cami_memory_graph_search — Graph-augmented search with entity expansion
-  6. cami_message_search      — Semantic search over iMessage/Discord via pgvector
+  6. cami_message_search      — Semantic search over iMessage/Discord via sqlite-vec
   7. cami_contact_search      — Search unified contacts database
 
 Usage:
@@ -36,6 +36,16 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from memory_retriever import MemoryRetriever
+
+# Lazy-loaded sentence-transformer model for message search (384-dim, all-MiniLM-L6-v2)
+_ST_MODEL = None
+
+def _get_st_model():
+    global _ST_MODEL
+    if _ST_MODEL is None:
+        from sentence_transformers import SentenceTransformer
+        _ST_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
+    return _ST_MODEL
 
 # ── MCP Protocol (stdio transport) ─────────────────────────────────────────
 #
@@ -241,7 +251,7 @@ TOOLS = [
                 "source": {
                     "type": "string",
                     "description": "Filter by message source",
-                    "enum": ["imessage", "discord"],
+                    "enum": ["imessage", "discord", "facebook", "instagram"],
                 },
                 "contact": {
                     "type": "string",
@@ -280,6 +290,25 @@ TOOLS = [
                 },
             },
             "required": ["query"],
+        },
+    },
+    {
+        "name": "session_bootstrap",
+        "description": (
+            "Bootstrap a new session with current time, user profile, recent activity, "
+            "and session history from the last 48 hours. Call this at the start of every "
+            "session before responding to the user's first prompt."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "hours": {
+                    "type": "integer",
+                    "description": "Hours of history to include (default: 48)",
+                    "default": 48,
+                },
+            },
+            "required": [],
         },
     },
 ]
@@ -526,173 +555,274 @@ def handle_tool_call(name: str, arguments: dict) -> dict:
             return {"content": [{"type": "text", "text": "\n".join(lines)}]}
 
         elif name == "cami_message_search":
-            _load_env()
+            import struct
+            import time as _time
+            from datetime import datetime
 
-            import psycopg2
-            import openai
+            query = arguments["query"]
+            source_filter = arguments.get("source")  # "imessage", "discord", or None
+            contact_filter = arguments.get("contact")
+            days_back = arguments.get("days_back")
+            limit = arguments.get("limit", 5)
+            SIMILARITY_THRESHOLD = 0.30
 
-            openai_key = os.environ.get("OPENAI_API_KEY")
-            if not openai_key:
+            IMESSAGE_DB = Path.home() / "clawd/data/imessage-embeddings.db"
+            DISCORD_DB = Path.home() / "clawd/data/discord-embeddings.db"
+            FACEBOOK_DB = Path.home() / "clawd/data/facebook-embeddings.db"
+            INSTAGRAM_DB = Path.home() / "clawd/data/instagram-embeddings.db"
+
+            # Embed query using sentence-transformers all-MiniLM-L6-v2 (384-dim)
+            # — same model used to build both embedding DBs
+            try:
+                model = _get_st_model()
+                query_vec = model.encode([query])[0].tolist()
+            except Exception as e:
                 return {
-                    "content": [{"type": "text", "text": "Error: OPENAI_API_KEY not found"}],
+                    "content": [{"type": "text", "text": f"Error loading embedding model: {e}"}],
                     "isError": True,
                 }
 
-            client = openai.OpenAI(api_key=openai_key)
+            embedding_bytes = struct.pack(f"{len(query_vec)}f", *query_vec)
 
-            # Embed the query
-            resp = client.embeddings.create(
-                input=[arguments["query"]], model="text-embedding-3-small"
-            )
-            query_vec = resp.data[0].embedding
+            def _load_sqlite_vec(conn):
+                conn.enable_load_extension(True)
+                import sqlite_vec
+                sqlite_vec.load(conn)
+                conn.enable_load_extension(False)
 
-            # Build SQL query with filters
-            conn = psycopg2.connect(
-                host=os.environ.get("CORTEX_PG_HOST", "100.67.112.3"),
-                port=int(os.environ.get("CORTEX_PG_PORT", "5432")),
-                dbname=os.environ.get("CORTEX_PG_DB", "tradingcore"),
-                user=os.environ.get("CORTEX_PG_USER", "trading_user"),
-                password=os.environ.get("CORTEX_PG_PASSWORD", ""),
-            )
-            try:
-                cur = conn.cursor()
+            def _recency_score(ts_seconds):
+                if ts_seconds is None:
+                    return 0.5
+                try:
+                    age_days = (_time.time() - ts_seconds) / 86400
+                    if age_days <= 7:
+                        return 1.0
+                    elif age_days <= 30:
+                        return 0.8
+                    elif age_days <= 90:
+                        return 0.6
+                    else:
+                        return 0.4
+                except Exception:
+                    return 0.5
 
-                conditions = []
-                params = []
+            def _fmt_ts(ts_seconds):
+                if ts_seconds is None:
+                    return "?"
+                try:
+                    return datetime.fromtimestamp(ts_seconds).strftime("%Y-%m-%d %H:%M")
+                except Exception:
+                    return str(ts_seconds)
 
-                if arguments.get("source"):
-                    conditions.append("source_type = %s")
-                    params.append(arguments["source"])
+            all_results = []
 
-                if arguments.get("contact"):
-                    conditions.append("metadata::text ILIKE %s")
-                    params.append(f"%{arguments['contact']}%")
+            # --- iMessage search ---
+            if source_filter in (None, "imessage") and IMESSAGE_DB.exists():
+                try:
+                    iconn = sqlite3.connect(str(IMESSAGE_DB))
+                    iconn.row_factory = sqlite3.Row
+                    _load_sqlite_vec(iconn)
 
-                if arguments.get("days_back"):
-                    conditions.append("created_at > NOW() - (%s * INTERVAL '1 day')")
-                    params.append(arguments["days_back"])
-
-                where = (" AND " + " AND ".join(conditions)) if conditions else ""
-                limit = arguments.get("limit", 5)
-
-                # Format the vector as a string for pgvector
-                vec_str = "[" + ",".join(str(v) for v in query_vec) + "]"
-
-                # Fetch extra rows to allow post-filtering by similarity threshold
-                fetch_limit = max(limit * 4, 40)
-                cur.execute(
-                    f"""
-                    SELECT content_preview, source_type, source_id, metadata,
-                           1 - (embedding <=> %s::vector) as similarity,
-                           created_at
-                    FROM vec.embeddings
-                    WHERE 1=1 {where}
-                    ORDER BY embedding <=> %s::vector
-                    LIMIT %s
-                    """,
-                    [vec_str] + params + [vec_str, fetch_limit],
-                )
-
-                rows = cur.fetchall()
-
-                if not rows:
-                    return {
-                        "content": [{"type": "text", "text": "No matching messages found."}]
-                    }
-
-                # --- Similarity threshold + recency-weighted ranking ---
-                SIMILARITY_THRESHOLD = 0.35
-                from datetime import datetime, timezone
-
-                def _recency_score(created_at):
-                    """Return recency score 1.0/0.8/0.6/0.4 based on age."""
-                    if created_at is None:
-                        return 0.5
-                    try:
-                        if isinstance(created_at, str):
-                            # Parse ISO string; handle both naive and aware
-                            ts = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
-                        else:
-                            ts = created_at
-                        # Make timezone-aware if naive
-                        if ts.tzinfo is None:
-                            ts = ts.replace(tzinfo=timezone.utc)
-                        age_days = (datetime.now(timezone.utc) - ts).days
-                        if age_days <= 7:
-                            return 1.0
-                        elif age_days <= 30:
-                            return 0.8
-                        elif age_days <= 90:
-                            return 0.6
-                        else:
-                            return 0.4
-                    except Exception:
-                        return 0.5
-
-                def _composite_score(similarity, created_at):
-                    return similarity * 0.7 + _recency_score(created_at) * 0.3
-
-                # Filter by threshold, then sort by composite score, then trim to limit
-                filtered = [
-                    row for row in rows if row[4] >= SIMILARITY_THRESHOLD
-                ]
-                filtered.sort(key=lambda r: _composite_score(r[4], r[5]), reverse=True)
-                filtered = filtered[:limit]
-
-                if not filtered:
-                    return {
-                        "content": [{"type": "text", "text": f"No matching messages found (similarity threshold: {SIMILARITY_THRESHOLD})."}]
-                    }
-
-                lines = [f"Found {len(filtered)} matching conversation(s):\n"]
-                for i, row in enumerate(filtered, 1):
-                    chunk_text, source, source_id, metadata, similarity, created_at = row
-                    meta = (
-                        metadata
-                        if isinstance(metadata, dict)
-                        else json.loads(metadata) if metadata else {}
-                    )
-                    start_time = meta.get("start_time")
-                    end_time = meta.get("end_time")
-                    # Use created_at as date if meta times not available
-                    date_val = start_time or (created_at.isoformat() if hasattr(created_at, 'isoformat') else str(created_at) if created_at else None)
-
-                    def _fmt_ts(ts):
-                        if ts is None:
-                            return "?"
-                        if isinstance(ts, str):
-                            return ts[:16] if len(ts) >= 16 else ts
-                        if hasattr(ts, "strftime"):
-                            return ts.strftime("%Y-%m-%d %H:%M")
-                        return str(ts)
-                    time_str = ""
-                    if start_time or end_time:
-                        time_str = f" ({_fmt_ts(start_time)} - {_fmt_ts(end_time)})"
-
-                    composite = _composite_score(similarity, created_at)
-
-                    # Truncate chunk text for display
-                    display_text = (
-                        (chunk_text or "")[:500] + "..." if len(chunk_text or "") > 500 else (chunk_text or "")
-                    )
-
-                    lines.append(
-                        f"--- [{source}] Match {i} (similarity: {similarity:.3f}, score: {composite:.3f}){time_str} ---"
-                    )
-                    if date_val:
-                        lines.append(f"Date: {_fmt_ts(date_val)}")
-                    if meta.get("participants"):
-                        lines.append(
-                            f"Participants: {', '.join(meta['participants'][:5])}"
+                    time_cutoff = (_time.time() - days_back * 86400) if days_back else None
+                    conditions, extra_params = [], []
+                    if contact_filter:
+                        conditions.append(
+                            "(c.contact_identifier LIKE ? OR c.contact_name LIKE ?)"
                         )
-                    elif meta.get("channel"):
-                        lines.append(f"Channel: {meta['channel']}")
-                    lines.append(display_text)
-                    lines.append("")
+                        extra_params += [f"%{contact_filter}%", f"%{contact_filter}%"]
+                    if time_cutoff:
+                        conditions.append("c.end_time >= ?")
+                        extra_params.append(int(time_cutoff))
 
-                return {"content": [{"type": "text", "text": "\n".join(lines)}]}
-            finally:
-                conn.close()
+                    where = ("AND " + " AND ".join(conditions)) if conditions else ""
+                    fetch_limit = max(limit * 4, 40)
+
+                    rows = iconn.execute(
+                        f"""
+                        SELECT c.chunk_text, c.contact_identifier, c.contact_name,
+                               c.start_time, c.end_time,
+                               vec_distance_cosine(e.embedding, ?) as distance
+                        FROM chunk_embeddings e
+                        JOIN chunks c ON c.id = e.chunk_id
+                        WHERE 1=1 {where}
+                        ORDER BY distance
+                        LIMIT ?
+                        """,
+                        [embedding_bytes] + extra_params + [fetch_limit],
+                    ).fetchall()
+                    iconn.close()
+
+                    for row in rows:
+                        similarity = 1.0 - (row["distance"] / 2.0)
+                        if similarity >= SIMILARITY_THRESHOLD:
+                            all_results.append({
+                                "source": "imessage",
+                                "text": row["chunk_text"] or "",
+                                "contact": row["contact_name"] or row["contact_identifier"] or "Unknown",
+                                "channel": None,
+                                "start_time": row["start_time"],
+                                "end_time": row["end_time"],
+                                "similarity": similarity,
+                            })
+                except Exception as e:
+                    all_results.append({
+                        "source": "imessage",
+                        "text": f"[iMessage search error: {e}]",
+                        "contact": None, "channel": None,
+                        "start_time": None, "end_time": None,
+                        "similarity": 0.0,
+                    })
+
+            # --- Facebook / Instagram search (same schema as iMessage) ---
+            for _plat, _db in [("facebook", FACEBOOK_DB), ("instagram", INSTAGRAM_DB)]:
+                if source_filter not in (None, _plat) or not _db.exists():
+                    continue
+                try:
+                    pconn = sqlite3.connect(str(_db))
+                    pconn.row_factory = sqlite3.Row
+                    _load_sqlite_vec(pconn)
+
+                    time_cutoff = (_time.time() - days_back * 86400) if days_back else None
+                    conditions, extra_params = [], []
+                    if contact_filter:
+                        conditions.append(
+                            "(c.conversation_name LIKE ? OR c.participants LIKE ?)"
+                        )
+                        extra_params += [f"%{contact_filter}%", f"%{contact_filter}%"]
+                    if time_cutoff:
+                        conditions.append("c.end_time >= ?")
+                        extra_params.append(int(time_cutoff))
+
+                    where = ("AND " + " AND ".join(conditions)) if conditions else ""
+                    fetch_limit = max(limit * 4, 40)
+
+                    rows = pconn.execute(
+                        f"""
+                        SELECT c.chunk_text, c.conversation_name, c.participants,
+                               c.start_time, c.end_time,
+                               vec_distance_cosine(e.embedding, ?) as distance
+                        FROM chunk_embeddings e
+                        JOIN chunks c ON c.id = e.chunk_id
+                        WHERE 1=1 {where}
+                        ORDER BY distance
+                        LIMIT ?
+                        """,
+                        [embedding_bytes] + extra_params + [fetch_limit],
+                    ).fetchall()
+                    pconn.close()
+
+                    for row in rows:
+                        similarity = 1.0 - (row["distance"] / 2.0)
+                        if similarity >= SIMILARITY_THRESHOLD:
+                            try:
+                                parts = json.loads(row["participants"] or "[]")
+                                contact_display = ", ".join(p for p in parts if p != "Cameron Bennion")[:60] or row["conversation_name"]
+                            except Exception:
+                                contact_display = row["conversation_name"] or "Unknown"
+                            all_results.append({
+                                "source": _plat,
+                                "text": row["chunk_text"] or "",
+                                "contact": contact_display,
+                                "channel": None,
+                                "start_time": row["start_time"],
+                                "end_time": row["end_time"],
+                                "similarity": similarity,
+                            })
+                except Exception as e:
+                    all_results.append({
+                        "source": _plat,
+                        "text": f"[{_plat} search error: {e}]",
+                        "contact": None, "channel": None,
+                        "start_time": None, "end_time": None,
+                        "similarity": 0.0,
+                    })
+
+            # --- Discord search ---
+            if source_filter in (None, "discord") and DISCORD_DB.exists():
+                try:
+                    dconn = sqlite3.connect(str(DISCORD_DB))
+                    dconn.row_factory = sqlite3.Row
+                    _load_sqlite_vec(dconn)
+
+                    time_cutoff = (_time.time() - days_back * 86400) if days_back else None
+                    conditions, extra_params = [], []
+                    if contact_filter:
+                        conditions.append("c.channel_name LIKE ?")
+                        extra_params.append(f"%{contact_filter}%")
+                    if time_cutoff:
+                        conditions.append("c.end_time >= ?")
+                        extra_params.append(int(time_cutoff))
+
+                    where = ("AND " + " AND ".join(conditions)) if conditions else ""
+                    fetch_limit = max(limit * 4, 40)
+
+                    rows = dconn.execute(
+                        f"""
+                        SELECT c.text, c.channel_name, c.guild_id,
+                               c.start_time, c.end_time,
+                               vec_distance_cosine(e.embedding, ?) as distance
+                        FROM chunk_embeddings e
+                        JOIN chunks c ON c.id = e.chunk_id
+                        WHERE 1=1 {where}
+                        ORDER BY distance
+                        LIMIT ?
+                        """,
+                        [embedding_bytes] + extra_params + [fetch_limit],
+                    ).fetchall()
+                    dconn.close()
+
+                    for row in rows:
+                        similarity = 1.0 - (row["distance"] / 2.0)
+                        if similarity >= SIMILARITY_THRESHOLD:
+                            all_results.append({
+                                "source": "discord",
+                                "text": row["text"] or "",
+                                "contact": None,
+                                "channel": row["channel_name"] or row["guild_id"],
+                                "start_time": row["start_time"],
+                                "end_time": row["end_time"],
+                                "similarity": similarity,
+                            })
+                except Exception as e:
+                    all_results.append({
+                        "source": "discord",
+                        "text": f"[Discord search error: {e}]",
+                        "contact": None, "channel": None,
+                        "start_time": None, "end_time": None,
+                        "similarity": 0.0,
+                    })
+
+            if not all_results:
+                src_note = f" in {source_filter}" if source_filter else ""
+                return {
+                    "content": [{"type": "text", "text": f"No matching messages found{src_note} (threshold: {SIMILARITY_THRESHOLD})."}]
+                }
+
+            def _composite(r):
+                return r["similarity"] * 0.7 + _recency_score(r.get("end_time")) * 0.3
+
+            all_results.sort(key=_composite, reverse=True)
+            all_results = all_results[:limit]
+
+            lines = [f"Found {len(all_results)} matching conversation(s):\n"]
+            for i, r in enumerate(all_results, 1):
+                time_str = (
+                    f" ({_fmt_ts(r['start_time'])} - {_fmt_ts(r['end_time'])})"
+                    if r.get("start_time") else ""
+                )
+                composite = _composite(r)
+                lines.append(
+                    f"--- [{r['source']}] Match {i} (similarity: {r['similarity']:.3f}, score: {composite:.3f}){time_str} ---"
+                )
+                if r.get("contact"):
+                    lines.append(f"Participants: {r['contact']}")
+                if r.get("channel"):
+                    lines.append(f"Channel: {r['channel']}")
+                display = r["text"][:500] + "..." if len(r["text"]) > 500 else r["text"]
+                lines.append(display)
+                lines.append("")
+
+            return {"content": [{"type": "text", "text": "\n".join(lines)}]}
 
         elif name == "cami_contact_search":
             result_text = search_contacts(
@@ -701,6 +831,27 @@ def handle_tool_call(name: str, arguments: dict) -> dict:
                 limit=arguments.get("limit", 10),
             )
             return {"content": [{"type": "text", "text": result_text}]}
+
+        elif name == "session_bootstrap":
+            import subprocess
+            hours = arguments.get("hours", 48)
+            script = Path(__file__).parent / "context_loader.py"
+            try:
+                result = subprocess.run(
+                    [sys.executable, str(script), "--hours", str(hours)],
+                    capture_output=True, text=True, timeout=30,
+                    cwd=str(Path(__file__).parent.parent),
+                )
+                output = result.stdout.strip()
+                if result.returncode != 0 and result.stderr:
+                    output += f"\n[stderr: {result.stderr[:200]}]"
+                if not output:
+                    output = "[session_bootstrap: no output from context_loader]"
+            except subprocess.TimeoutExpired:
+                output = "[session_bootstrap: context_loader timed out after 30s]"
+            except Exception as e:
+                output = f"[session_bootstrap error: {e}]"
+            return {"content": [{"type": "text", "text": output}]}
 
         else:
             return {
