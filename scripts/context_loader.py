@@ -342,35 +342,54 @@ def cortex_recall(cwd: Optional[str] = None) -> str:
 
 
 OBSIDIAN_VAULT = Path.home() / "Library" / "Mobile Documents" / "iCloud~md~obsidian" / "Documents" / "Cameron"
-OBSIDIAN_BB = OBSIDIAN_VAULT / "BrokerBridge"
+
+# Maps project directory name (or path fragment) to vault folder name.
+# Checked in order — first match wins.
+_PROJECT_VAULT_MAP: list[tuple[str, str]] = [
+    ("broker-bridge-retail", "BrokerBridge"),
+    ("MCP-Servers/brokerbridge", "BrokerBridgeMCP"),
+    ("brokerbridge", "BrokerBridgeMCP"),   # fallback for bare name
+    ("openclaw", "OpenClaw"),
+    ("matrix-lstm", "MatrixLSTM"),
+    ("moltytrades", "MoltyTrades"),
+    ("CLIProxyAPI", "CLIProxyAPI"),
+    ("ymi-website", "YMIWebsite"),
+    ("llm-cortex", "LLMCortex"),
+]
+
+
+def _resolve_vault_folder(project_dir: str) -> Optional[Path]:
+    """Return the Obsidian vault subfolder for the given project directory, or None."""
+    for pattern, vault_name in _PROJECT_VAULT_MAP:
+        if pattern.lower() in project_dir.lower():
+            folder = OBSIDIAN_VAULT / vault_name
+            if folder.exists():
+                return folder
+    return None
 
 
 def obsidian_context(cwd: Optional[str] = None) -> str:
-    """Read BrokerBridge Obsidian vault files and return a formatted context block.
+    """Read project-specific Obsidian vault files and return a formatted context block.
 
     Reads architecture.md, decisions.md, open-questions.md, and the most recent
-    session note. Only injects vault content when working in the broker-bridge-retail
-    project or when the vault directory exists.
+    session note from the vault folder matching the current project.
     """
-    if not OBSIDIAN_BB.exists():
-        return ""
-
-    # Only inject when in a BrokerBridge-related working directory
     project_dir = cwd or os.environ.get("CORTEX_PROJECT_DIR") or os.getcwd()
-    if "broker-bridge" not in project_dir.lower() and "brokerbridge" not in project_dir.lower():
+    vault_folder = _resolve_vault_folder(project_dir)
+    if vault_folder is None:
         return ""
 
-    lines = ["## Obsidian Vault — BrokerBridge"]
+    label = vault_folder.name
+    lines = [f"## Obsidian Vault — {label}"]
 
     standing_files = ["architecture.md", "decisions.md", "open-questions.md"]
     for fname in standing_files:
-        fpath = OBSIDIAN_BB / fname
+        fpath = vault_folder / fname
         if fpath.exists():
             try:
                 content = fpath.read_text(encoding="utf-8").strip()
                 if content:
                     lines.append(f"\n### {fname}")
-                    # Truncate to keep context bounded
                     if len(content) > 1500:
                         content = content[:1497] + "..."
                     lines.append(content)
@@ -378,7 +397,7 @@ def obsidian_context(cwd: Optional[str] = None) -> str:
                 continue
 
     # Most recent session note
-    sessions_dir = OBSIDIAN_BB / "sessions"
+    sessions_dir = vault_folder / "sessions"
     if sessions_dir.exists():
         session_files = sorted(sessions_dir.glob("*.md"), reverse=True)
         if session_files:
