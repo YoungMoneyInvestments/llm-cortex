@@ -13,10 +13,13 @@ Configure:
 """
 
 import argparse
+import json
 import os
 import re
 import sqlite3
 import sys
+import urllib.request
+import urllib.error
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -274,11 +277,144 @@ class MemoryBootstrap:
         return "\n".join(lines)
 
 
+def cortex_recall(cwd: Optional[str] = None) -> str:
+    """Query the cortex memory worker for observations relevant to the current project.
+
+    Detects the project name from CWD (last path component), searches cortex
+    for the 5 most relevant observations, and returns a formatted summary block.
+
+    Returns an empty string if the worker is unreachable or no results are found.
+    """
+    worker_url = os.environ.get("CORTEX_WORKER_URL", "http://localhost:37778")
+    api_key = os.environ.get("CORTEX_WORKER_API_KEY", "cortex-local-2026")
+
+    # Determine project name from CWD
+    project_dir = cwd or os.environ.get("CORTEX_PROJECT_DIR") or os.getcwd()
+    project_name = Path(project_dir).name
+    if not project_name or project_name in (".", "/"):
+        return ""
+
+    # Build the search request
+    endpoint = f"{worker_url}/api/memory/search"
+    payload = json.dumps({"query": project_name, "limit": 5}).encode("utf-8")
+
+    req = urllib.request.Request(
+        endpoint,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, json.JSONDecodeError, TimeoutError):
+        return ""
+
+    results = body.get("results", [])
+    if not results:
+        return ""
+
+    lines = [f"Cortex Recall ({len(results)} relevant observations):"]
+    for obs in results:
+        timestamp = obs.get("timestamp", "")
+        # Extract just the date portion (YYYY-MM-DD)
+        date_str = "unknown"
+        if timestamp:
+            try:
+                dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                date_str = dt.strftime("%Y-%m-%d")
+            except (ValueError, TypeError):
+                # Try simple prefix extraction
+                if len(timestamp) >= 10:
+                    date_str = timestamp[:10]
+        summary = obs.get("summary", "").strip()
+        if summary:
+            # Truncate long summaries to keep context concise
+            if len(summary) > 120:
+                summary = summary[:117] + "..."
+            lines.append(f"  - [{date_str}] {summary}")
+
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
+OBSIDIAN_VAULT = Path.home() / "Library" / "Mobile Documents" / "iCloud~md~obsidian" / "Documents" / "Cameron"
+OBSIDIAN_BB = OBSIDIAN_VAULT / "BrokerBridge"
+
+
+def obsidian_context(cwd: Optional[str] = None) -> str:
+    """Read BrokerBridge Obsidian vault files and return a formatted context block.
+
+    Reads architecture.md, decisions.md, open-questions.md, and the most recent
+    session note. Only injects vault content when working in the broker-bridge-retail
+    project or when the vault directory exists.
+    """
+    if not OBSIDIAN_BB.exists():
+        return ""
+
+    # Only inject when in a BrokerBridge-related working directory
+    project_dir = cwd or os.environ.get("CORTEX_PROJECT_DIR") or os.getcwd()
+    if "broker-bridge" not in project_dir.lower() and "brokerbridge" not in project_dir.lower():
+        return ""
+
+    lines = ["## Obsidian Vault — BrokerBridge"]
+
+    standing_files = ["architecture.md", "decisions.md", "open-questions.md"]
+    for fname in standing_files:
+        fpath = OBSIDIAN_BB / fname
+        if fpath.exists():
+            try:
+                content = fpath.read_text(encoding="utf-8").strip()
+                if content:
+                    lines.append(f"\n### {fname}")
+                    # Truncate to keep context bounded
+                    if len(content) > 1500:
+                        content = content[:1497] + "..."
+                    lines.append(content)
+            except Exception:
+                continue
+
+    # Most recent session note
+    sessions_dir = OBSIDIAN_BB / "sessions"
+    if sessions_dir.exists():
+        session_files = sorted(sessions_dir.glob("*.md"), reverse=True)
+        if session_files:
+            try:
+                content = session_files[0].read_text(encoding="utf-8").strip()
+                if content:
+                    lines.append(f"\n### Last session ({session_files[0].stem})")
+                    if len(content) > 800:
+                        content = content[:797] + "..."
+                    lines.append(content)
+            except Exception:
+                pass
+
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
 def main():
     parser = argparse.ArgumentParser(description="Session memory bootstrap")
     parser.add_argument("--hours", type=int, default=48)
     args = parser.parse_args()
-    print(MemoryBootstrap(hours=args.hours).generate_summary())
+
+    bootstrap = MemoryBootstrap(hours=args.hours)
+    summary = bootstrap.generate_summary()
+    print(summary)
+
+    # Append cortex recall after the main summary
+    recall = cortex_recall()
+    if recall:
+        print("")
+        print(recall)
+
+    # Append Obsidian vault context
+    vault = obsidian_context()
+    if vault:
+        print("")
+        print(vault)
 
 
 if __name__ == "__main__":
