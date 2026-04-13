@@ -575,14 +575,22 @@ class UnifiedVectorStore:
             except Exception as e:
                 logger.error(f"Failed to upsert document {doc_id}: {e}")
                 raise
+
+            # Generate embedding immediately after successful insert
+            try:
+                self.embed_document(doc_id)
+            except Exception as e:
+                logger.warning(f"Embedding generation failed for {doc_id}, document stored without embedding: {e}")
         else:
             # Multiple chunks — store each with chunk suffix
             meta = metadata or {}
             meta["_parent_doc_id"] = doc_id
             meta["_total_chunks"] = len(chunks)
 
+            chunk_ids = []
             for i, chunk in enumerate(chunks):
                 chunk_id = f"{doc_id}-chunk-{i}"
+                chunk_ids.append(chunk_id)
                 chunk_meta = {**meta, "_chunk_index": i}
                 meta_json = json.dumps(chunk_meta)
                 chunk_hash = _compute_text_hash(chunk)
@@ -598,6 +606,13 @@ class UnifiedVectorStore:
                     logger.error(f"Failed to upsert chunk {chunk_id}: {e}")
                     raise
             self.conn.commit()
+
+            # Generate embeddings for all chunks after successful commit
+            for chunk_id in chunk_ids:
+                try:
+                    self.embed_document(chunk_id)
+                except Exception as e:
+                    logger.warning(f"Embedding generation failed for chunk {chunk_id}, chunk stored without embedding: {e}")
 
     def add_batch(
         self,
