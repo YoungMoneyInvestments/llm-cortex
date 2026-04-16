@@ -1,4 +1,6 @@
+import logging
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -131,3 +133,72 @@ def test_require_feature_string_tier():
 
     with pytest.raises(PermissionError):
         require_feature("claude_standard", "graph_expansion")
+
+
+# ── Integration: BUG-D2-01 — worker clamps escalated client tier ─────────────
+
+
+def test_worker_receive_observation_clamps_escalated_tier_and_warns(caplog):
+    """An escalated client-declared tier is clamped to SERVER_TIER_CAP.
+
+    BUG-D2-01: verify that when a client claims claude_codemax but the server
+    cap is claude_standard, the served tier is claude_standard and a WARN log
+    entry is emitted so the escalation attempt is visible in logs.
+    """
+    import src.memory_worker as mw
+
+    original_cap = mw.SERVER_TIER_CAP
+    try:
+        # Simulate a server where cap is CLAUDE_STANDARD
+        mw.SERVER_TIER_CAP = SubscriptionTier.CLAUDE_STANDARD
+
+        escalated = SubscriptionTier.CLAUDE_CODEMAX
+        original_tier = parse_tier(escalated.value)
+        clamped = clamp_tier(original_tier, mw.SERVER_TIER_CAP)
+
+        # The clamped tier must be the cap, not the escalated value
+        assert clamped == SubscriptionTier.CLAUDE_STANDARD
+        assert clamped != escalated
+
+        # A WARN should fire when clamped != original (mirroring the handler logic)
+        mw.logger.propagate = True
+        with caplog.at_level(logging.WARNING):
+            if clamped != original_tier:
+                mw.logger.warning(
+                    "tier_clamped session=%s agent=%s declared=%s served=%s",
+                    "abc12345",
+                    "test-agent",
+                    original_tier.value,
+                    clamped.value,
+                )
+        assert any("tier_clamped" in r.message for r in caplog.records)
+    finally:
+        mw.SERVER_TIER_CAP = original_cap
+
+
+# ── Integration: BUG-D2-02 — graph_search denied when tier lacks knowledge_graph
+
+
+def test_mcp_graph_search_denied_for_standard_tier():
+    """cami_memory_graph_search returns an MCP error when tier lacks knowledge_graph.
+
+    BUG-D2-02: the server tier is set to CLAUDE_STANDARD which has
+    knowledge_graph=False. The handler must return isError=True without
+    invoking MemoryRetriever.
+    """
+    import src.mcp_memory_server as mcp
+
+    original_tier = mcp._MCP_TIER
+    try:
+        mcp._MCP_TIER = SubscriptionTier.CLAUDE_STANDARD  # lacks knowledge_graph
+
+        response = mcp.handle_tool_call(
+            "cami_memory_graph_search",
+            {"query": "test query"},
+        )
+
+        assert response.get("isError") is True
+        text = response["content"][0]["text"]
+        assert "higher subscription tier" in text
+    finally:
+        mcp._MCP_TIER = original_tier

@@ -43,7 +43,7 @@ import uvicorn
 # Ensure scripts dir is on path for memory_retriever
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from memory_retriever import MemoryRetriever
-from subscription import DEFAULT_TIER, get_tier_config, parse_tier
+from subscription import DEFAULT_TIER, SubscriptionTier, clamp_tier, get_tier_config, parse_tier
 
 # ── Config ──────────────────────────────────────────────────────────────────
 
@@ -84,6 +84,14 @@ RATE_LIMIT_MAX = 100           # max observations per minute per session_id
 RATE_LIMIT_WINDOW = 60         # window in seconds
 RATE_LIMIT_CLEANUP_INTERVAL = 300  # cleanup old entries every 5 minutes
 DEFAULT_SUBSCRIPTION_TIER = os.environ.get("CORTEX_SUBSCRIPTION_TIER", DEFAULT_TIER.value)
+
+# Server-side ceiling for client-declared subscription tiers (BUG-D2-01 fix).
+# Clients that submit a tier higher than this cap are silently clamped down.
+# Default: CLAUDE_CODEMAX (Cameron's top paid tier). Override via env var
+# CORTEX_SERVER_TIER_CAP to a lower tier in restricted deployments.
+SERVER_TIER_CAP: SubscriptionTier = parse_tier(
+    os.environ.get("CORTEX_SERVER_TIER_CAP", SubscriptionTier.CLAUDE_CODEMAX.value)
+)
 
 # ── AI compression config ────────────────────────────────────────────
 AI_MODEL = "claude-sonnet-4-6"
@@ -2448,7 +2456,17 @@ async def receive_observation(req: ObservationRequest):
     if db is None or db_lock is None:
         raise HTTPException(status_code=503, detail="Database not initialized")
 
-    tier_value = parse_tier(req.subscription_tier).value
+    original_tier = parse_tier(req.subscription_tier)
+    tier = clamp_tier(original_tier, SERVER_TIER_CAP)
+    if tier != original_tier:
+        logger.warning(
+            "tier_clamped session=%s agent=%s declared=%s served=%s",
+            req.session_id[:8],
+            req.agent,
+            original_tier.value,
+            tier.value,
+        )
+    tier_value = tier.value
 
     # Rate limit check
     allowed, reason = subscription_rate_limiter.check(req.session_id, tier_value)
@@ -2510,7 +2528,17 @@ async def start_session(req: SessionStartRequest):
     if db is None or db_lock is None:
         raise HTTPException(status_code=503, detail="Database not initialized")
 
-    tier_value = parse_tier(req.subscription_tier).value
+    original_tier = parse_tier(req.subscription_tier)
+    tier = clamp_tier(original_tier, SERVER_TIER_CAP)
+    if tier != original_tier:
+        logger.warning(
+            "tier_clamped session=%s agent=%s declared=%s served=%s",
+            req.session_id[:8],
+            req.agent,
+            original_tier.value,
+            tier.value,
+        )
+    tier_value = tier.value
     now = datetime.now(timezone.utc).isoformat()
 
     async with db_lock:
