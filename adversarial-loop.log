@@ -694,3 +694,57 @@
 **Commit**: `0e4acce` — `feat(subscription): add clamp_tier and require_feature defensive helpers`
 
 **Summary**: Default tier is CLAUDE_STANDARD (lowest). 4 bugs confirmed (BUG-D2-01 through D2-04), all deferred to memory_worker.py / mcp_memory_server.py owners. 1 non-bug documented (D2-05, restart requirement). Defensive helpers added and tested in the one in-scope file (`subscription.py`). Feature gates are dead code with no production wiring — wiring them requires helpers from this pass plus handler changes in off-limits files.
+
+### Pass D1 — 2026-04-16
+- **Subsystem**: `conversation-memory/identity_resolver.py` (~228 LOC after fix, was ~178) — person name to platform ID resolver used by all 4 MCP tools in the conversation-memory server.
+- **File audited**: `~/clawd/mcp-servers/conversation-memory/identity_resolver.py` only. No matching file in llm-cortex (`src/identity_resolver.py` does not exist).
+- **Data source**: `~/clawd/data/identity-graph.json` — 1,375 `CanonicalIdentity` objects keyed by canonical slug, loaded via `IdentityGraph.load()`. Zero aliases in the graph (all `identity.aliases` lists are empty — unlike Pass A2's self-referential alias table, these simply don't exist yet). No stale CamiRouter / localhost:8317 / OpenAI API references found.
+- **Callers grepped**: `server.py` imports `get_resolver()` at 4 call sites (`search_person_conversations`, `get_person_recent`, `get_person_recent`, `list_frequent_contacts`). No other importers in either repo.
+
+**Bugs confirmed and fixed (commit `ee57df8` in clawd repo):**
+
+  **BUG-D1-01 (P1, FIXED): Short/partial queries return junk entries — missing message-count ranking**
+  - Root cause: `resolve()` called `search_by_name(name)` (pure substring match on `display_name`) then returned `matches[0]` with no relevance ranking. The identity graph contains 87 Facebook Marketplace listing entries whose `display_name` starts with "Cameron ·" (e.g. "Cameron · LG TROMM WASHER/DRYER"). These entries appear before real contacts in JSON insertion order. Query "Cam" → 96 matches → `matches[0]` = marketplace junk.
+  - Impact: The junk entries have `platform=facebook` identifiers, so `_identity_to_resolution()` sets `has_facebook=True` and populates `facebook_names` with the junk display name. `search_person_conversations("Cam", ...)` then runs a Facebook LIKE search for "Cameron · LG TROMM WASHER/DRYER" and returns whatever marginally matches. The caller gets garbage results with no error. Reproduction: `resolver.resolve("Cam")` → `display_name="Cameron · LG TROMM WASHER/DRYER"`.
+  - Fix: Sort `matches` by `sum(c.message_count for c in i.communication)` descending before tiebreaking. Real "Cameron" identity has 79,917 messages. Junk max is 111. After sort, `matches[0]` is the real person. Verified: `resolve("Cam")` → `display_name="Cameron"` (`canonical_id="cameron"`, 79,917 messages).
+
+  **BUG-D1-02 (P2, FIXED): First-name-token tiebreak overwrites on every iteration — no break**
+  - Root cause: Lines 101-102 in the original: `if identity.display_name.lower().split()[0] == name_lower: best_match = identity` — no `break`. Every subsequent identity sharing the same first token kept overwriting `best_match`. With 4 "Johns" in the graph, the last one in dict iteration order won regardless of relevance.
+  - Impact: Non-deterministic selection for any ambiguous first name. Dict iteration order in CPython 3.7+ is insertion order, so the result was stable across runs but arbitrary (whoever was inserted last into the JSON wins).
+  - Fix: Added `break` after the first-name-token assignment. Combined with the message-count sort from BUG-D1-01, the first match encountered (highest-traffic person with that first name) is selected and immediately locked in.
+
+  **BUG-D1-03 (P2, FIXED): No whitespace stripping — leading/trailing spaces cause silent miss**
+  - Root cause: `search_by_name(name)` passes `name.lower()` directly to `in identity.display_name.lower()`. `"  brigham  " in "brigham castillow"` is `False` because the leading space prevents the substring match.
+  - Impact: Any caller that passes a name with surrounding whitespace (copy-paste, form input, voice transcription artifact) gets `None` and sees the error path `"Could not find person matching '  Brigham  '"` with suggestions — confusing.
+  - Fix: `name = name.strip()` at the top of `resolve()` before any lookup. Guard `if not name: return None` for empty-after-strip inputs.
+
+  **BUG-D1-04 (P3, FIXED): Phone numbers and emails treated as name queries — always return None**
+  - Root cause: If a caller passes `"+18019137960"` or `"user@example.com"` to `resolve()`, `search_by_name` does a substring search and finds 0 matches (no display name contains a phone number or email). `IdentityGraph.resolve_phone()` and `IdentityGraph.resolve("email", ...)` exist but were never called from `IdentityResolver.resolve()`.
+  - Impact: A user who pastes a phone number or email into a "person" field gets `None` instead of resolution. Confirmed: `resolve("+13609074147")` → `None` before fix. The number belongs to "Cameron" in the graph.
+  - Fix: Added compiled regex constants `_PHONE_RE` and `_EMAIL_RE` as class attributes. At the top of `resolve()`, after stripping, check against both patterns. If matched, call `graph.resolve_phone(name)` or `graph.resolve("email", name.lower())` directly and return. Phone regex: `^\+?[\d\s\-().]{7,20}$` (7-20 chars, handles international formats). Email regex: standard `[^@\s]+@[^@\s]+\.[^@\s]+`.
+  - Post-fix: `resolve("+13609074147")` → `display_name="Cameron"`. `resolve("test@example.com")` → `None` (no such email in graph, correct).
+
+**Bugs investigated, NOT confirmed:**
+- **Alias self-referential garbage (Pass A2 pattern)**: 0 identities have aliases in this graph. `_find_by_alias` is dead-code-by-data. No fix needed.
+- **Accent normalization**: 0 display names have diacritics. Theoretical concern only.
+- **Singleton thread safety**: `_resolver` module global has no lock. Under CPython GIL, the race produces two IdentityResolver instances that both load the same file — harmless. Not fixed.
+- **Single-platform bias**: When a person has iMessage but not Discord, `has_discord=False` and the server correctly skips Discord search. No null leak.
+- **Redundant conditions in `get_frequent_contacts`** (lines 241-244): `platform == X and ident.platform == X` is always covered by `ident.platform == platform`. Dead code, not a bug.
+- **Stale references**: Zero CamiRouter / localhost:8317 / OpenAI API hits in `identity_resolver.py`. Clean.
+
+**Verification**:
+  - `python3 -m py_compile identity_resolver.py` — CLEAN
+  - `pytest tests/ -v` — 2 passed (unchanged, same as Pass 4 baseline)
+  - Smoke tests (live graph, 1,375 identities):
+    - `resolve("Cam")` → `Cameron` (79,917 msgs) — was marketplace junk before fix
+    - `resolve("  Brigham  ")` → `Brigham Castillow` — was None before fix
+    - `resolve("+13609074147")` → `Cameron` — was None before fix
+    - `resolve("test@example.com")` → `None` (correct, no such email)
+    - `resolve("Brigham")` → unchanged, still correct
+
+**Commit**: `ee57df8` in clawd repo (`fix(identity_resolver): four bugs in name resolution (Pass D1)`)
+
+**Deferrals**:
+- Accent / diacritic normalization: no accented names in current graph. If they appear, `search_by_name` in `schema.py` should run both query and display names through `unicodedata.normalize('NFC', ...)` before substring match. Out of scope today.
+- `_find_by_alias` dead code cleanup: harmless, but could be removed when aliases are populated. Deferred.
+- `get_frequent_contacts` redundant conditions (lines 241-244): dead code, not a bug. Deferred.
