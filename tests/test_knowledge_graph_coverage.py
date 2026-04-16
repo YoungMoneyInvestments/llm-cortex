@@ -70,6 +70,42 @@ class TestKnowledgeGraphRegressions(unittest.TestCase):
             conn.close()
         self.assertIsNone(row, "alias for non-existent entity must not be persisted")
 
+    # ── BUG-W-01: add_alias rejects self-referential alias ───────────────
+
+    def test_add_alias_rejects_self_referential_identical(self):
+        """Pass W regression: add_alias(id, id) must be silently rejected.
+
+        Before fix: add_alias('cameron', 'cameron') would INSERT the row.
+        After fix: the function returns early and nothing is persisted.
+        """
+        self.g.add_entity("cameron", "person")
+        self.g.add_alias("cameron", "cameron")
+        conn = self.g._get_conn()
+        try:
+            row = conn.execute(
+                "SELECT * FROM aliases WHERE alias = 'cameron'"
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertIsNone(row,
+            "add_alias must not persist a self-referential alias (alias == canonical_id)")
+
+    def test_add_alias_rejects_self_referential_after_normalization(self):
+        """Pass W regression: add_alias('Cameron', 'cameron') normalizes to the same
+        string and must be rejected (different raw values, same normalized form).
+        """
+        self.g.add_entity("cameron", "person")
+        self.g.add_alias("Cameron", "cameron")
+        conn = self.g._get_conn()
+        try:
+            row = conn.execute(
+                "SELECT * FROM aliases WHERE alias = 'cameron'"
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertIsNone(row,
+            "add_alias must reject aliases that normalize to their own canonical_id")
+
     # ── BUG-A2-02: find_path respects max_hops cutoff ────────────────────
 
     def test_find_path_returns_none_beyond_max_hops(self):

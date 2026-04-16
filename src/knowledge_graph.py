@@ -277,6 +277,10 @@ class KnowledgeGraph:
         normalized_alias = _normalize_id(alias)
         normalized_canonical = _normalize_id(canonical_id)
 
+        if normalized_alias == normalized_canonical:
+            logger.debug("Rejecting self-referential alias: %s", normalized_alias)
+            return
+
         if normalized_canonical not in self.graph:
             logger.warning(
                 "Cannot add alias '%s' -> '%s': canonical entity does not exist",
