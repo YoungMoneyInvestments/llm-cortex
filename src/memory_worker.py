@@ -2623,6 +2623,23 @@ async def lifespan(app: FastAPI):
 
     logger.info(f"Cortex Worker starting on port {WORKER_PORT}")
 
+    # Log the git commit hash so stale workers are immediately visible in logs.
+    # A mismatch between this hash and `git rev-parse HEAD` in the working tree
+    # means the worker is running old code and needs `scripts/restart_worker.sh`.
+    try:
+        _git_result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=3,
+            cwd=str(Path(__file__).resolve().parent),
+        )
+        if _git_result.returncode == 0:
+            _git_hash = _git_result.stdout.strip()
+            logger.info(f"Running git commit: {_git_hash}")
+        else:
+            logger.warning("git rev-parse HEAD failed (non-git deployment?): %s", _git_result.stderr.strip())
+    except Exception as _git_exc:
+        logger.warning("Could not determine git commit hash: %s", _git_exc)
+
     # BUG-D2-04: Warn loudly when no env var was configured.
     # A generated key is usable but Cameron should notice and set the env var.
     if _API_KEY_WAS_GENERATED:
