@@ -2006,6 +2006,22 @@ Created `scripts/smoke_test.py` — re-runnable, 8 scenarios, JSON output to `~/
 - **BUG-V-01 cleanup:** Remove `CORTEX_WORKER_API_KEY=cortex-local-2026` from worker launchctl plist (or sync key file). Deferred — requires launchctl plist edit + worker restart.
 - **Scenario A latency:** KG load on first call takes ~15s (loads 9974 entities into memory). Not a regression — same as prior passes. Acceptable for MCP server (loaded once per process lifetime).
 
+### Pass V Post-Commit Correction (2026-04-16)
+
+**BUG-V-04: Scenario E false positive — "cortex" path match**
+
+After initial commit, advisor flagged that Scenario E's cortex recall check was a false positive:
+- Check was: `has_cortex = "Cortex Recall" in stdout or "cortex" in stdout.lower()`
+- The subprocess doesn't inherit `CORTEX_WORKER_API_KEY` from the launchctl worker environment.
+- `context_loader.py` gets 401, falls back to `(cortex worker unreachable)` in output.
+- `"cortex" in stdout.lower()` matched this failure string, reporting `has_cortex=True` falsely.
+
+**Fix applied in `scripts/smoke_test.py`:**
+1. Pass `CORTEX_WORKER_API_KEY` explicitly into the subprocess env using `_read_api_key()` (same probe used for Scenario D).
+2. Tighten check to `"Cortex Recall (" in stdout` — matches the success format only.
+
+**Rerun results (2026-04-16T23:16:58Z):** 8/8 PASS, `has_cortex_recall=True` confirmed genuine.
+
 **STATUS: COMPLETE — 8/8 scenarios pass, 0 regressions.**
 
 ---

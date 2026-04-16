@@ -346,12 +346,22 @@ def scenario_e() -> Dict[str, Any]:
     script = SCRIPTS_DIR / "context_loader.py"
 
     try:
+        # Pass the live worker's API key so context_loader.py can authenticate.
+        # Without it, the subprocess gets 401 and falls back to
+        # "(cortex worker unreachable)" — which contains "cortex" and would
+        # fool a naive `"cortex" in stdout.lower()` check (BUG-V-01 fallout).
+        env = os.environ.copy()
+        api_key = _read_api_key()
+        if api_key:
+            env["CORTEX_WORKER_API_KEY"] = api_key
+
         proc = subprocess.run(
             [python_bin, str(script), "--hours", "48"],
             capture_output=True,
             text=True,
             timeout=10,
             cwd=str(REPO_ROOT),
+            env=env,
         )
         elapsed = (time.perf_counter() - t0) * 1000
 
@@ -361,8 +371,9 @@ def scenario_e() -> Dict[str, Any]:
         exited_ok = (proc.returncode == 0)
         # <3000ms pass
         under_3s = elapsed < 3000
-        # Contains some cortex recall indicator
-        has_cortex = "Cortex Recall" in stdout or "cortex" in stdout.lower()
+        # Strict check: successful cortex recall prints "Cortex Recall (N results)"
+        # "(cortex worker unreachable)" is a FAIL — don't match on that.
+        has_cortex = "Cortex Recall (" in stdout
         # Vault name should appear if project maps to one
         # For llm-cortex project dir it may not map; check for any output
         has_output = len(stdout.strip()) > 0
