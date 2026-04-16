@@ -142,3 +142,144 @@ class UnifiedVectorStoreTests(unittest.TestCase):
             self.assertIn("obs-1", ids)
             self.assertIn("obs-2", ids)
             self.assertNotIn("obs-3", ids)
+
+    def test_delete_document_and_chunks_removes_unchunked(self) -> None:
+        """delete_document_and_chunks on an unchunked doc deletes it by exact id."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "del_test.db"
+            store = UnifiedVectorStore(db_path=db_path)
+            self.addCleanup(store.close)
+
+            store.add_knowledge("doc-simple", "short text no chunking", {})
+            # Stored as kg-doc-simple
+            row = store.conn.execute(
+                "SELECT id FROM documents WHERE id = 'kg-doc-simple'"
+            ).fetchone()
+            self.assertIsNotNone(row)
+
+            n_deleted = store.delete_document_and_chunks("kg-doc-simple")
+            self.assertEqual(n_deleted, 1)
+
+            row_after = store.conn.execute(
+                "SELECT id FROM documents WHERE id = 'kg-doc-simple'"
+            ).fetchone()
+            self.assertIsNone(row_after)
+
+    def test_delete_document_and_chunks_removes_all_chunk_suffixes(self) -> None:
+        """delete_document_and_chunks removes base doc and all -chunk-N rows."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "del_chunks_test.db"
+            store = UnifiedVectorStore(db_path=db_path)
+            self.addCleanup(store.close)
+
+            # Manually insert a doc with multiple chunk rows to simulate what _upsert
+            # produces for a large file
+            base_id = "kg-strategy-kb--test--big-file-md"
+            store.conn.execute(
+                "INSERT INTO documents (id, collection, text, metadata) VALUES (?, 'knowledge', 'chunk0', '{}')",
+                (base_id + "-chunk-0",),
+            )
+            store.conn.execute(
+                "INSERT INTO documents (id, collection, text, metadata) VALUES (?, 'knowledge', 'chunk1', '{}')",
+                (base_id + "-chunk-1",),
+            )
+            store.conn.execute(
+                "INSERT INTO documents (id, collection, text, metadata) VALUES (?, 'knowledge', 'chunk2', '{}')",
+                (base_id + "-chunk-2",),
+            )
+            store.conn.commit()
+
+            rows_before = store.conn.execute(
+                "SELECT COUNT(*) FROM documents WHERE id LIKE ?", (base_id + "%",)
+            ).fetchone()[0]
+            self.assertEqual(rows_before, 3)
+
+            n_deleted = store.delete_document_and_chunks(base_id)
+            self.assertEqual(n_deleted, 3)
+
+            rows_after = store.conn.execute(
+                "SELECT COUNT(*) FROM documents WHERE id LIKE ?", (base_id + "%",)
+            ).fetchone()[0]
+            self.assertEqual(rows_after, 0)
+
+    def test_delete_document_and_chunks_does_not_touch_sibling_prefix(self) -> None:
+        """delete_document_and_chunks('kg-kb-content_posts-1') must NOT delete
+        'kg-kb-content_posts-10' -- sibling IDs that share a common prefix."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "prefix_test.db"
+            store = UnifiedVectorStore(db_path=db_path)
+            self.addCleanup(store.close)
+
+            # Simulate two KB posts: pk=1 and pk=10
+            store.conn.execute(
+                "INSERT INTO documents (id, collection, text, metadata) "
+                "VALUES ('kg-kb-content_posts-1', 'knowledge', 'post one', '{}')"
+            )
+            store.conn.execute(
+                "INSERT INTO documents (id, collection, text, metadata) "
+                "VALUES ('kg-kb-content_posts-10', 'knowledge', 'post ten', '{}')"
+            )
+            store.conn.commit()
+
+            # Delete only the pk=1 doc
+            n_deleted = store.delete_document_and_chunks("kg-kb-content_posts-1")
+            self.assertEqual(n_deleted, 1)
+
+            # pk=10 must still be present
+            surviving = store.conn.execute(
+                "SELECT id FROM documents WHERE id = 'kg-kb-content_posts-10'"
+            ).fetchone()
+            self.assertIsNotNone(surviving)
+
+    def test_delete_document_and_chunks_returns_zero_when_not_found(self) -> None:
+        """delete_document_and_chunks returns 0 when the doc does not exist."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "notfound_test.db"
+            store = UnifiedVectorStore(db_path=db_path)
+            self.addCleanup(store.close)
+
+            n_deleted = store.delete_document_and_chunks("kg-does-not-exist")
+            self.assertEqual(n_deleted, 0)
+
+    def test_idempotent_replace_via_delete_before_insert(self) -> None:
+        """Simulates ingest_strategy_kb replace pattern: delete then re-add produces
+        the same final chunk count as the first ingest, regardless of prior chunk count."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "idempotent_test.db"
+            store = UnifiedVectorStore(db_path=db_path)
+            self.addCleanup(store.close)
+
+            # Insert an initial version with synthetic chunk rows (e.g., 3 chunks)
+            base_id = "kg-strategy-kb--test--evolving-md"
+            for i in range(3):
+                store.conn.execute(
+                    "INSERT INTO documents (id, collection, text, metadata, text_hash) "
+                    "VALUES (?, 'knowledge', ?, '{}', ?)",
+                    (f"{base_id}-chunk-{i}", f"old chunk {i}", f"hash_old_{i}"),
+                )
+            store.conn.commit()
+
+            count_before = store.conn.execute(
+                "SELECT COUNT(*) FROM documents WHERE id LIKE ?", (base_id + "%",)
+            ).fetchone()[0]
+            self.assertEqual(count_before, 3)
+
+            # Simulate replace: delete old chunks, then add new (shorter) content
+            store.delete_document_and_chunks(base_id)
+            new_text = "new short content"  # Fits in 1 chunk
+            store.add_knowledge("strategy-kb--test--evolving-md", new_text, {})
+
+            # Should have exactly 1 row (the new single-chunk doc), not 4
+            count_after = store.conn.execute(
+                "SELECT COUNT(*) FROM documents WHERE id LIKE ?", (base_id + "%",)
+            ).fetchone()[0]
+            self.assertEqual(count_after, 1)
+
+            # Re-running delete+add again should still yield 1 row (true idempotency)
+            store.delete_document_and_chunks(base_id)
+            store.add_knowledge("strategy-kb--test--evolving-md", new_text, {})
+
+            count_idempotent = store.conn.execute(
+                "SELECT COUNT(*) FROM documents WHERE id LIKE ?", (base_id + "%",)
+            ).fetchone()[0]
+            self.assertEqual(count_idempotent, 1)
