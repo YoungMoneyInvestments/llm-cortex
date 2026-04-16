@@ -2478,3 +2478,43 @@ Total docs: 19,042
 - `scripts/ingest_strategy_kb.py` (+46 -9 lines)
 - `scripts/ingest_knowledge_base.py` (+32 -5 lines)
 - `tests/test_unified_vector_store.py` (+145 lines, 5 new tests)
+
+**STATUS: COMPLETE -- 5 commits, 268 tests pass, idempotent replace verified for both ingesters.**
+
+---
+
+## Pass HH — Adversarial Loop Capstone Report
+**Date**: 2026-04-16
+**Type**: DOCUMENTATION ONLY — no source code modified
+
+### Mission
+Produce a Cameron-readable close-out report covering all passes 1 through Y. Back every
+numeric claim with a source. Reference each pass by label and commit SHA. Document deferred
+items, accepted risks, verification status, and recommended next steps.
+
+### Inputs Read
+- `adversarial-loop.log` (2,414+ lines, read in 6 chunks due to 82,831-token size)
+- `docs/UNIFIED_SEARCH_DESIGN.md` (417 lines, Pass FF design doc)
+- Live: `GET /api/health` -> `{"status":"healthy","uptime_seconds":1009.5,"total_observations":11736}`
+- Live: `pytest tests/ -q` -> `268 passed, 2 skipped in 16.80s`
+- `git log --oneline | wc -l` -> llm-cortex: 178, clawd: 73
+
+### Report Structure (8 sections)
+1. Executive Summary — system state before vs after, most surprising finding
+2. Numbers Snapshot — 20+ metrics from log + live API
+3. Top 10 Fixes — ranked by severity x user-visible impact, each with pass + commit SHA
+4. Systemic Findings — 5 architectural patterns that recurred across passes
+5. Deferred Items — 6 items with exact status and next step
+6. Accepted Risks — 4 items with rationale and re-evaluation conditions
+7. Verification Status — live health check, pytest output, recall results, smoke test
+8. What to Do Next — 6 priorities ordered by recommended sequence
+
+### Report
+- **File:** `docs/ADVERSARIAL_LOOP_REPORT.md`
+- **Lines:** 710
+- **All numeric claims sourced from:** log entries, live API responses, git log
+
+### Commits
+- See commit SHA below after commit
+
+**STATUS: COMPLETE -- 710-line report written, all claims source-backed, no source code modified.**
