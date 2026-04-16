@@ -1617,6 +1617,55 @@ class UnifiedVectorStore:
             logger.error(f"Failed to delete documents: {e}")
             raise
 
+    def delete_document_and_chunks(self, base_doc_id: str) -> int:
+        """Delete a document and all its chunks by stable base doc ID.
+
+        Handles both unchunked documents (stored as ``base_doc_id`` directly) and
+        chunked documents (stored as ``base_doc_id-chunk-0``, ``...-chunk-1``, etc.).
+        Uses exact match plus a ``-chunk-N`` suffix pattern so sibling IDs that
+        share a common prefix (e.g. ``kb-content_posts-1`` vs
+        ``kb-content_posts-10``) are never accidentally deleted.
+
+        This is the idempotent replace primitive used by ingesters: call
+        ``delete_document_and_chunks(base_doc_id)`` before re-inserting to clear
+        any stale chunks left over when a file shrinks from N chunks to M < N.
+
+        Args:
+            base_doc_id: The *internal* doc ID as stored in the documents table
+                (i.e. already including the ``kg-`` / ``obs-`` / ``conv-`` prefix
+                that ``add_knowledge`` / ``add_observation`` prepend).
+
+        Returns:
+            Number of rows deleted.
+        """
+        try:
+            # Match exact ID (unchunked) OR chunk suffixes (-chunk-0, -chunk-1, ...)
+            rows = self._safe_execute(
+                "SELECT id FROM documents WHERE id = ? OR id LIKE ?",
+                (base_doc_id, base_doc_id + "-chunk-%"),
+            ).fetchall()
+            if not rows:
+                return 0
+            ids_to_delete = [r["id"] for r in rows]
+            placeholders = ",".join("?" for _ in ids_to_delete)
+            self._safe_execute(
+                f"DELETE FROM documents WHERE id IN ({placeholders})", ids_to_delete
+            )
+            if self.vec_available:
+                self._safe_execute(
+                    f"DELETE FROM document_embeddings WHERE doc_id IN ({placeholders})",
+                    ids_to_delete,
+                )
+            self.conn.commit()
+            logger.debug(
+                f"delete_document_and_chunks: removed {len(ids_to_delete)} row(s) "
+                f"for base_doc_id={base_doc_id!r}"
+            )
+            return len(ids_to_delete)
+        except Exception as e:
+            logger.error(f"Failed to delete document+chunks for {base_doc_id!r}: {e}")
+            raise
+
     def recent(self, collection: Optional[str] = None, limit: int = 20) -> list[dict]:
         """Get most recent documents."""
         try:
