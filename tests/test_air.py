@@ -614,6 +614,56 @@ class TestInjector:
         assert "high_confidence_rules" in stats
         assert "medium_confidence_rules" in stats
         assert "total_rules" in stats
+        assert "cold_start_complete" in stats
+
+    def test_cold_start_false_when_no_rules(self, injector):
+        """cold_start_complete must be False when no rules have been compiled."""
+        stats = injector.get_injection_stats()
+        assert stats["cold_start_complete"] is False
+
+    def test_cold_start_true_with_harvester_above_threshold(
+        self, injector, harvester, cortex_db
+    ):
+        """cold_start_complete must be True when session count >= cold_start_cycles."""
+        from datetime import datetime, timezone, timedelta
+        import sqlite3
+        # cold_start_cycles=10 in config; insert 10 distinct sessions
+        now = datetime.now(timezone.utc)
+        conn = sqlite3.connect(str(cortex_db))
+        for i in range(10):
+            conn.execute(
+                "INSERT INTO observations "
+                "(session_id, timestamp, source, tool_name) "
+                "VALUES (?, ?, 'post_tool_use', 'Bash')",
+                (f"cold-start-sess-{i}", (now - timedelta(seconds=i)).isoformat()),
+            )
+        conn.commit()
+        conn.close()
+
+        stats = injector.get_injection_stats(harvester=harvester)
+        assert stats["cold_start_complete"] is True
+
+    def test_cold_start_false_with_harvester_below_threshold(
+        self, injector, harvester, cortex_db
+    ):
+        """cold_start_complete must be False when session count < cold_start_cycles."""
+        from datetime import datetime, timezone
+        import sqlite3
+        # Only 3 sessions, cold_start_cycles=10
+        now = datetime.now(timezone.utc)
+        conn = sqlite3.connect(str(cortex_db))
+        for i in range(3):
+            conn.execute(
+                "INSERT INTO observations "
+                "(session_id, timestamp, source, tool_name) "
+                "VALUES (?, ?, 'post_tool_use', 'Bash')",
+                (f"cold-start-small-{i}", now.isoformat()),
+            )
+        conn.commit()
+        conn.close()
+
+        stats = injector.get_injection_stats(harvester=harvester)
+        assert stats["cold_start_complete"] is False
 
 
 # ── Decay Batch Tests (2) ────────────────────────────────────────────
