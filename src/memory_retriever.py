@@ -35,6 +35,9 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Optional
 
+# Subscription helpers — imported lazily to avoid circular import at module top.
+# Inline import deferred to function body where needed.
+
 logger = logging.getLogger("cortex-retriever")
 
 # ── Config ──────────────────────────────────────────────────────────────────
@@ -944,6 +947,7 @@ class MemoryRetriever:
         graph_depth: int = 1,
         source: Optional[str] = None,
         agent: Optional[str] = None,
+        tier=None,
     ) -> list[dict]:
         """Search with knowledge graph augmentation.
 
@@ -959,6 +963,9 @@ class MemoryRetriever:
             graph_depth: How many hops to traverse for expansion (1 or 2)
             source: Filter by observation source type
             agent: Filter by agent name
+            tier: Optional subscription tier for feature gating. When provided
+                and the tier lacks ``graph_expansion``, expansion is skipped and
+                the base results are returned (BUG-D2-02 fix).
         """
         # Clamp graph_depth
         graph_depth = max(1, min(2, graph_depth))
@@ -968,6 +975,18 @@ class MemoryRetriever:
 
         # Step 2: Enrich with graph context
         base_results = self._enrich_with_graph_context(base_results)
+
+        # Step 3: Graph-first expansion — gate on graph_expansion feature (BUG-D2-02)
+        if tier is not None:
+            from subscription import require_feature
+            try:
+                require_feature(tier, "graph_expansion")
+            except PermissionError:
+                logger.info(
+                    "graph_expansion skipped: tier %s lacks feature graph_expansion",
+                    getattr(tier, "value", tier),
+                )
+                return base_results
 
         # Step 3: Graph-first expansion (if KG available)
         if not self.kg or self.kg.graph.number_of_nodes() == 0:

@@ -38,8 +38,20 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from memory_retriever import MemoryRetriever
+from subscription import SubscriptionTier, parse_tier, require_feature
 
 logger = logging.getLogger("cortex-mcp")
+
+# ── Server tier resolution (BUG-D2-02 fix) ─────────────────────────────────
+# CORTEX_CURRENT_TIER sets the active tier for MCP feature gating.
+# Falls back to CORTEX_SERVER_TIER_CAP, then to CLAUDE_CODEMAX.
+# Resolved once at module load; env does not change mid-process.
+_raw_mcp_tier = (
+    os.environ.get("CORTEX_CURRENT_TIER")
+    or os.environ.get("CORTEX_SERVER_TIER_CAP")
+    or SubscriptionTier.CLAUDE_CODEMAX.value
+)
+_MCP_TIER: SubscriptionTier = parse_tier(_raw_mcp_tier)
 
 # Hard caps applied to all tool limit/window/graph_depth params.
 # These prevent the LLM from accidentally requesting thousands of results
@@ -573,6 +585,14 @@ def handle_tool_call(name: str, arguments: dict) -> dict:
             query = arguments.get("query")
             if not isinstance(query, str) or not query.strip():
                 return {"content": [{"type": "text", "text": "Error: 'query' must be a non-empty string"}], "isError": True}
+            # Gate: knowledge_graph is a premium feature (BUG-D2-02)
+            try:
+                require_feature(_MCP_TIER, "knowledge_graph")
+            except PermissionError:
+                return {
+                    "content": [{"type": "text", "text": "Error: graph search requires a higher subscription tier"}],
+                    "isError": True,
+                }
             limit = _int_arg(arguments, "limit", 15, lo=1, hi=_MAX_LIMIT)
             try:
                 graph_depth = int(arguments.get("graph_depth", 1))
@@ -584,6 +604,7 @@ def handle_tool_call(name: str, arguments: dict) -> dict:
                 query=query,
                 limit=limit,
                 graph_depth=graph_depth,
+                tier=_MCP_TIER,
             )
             lines = [f"Graph search: '{query}' — {len(results)} results\n"]
             for r in results:
