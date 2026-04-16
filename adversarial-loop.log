@@ -615,3 +615,82 @@
 - `10c6b9e` — `fix(air): list_active_rules(project_id=None) must exclude project-scoped rules`
 
 **On-disk-only fixes** (src/air/ is git-ignored): BUG-C2-01 (miss_count), partial BUG-C2-02 (injector changes), BUG-C2-03 (list_active_rules filter). All verified passing via pytest.
+
+### Pass D2 — 2026-04-16
+- **Subsystem**: `src/subscription.py` (~5KB, tier management) + tier-gating logic across the codebase
+- **Scope**: Full read of `subscription.py`, full caller map via grep across all Python files. Mutations proposed to `subscription.py` and `tests/test_subscription_and_credentials.py` only. All other files treated as read-only per pass brief.
+
+**Default tier**: `DEFAULT_TIER = SubscriptionTier.CLAUDE_STANDARD` (line 133) — rank=1, lowest tier, 60 obs/min, 250K daily tokens, no KG, no graph_expansion. Safe default. NOT unlimited.
+
+**Stale-reference check**: Zero CamiRouter / localhost:8317 / OpenAI API references in `subscription.py`. Clean.
+
+**Callsite map** — every production caller of tier functions:
+
+| File | Function | Tier function used | Pre-op / Post-op / Missing |
+|------|----------|--------------------|---------------------------|
+| `memory_worker.py:2441` | `receive_observation` | `parse_tier(req.subscription_tier).value` | Pre-op (before rate-limit + quota check + INSERT) |
+| `memory_worker.py:2503` | `start_session` | `parse_tier(req.subscription_tier).value` | Pre-op (before session INSERT) |
+| `memory_worker.py:351,358` | `SubscriptionRateLimiter.check()` | `get_tier_config(tier)` | Inside rate-limit check |
+| `memory_worker.py:404` | `QuotaManager.consume()` | `get_tier_config(tier)` | Inside quota check |
+| `credential_manager.py:136,184,293` | store/list/audit | `parse_tier()` | Pre-op (parameter normalization) |
+| `mcp_memory_server.py` | `cami_memory_graph_search` handler | None | **MISSING** — no tier check |
+| `memory_retriever.py` | `search_with_context()` | None | **MISSING** — no tier check |
+
+**`tier_supports_feature` production caller count**: ZERO. Only called in `tests/test_subscription_and_credentials.py`. The feature gates (`knowledge_graph`, `graph_expansion`) defined in `TierFeatures` are never enforced in any request path. All MCP tools run at full capability regardless of declared tier.
+
+**Bugs confirmed:**
+
+  **BUG-D2-01 (P1, DEFERRED to C1): Client-declared tier escalation**
+  - `ObservationRequest.subscription_tier` (Pydantic field, line 443) and `SessionStartRequest.subscription_tier` (line 466) are plain string fields with default `DEFAULT_SUBSCRIPTION_TIER`. Any authenticated caller can set `subscription_tier: "claude_codemax"` in the request body and receive 240 obs/min + 1.2M daily tokens instead of the 60/250K default.
+  - Reproduction confirmed: `parse_tier("claude_codemax")` returns `CLAUDE_CODEMAX` and `get_tier_config()` returns `observations_per_minute=240, daily_token_budget=1_200_000`.
+  - Root cause: No server-side tier cap. The server must maintain a server-authoritative tier and clamp the client-declared value.
+  - Fix location: `memory_worker.py` `receive_observation` and `start_session`. Use `clamp_tier(req.subscription_tier, server_cap)` where `server_cap` comes from a server-side config or credential lookup.
+  - Fix helper added to `subscription.py` this pass: `clamp_tier()`. Ready for wiring by C1.
+  - Status: OPEN — deferred to memory_worker.py owner.
+
+  **BUG-D2-02 (P1, DEFERRED to C1 + mcp_memory_server owner): Dead feature gates**
+  - `TierFeatures.knowledge_graph` and `TierFeatures.graph_expansion` exist in `TierConfig` but are never checked in any production code path. `cami_memory_graph_search` (MCP) and `search_with_context()` (retriever) run for every tier including CLAUDE_STANDARD which explicitly has `knowledge_graph=False`.
+  - Reproduction: `tier_supports_feature(SubscriptionTier.CLAUDE_STANDARD, "knowledge_graph")` returns `False`. `mcp_memory_server.handle_tool_call("cami_memory_graph_search", {"query": "test"})` runs without any tier check, regardless.
+  - Fix location: `mcp_memory_server.py` `cami_memory_graph_search` handler and optionally `memory_worker.py` `/api/memory/search` endpoint. Use `require_feature(tier, "knowledge_graph")` before dispatching to retriever.
+  - Fix helper added to `subscription.py` this pass: `require_feature()`. Ready for wiring.
+  - Status: OPEN — deferred to mcp_memory_server.py and memory_worker.py owners.
+
+  **BUG-D2-03 (P2, DEFERRED to C1): Unauthenticated memory read endpoints**
+  - `/api/memory/search`, `/api/memory/timeline`, `/api/memory/details` (POST) have no `Depends(require_auth)`. Full observation history is readable without a bearer token.
+  - `/api/observations/recent`, `/api/sessions/recent`, `/api/stats`, `/api/retention/stats`, `/api/ner/stats`, `/api/profile`, `/api/compression/status` are all GET endpoints with no auth.
+  - Confirmed already documented in Pass C1 as BUG-C1-01 (ACCEPTED RISK — worker binds to 127.0.0.1:37778 only). Restated here for completeness.
+  - Fix path: add `Depends(require_auth)` to the three POST endpoints when `CORTEX_WORKER_API_KEY` is configured. MCP server would need to pass the auth header.
+  - Status: OPEN — same constraint as C1-01. Deferred.
+
+  **BUG-D2-04 (P3, DEFERRED to C1): Empty CORTEX_WORKER_API_KEY silences all writes**
+  - `CORTEX_API_KEY = os.environ.get("CORTEX_WORKER_API_KEY", "")` (line 80). If `CORTEX_WORKER_API_KEY` is not set, `CORTEX_API_KEY` is an empty string. `require_auth` checks `credentials.credentials != CORTEX_API_KEY`. No caller can satisfy `"" != ""` while also sending a non-empty bearer token that FastAPI's HTTPBearer parser accepts (HTTPBearer rejects `Authorization: Bearer ` with trailing space, returning None). Effective result: ALL authenticated POST endpoints return 401 when the env var is missing.
+  - This is not a security bypass — it fails closed. But it fails silently (no startup warning), making misconfiguration hard to detect.
+  - Verified via TestClient: empty string CORTEX_API_KEY + any non-empty Bearer token → 401 always.
+  - Fix: add startup assertion `assert CORTEX_API_KEY, "CORTEX_WORKER_API_KEY must be set"` or a warning log at startup.
+  - Status: OPEN — deferred to memory_worker.py.
+
+  **BUG-D2-05 (P2, DEFERRED to C1): Tier read from env at startup, cached forever**
+  - `DEFAULT_SUBSCRIPTION_TIER = os.environ.get("CORTEX_SUBSCRIPTION_TIER", DEFAULT_TIER.value)` (line 86) is a module-level constant. It is set once on process start and never re-read.
+  - Any subscription change (upgrading `CORTEX_SUBSCRIPTION_TIER` env var) requires a full worker restart to take effect.
+  - No cache invalidation endpoint exists.
+  - This is by design for a single-user personal system, but should be documented as a known restart requirement when changing subscription tier.
+  - Status: ACCEPTED / document — no code change required.
+
+**Bugs NOT confirmed (investigated and cleared):**
+- **Empty-key bypass**: Tested with `TestClient`. `Authorization: Bearer ` (trailing space) returns `credentials=None` from FastAPI's HTTPBearer, causing 401 path to fire correctly. No empty-key bypass exists.
+- **Tier escalation via `parse_tier` silent fallback**: `parse_tier` falling back to DEFAULT_TIER on invalid input is explicitly safe — the fallback is the minimum tier. Attackers cannot use this to escalate; they must supply a valid higher-tier string to escalate (covered by BUG-D2-01).
+
+**Fixes applied this pass:**
+1. Added `clamp_tier(client, cap) -> SubscriptionTier` to `subscription.py` (lines 175-205).
+   - Returns lower-ranked tier within the same provider; falls back to cap on cross-provider comparison.
+   - Documented for use on write endpoints to prevent privilege escalation via client-declared tier.
+2. Added `require_feature(tier, feature) -> None` to `subscription.py` (lines 208-237).
+   - Raises `PermissionError` when tier lacks the feature; raises `ValueError` for unknown feature names.
+   - Documented for use in MCP handler and HTTP endpoint before dispatching to graph search / graph expansion.
+3. Added 11 tests to `tests/test_subscription_and_credentials.py` covering both helpers.
+
+**Verification**: `python3 -m py_compile src/subscription.py` CLEAN. `pytest tests/` — 103 passed, 0 failed (up from 96 before this pass). No regressions.
+
+**Commit**: `0e4acce` — `feat(subscription): add clamp_tier and require_feature defensive helpers`
+
+**Summary**: Default tier is CLAUDE_STANDARD (lowest). 4 bugs confirmed (BUG-D2-01 through D2-04), all deferred to memory_worker.py / mcp_memory_server.py owners. 1 non-bug documented (D2-05, restart requirement). Defensive helpers added and tested in the one in-scope file (`subscription.py`). Feature gates are dead code with no production wiring — wiring them requires helpers from this pass plus handler changes in off-limits files.
