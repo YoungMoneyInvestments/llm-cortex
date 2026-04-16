@@ -361,9 +361,13 @@ class KnowledgeGraph:
         # Persist to SQLite
         self._db_save_entity(normalized_id, validated_type, display_name, attributes)
 
-        # Auto-register alias from original name
-        if display_name:
-            self.add_alias(entity_id, normalized_id)
+        # NOTE: do NOT auto-register an alias here.  add_alias normalizes both
+        # arguments, so passing entity_id -> normalized_id always produces a
+        # self-referential alias (e.g. 'cameron' -> 'cameron').  resolve_entity
+        # already applies _normalize_id before the exact-match lookup, so the
+        # alias would be redundant at best and pollutes the alias table at worst.
+        # Callers should call add_alias() explicitly when they have a genuinely
+        # different alias (e.g. "Cam" -> "cameron").
 
     def get_entity(self, entity_id: str) -> Optional[Dict]:
         """Get entity attributes."""
@@ -465,16 +469,25 @@ class KnowledgeGraph:
 
     def find_path(self, source: str, target: str,
                   max_hops: int = 3) -> Optional[List]:
-        """Find shortest path between entities."""
+        """Find shortest path between entities.
+
+        Uses BFS cutoff so traversal stops once max_hops is exceeded rather
+        than exploring the full graph and filtering afterwards.
+        """
         source_id = self.resolve_entity(source)
         target_id = self.resolve_entity(target)
         if not source_id or not target_id:
             return None
         try:
-            path = nx.shortest_path(self.graph, source_id, target_id)
-            if len(path) <= max_hops + 1:
+            # single_source_shortest_path respects cutoff at BFS time, avoiding
+            # full-graph traversal when source and target are far apart.
+            paths = nx.single_source_shortest_path(
+                self.graph, source_id, cutoff=max_hops
+            )
+            path = paths.get(target_id)
+            if path is not None:
                 return path
-        except nx.NetworkXNoPath:
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
             pass
         return None
 
@@ -510,6 +523,14 @@ class KnowledgeGraph:
                 "SELECT id, strength, last_accessed_at FROM relationships"
             ).fetchall()
 
+            # Build a db_id -> (u, v, k) index once so in-memory updates are O(1)
+            # rather than scanning all edges for each decayed row.
+            db_id_to_edge: Dict[int, Tuple] = {}
+            for u, v, k, data in self.graph.edges(keys=True, data=True):
+                db_id = data.get("db_id")
+                if db_id is not None:
+                    db_id_to_edge[db_id] = (u, v, k)
+
             for row in rows:
                 try:
                     last_accessed = datetime.fromisoformat(row["last_accessed_at"])
@@ -532,11 +553,11 @@ class KnowledgeGraph:
                     (new_strength, row["id"]),
                 )
 
-                # Update in-memory graph
-                for u, v, k, data in self.graph.edges(keys=True, data=True):
-                    if data.get("db_id") == row["id"]:
-                        self.graph[u][v][k]["strength"] = new_strength
-                        break
+                # Update in-memory graph via O(1) lookup
+                edge_key = db_id_to_edge.get(row["id"])
+                if edge_key:
+                    u, v, k = edge_key
+                    self.graph[u][v][k]["strength"] = new_strength
 
                 updated += 1
 
@@ -619,13 +640,26 @@ class KnowledgeGraph:
 
         Args:
             rel_type: Relationship type to filter by
-            direction: 'out' for outgoing edges, 'in' for incoming, 'both'
+            direction: 'out' for outgoing edges only, 'in' for incoming only,
+                       'both' for all edges of this type
         """
         normalized = rel_type.lower().strip()
         results = []
         seen_ids = set()
 
-        for u, v, data in self.graph.edges(data=True):
+        # Build edge iterator based on direction.
+        # graph.edges() only yields outgoing edges; in_edges() yields incoming.
+        if direction == "out":
+            edge_iter = self.graph.edges(data=True)
+            label = "outgoing"
+        elif direction == "in":
+            edge_iter = self.graph.in_edges(data=True)
+            label = "incoming"
+        else:  # both
+            edge_iter = list(self.graph.edges(data=True)) + list(self.graph.in_edges(data=True))
+            label = None
+
+        for u, v, data in edge_iter:
             if data.get("rel_type") != normalized:
                 continue
             db_id = data.get("db_id")
@@ -633,24 +667,12 @@ class KnowledgeGraph:
                 continue
             seen_ids.add(db_id)
 
-            if direction == "in":
-                results.append({
-                    "source": u, "target": v,
-                    "type": normalized, "direction": "incoming",
-                    **data,
-                })
-            elif direction == "out":
-                results.append({
-                    "source": u, "target": v,
-                    "type": normalized, "direction": "outgoing",
-                    **data,
-                })
-            else:  # both
-                results.append({
-                    "source": u, "target": v,
-                    "type": normalized,
-                    **data,
-                })
+            results.append({
+                "source": u, "target": v,
+                "type": normalized,
+                "direction": label if label else data.get("direction", "outgoing"),
+                **data,
+            })
 
         return results
 
