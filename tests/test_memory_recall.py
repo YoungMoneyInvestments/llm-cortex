@@ -127,12 +127,14 @@ def run_recall_evaluation() -> dict:
             results = _search(q, limit=3)
         except Exception as exc:
             results = []
+            full_text = ""
             top_snippet = f"ERROR: {exc}"
         else:
-            top_snippet = _result_text(results)[:200] if results else "(no results)"
+            full_text = _result_text(results) if results else ""
+            top_snippet = full_text[:200] if full_text else "(no results)"
         latency_ms = round((time.perf_counter() - t0) * 1000, 1)
 
-        hit = any(kw in top_snippet.lower() for kw in keywords)
+        hit = any(kw in full_text.lower() for kw in keywords) if full_text else False
         if hit:
             hits += 1
 

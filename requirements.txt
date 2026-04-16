@@ -13,5 +13,5 @@ httpx>=0.27.0
 networkx>=3.0
 #
 # Optional - Vector similarity search (Layer 0 + Layer 5):
-# sqlite-vec>=0.1.0
+sqlite-vec>=0.1.0
 # openai>=1.0.0

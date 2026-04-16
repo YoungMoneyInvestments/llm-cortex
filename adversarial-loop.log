@@ -1833,3 +1833,58 @@ Retypes applied: 10
 - **Prompt injection**: hard limit — cannot change compression prompt text.
 - **Timeout default**: hard limit — need evidence that 30s is wrong; no data.
 - **5xx in _call_ai_for_summary before fix**: the 5xx backoff gap in `_call_ai_for_summary` is now also fixed (as part of U-02 work) even though it wasn't in the original U-01 scope.
+
+---
+
+## Pass X -- sqlite_vec + hybrid retrieval (2026-04-16)
+
+**Mission**: Fix `test_memory_recall_rate` recurring failure (6 consecutive passes: 5, A2, A5, 8, 9, B1). Root cause believed to be sqlite_vec not installed and missing embeddings.
+
+### Investigation
+
+**Root cause stack (confirmed in order):**
+
+1. `~/.cortex/data/cortex-observations.db` was a 20KB stub with only FTS tables and no `observations` table. Fix: symlinked to `~/clawd/data/cortex-observations.db` (11,736 obs, 35MB). Machine-local, not committed.
+
+2. `cortex-vectors.db` had 19.6% embedding coverage (3,585/18,230 embedded). Backfill run using `.venv/bin/python scripts/backfill_embeddings.py` on clawd venv (Python 3.11, sqlite_vec 0.1.9, sentence_transformers 4.1.0, MPS acceleration): 14,645 rows processed, 0 failed, 56.9s at 257.4 docs/s. Post-backfill: 18,243/18,243 (100%) embedded.
+
+3. `_search_vector_store()` in `memory_retriever.py` called `store.search()` (FTS-only), not `store.search_hybrid()`. With embeddings now populated, switching to hybrid unlocks semantic recall for queries where FTS vocabulary doesn't match.
+
+4. Separate test harness bug (display truncation leaking into hit detection): `top_snippet = _result_text(results)[:200]` then `hit = any(kw in top_snippet.lower() ...)`. The `[:200]` slice was applied before keyword checking, not after. Fixed by separating `full_text` (for hit detection) from `top_snippet` (for display). This is a genuine bug fix -- the assertion `rate >= 0.5` and keyword set are unchanged. With or without this fix, the test was still failing at 3/10 due to issue (3).
+
+### Changes Made
+
+**`src/memory_retriever.py`**:
+- `_search_vector_store()`: when `store.vec_available` is True, call `store.search_hybrid()` and use `hybrid_score` (0-1, higher=better) as the `score` field. Falls back to `store.search()` (FTS-only) when vec not available. Docstring updated to reflect hybrid-first strategy.
+
+**`tests/test_memory_recall.py`**:
+- Fixed `_result_text(results)[:200]` display truncation leaking into keyword hit check. Added `full_text` variable for hit detection; `top_snippet = full_text[:200]` kept for display only. `full_text = ""` in except branch so variable is always defined.
+
+**`requirements.txt`**:
+- Uncommented `sqlite-vec>=0.1.0` (was `# sqlite-vec>=0.1.0`).
+
+### Test Results
+
+**Recall evaluation (inline, .venv Python):**
+- Before: 3/10 (30%) -- FTS-only retrieval, keywords absent from top-3 FTS results
+- After: 10/10 (100%) -- hybrid search surfaces semantically similar results with correct keywords
+
+**Full pytest suite (.venv Python):**
+- `260 passed, 2 skipped, 5 subtests passed` -- zero regressions
+
+**Smoke test:**
+- `store.vector_search("backtesting overfitting", limit=3)` with `vec_available=True`:
+  - dist=0.951: "Stop running backtests to confirm your bias. Run them to find where your strategy breaks."
+  - dist=1.003: "Your backtest shows 70% win rate but you're losing money live. Either you're overfit..."
+  - dist=1.040: "Backtesting isn't about finding a strategy that worked..."
+  - All 3 hits relevant. Vector search confirmed operational.
+
+### Commits
+- See commit below: `fix(retriever): use hybrid search when vec available + fix hit-detection truncation (Pass X)`
+
+### Notes
+- The `_truncate_summary(max_len=120)` default was NOT changed. Increasing it would widen MCP response text by 3x with unknown downstream impact. The hybrid switch alone was sufficient -- semantically relevant docs surface via vector similarity even when keyword-truncated summaries wouldn't match FTS.
+- Observation DB symlink is machine-local (`~/.cortex/data/cortex-observations.db -> ~/clawd/data/cortex-observations.db`). Not tracked in git; must be recreated on fresh install. `.env.example` documents `CORTEX_DATA_DIR`.
+- Embedding backfill (`scripts/backfill_embeddings.py`) is the correct tool for keeping embeddings current after bulk ingestion. No schedule exists yet -- manual trigger required.
+
+**STATUS**: test_memory_recall_rate CLOSED (7 consecutive passes).
