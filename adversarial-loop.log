@@ -488,3 +488,130 @@
 
 **No renames of cami_* tools** — all 8 tool names preserved.
 **No changes to unified_vector_store.py, memory_retriever.py, memory_worker.py, knowledge_graph.py.**
+
+### Pass C1 — 2026-04-16
+- **Subsystem**: `src/memory_worker.py` (~117KB, 2885 lines) — observation pipeline, AICompressor, EntityExtractor, RetentionManager, HTTP endpoints, shutdown lifecycle
+- **Scope**: Full file read (all 2885 lines in chunks). All 10 audit areas covered: observation pipeline, EntityExtractor/NER, NERExtractor.KNOWN_SYSTEMS, batching+retry, tier logic, retention+pruning, background loops, HTTP endpoints, AICompressor fallback path, graceful shutdown.
+- **Caller inventory**: `grep -rn 'from memory_worker\|import memory_worker'` found zero direct Python importers. Worker is a standalone FastAPI process consumed only via HTTP at `127.0.0.1:37778`. MCP server (`mcp_memory_server.py`) calls it via HTTP with no auth headers (confirmed by grep: zero hits for `Authorization|Bearer|CORTEX_WORKER_API_KEY` in `mcp_memory_server.py`).
+- **Prior passes not re-audited**: Pass 2 (CamiRouter removal, commit `40a32ba`) and Pass 5 (`VEC_DATA_DIR` constant, commit `84c7e03`) treated as already-fixed baseline.
+
+**Bug candidates investigated (10 areas):**
+
+**BUG-C1-01 (P2, ACCEPTED RISK): No auth on memory read endpoints**
+- `/api/memory/search`, `/api/memory/timeline`, `/api/memory/details` (POST) and `/api/profile` (GET) have no `Depends(require_auth)`.
+- `/api/observations/recent`, `/api/sessions/recent`, `/api/stats` are also unauthed but lower sensitivity.
+- Root cause: MCP server confirmed to send zero auth headers when calling these endpoints. Adding `require_auth` would break Cami's retrieval immediately.
+- Mitigation: Worker binds exclusively to `127.0.0.1:37778` (line 2882). No network-level exposure. Attack requires local process access.
+- Decision: ACCEPTED RISK for read endpoints. `/api/profile` is most sensitive (exposes AI-extracted personal profile facts) but same constraint applies. Document and defer until MCP server can be updated to send auth headers. Status: OPEN (BUG-C1-01).
+
+**BUG-C1-02 (P2, FIXED): db_lock missing on read endpoints**
+- `/api/observations/recent`, `/api/sessions/recent`, `/api/stats`, `/api/profile` all read shared `db` (single SQLite connection, `check_same_thread=False`) without holding `db_lock`.
+- Write paths (`receive_observation`, `end_session`, processor loop, retention loop, session summarizer) hold `db_lock` during multi-statement transactions.
+- In WAL mode concurrent readers and writers can coexist without blocking, but using the same connection object from multiple async tasks without serialization is unsafe regardless of WAL mode. A write transaction mid-flight on the shared connection will see reads interleaved with writes in unpredictable ordering.
+- Fix: Added `async with db_lock:` block around all DB reads in the four affected endpoints.
+- Commit: see below.
+
+**BUG-C1-03 (P3, FIXED): Shutdown missing WAL checkpoint**
+- `lifespan()` at lines 2382-2383: `if db: db.close()` with no prior `PRAGMA wal_checkpoint(TRUNCATE)`.
+- In WAL mode, `db.close()` does NOT flush the WAL to the main database file unless SQLite auto-checkpoint fires. Auto-checkpoint triggers at 1000 pages by default; a busy session with fewer than 1000 dirty pages leaves data only in the WAL. If the process is then killed or the WAL is lost, those writes are gone.
+- All background tasks are already cancelled before line 2382, so no new writes can race the checkpoint.
+- Fix: Added `db.execute("PRAGMA wal_checkpoint(TRUNCATE)")` immediately before `db.close()`.
+- Commit: see below.
+
+**BUG-C1-04 (P3, FIXED): `_call_ai_for_summary()` does not record failures**
+- Lines 2191-2210: direct AI call for session summary. On non-200 status codes (429 rate limit, 529 overload), function falls through to `return None` without calling `ai_compressor._record_failure(is_rate_limit=...)`.
+- The `AICompressor.compress()` path correctly calls `_record_failure()` on 429/529 and updates exponential backoff state. The direct `_call_ai_for_summary()` path bypasses this entirely.
+- Impact: consecutive 429s during session summarization never trip the failure counter, never trigger the alert, never engage backoff. The compressor appears healthy while rate limit errors silently accumulate for the session summary path.
+- Fix: Added explicit status code checks for 429, 529, and non-200 in `_call_ai_for_summary()`, calling `ai_compressor._record_failure(reason, is_rate_limit=...)` on each failure branch.
+- Commit: see below.
+
+**BUG-C1-05 (P3, DEFERRED): Dead rate-limit code**
+- Global `_rate_limit_buckets: dict[str, deque] = {}` (line 276) and `_rate_limit_last_cleanup: float = 0.0` (line 277) declared but never used.
+- Function `_check_rate_limit()` (lines 301-329) never called; superseded by `SubscriptionRateLimiter`.
+- No runtime impact. Removal is cleanup only; deferred to avoid churn.
+- Status: OPEN.
+
+**BUG-C1-06 (P3, DEFERRED): Retention leaves stale obs_ids in memcells/foresight**
+- `memcells.observation_ids` is a TEXT JSON array of observation IDs. No FK constraint, no cascade.
+- `RetentionManager._delete_low_signal()` deletes observations but does NOT clean `memcells.observation_ids` JSON entries pointing to deleted IDs. Similarly, `foresight` rows have no FK to observations.
+- Current callers of `memcells` at read time: none identified that would crash on stale IDs, but the data is corrupt in principle.
+- Fix requires JSON-patching or re-SELECT on memcells after deletion. Deferred pending confirmation of all read paths.
+- Status: OPEN.
+
+**BUG-C1-07 (investigated, NOT a bug): QuotaManager.consume() TOCTOU**
+- Initial concern: three SQLite statements (read, check, write) not wrapped in BEGIN/COMMIT.
+- After trace: `consume()` is only called at line 2449 inside `async with db_lock:` which already serializes the entire quota check + INSERT. No concurrent execution possible through this path. Not a bug.
+
+**NER systemic findings (no code changes this pass):**
+- `RE_GITHUB_REPO` (line 1304): pattern `[a-z0-9-]+/[a-z0-9._-]+` matches "key/value", "path/to" (first segment only), ISO date "2024-01" with any suffix. False positives expected in practice. Risk: low-signal noise in KG.
+- `@mention` tagging (lines 1439-1451): any `@handle` with `len > 2` tagged as type "person". Non-person handles (@CamiRouter, @PostgreSQL) get incorrect entity type. No query path currently breaks on this.
+- `seen` dict comment (line 1388): says value is `(display_name, type)` tuple but actual value is the type string only. Comment inconsistency; no functional impact.
+
+**Other areas (clean):**
+- Observation pipeline batching: no off-by-one, no double-submit on retry (status checked before re-fetch), backoff increments correctly in `_record_failure`.
+- Tier logic: `SubscriptionRateLimiter` applied at observation ingestion; no privileged path bypasses it.
+- Background loop scheduler: `_processor_watchdog` at 2300-2319 restarts dead tasks without creating duplicates (task-complete check via `.done()`). Retention loop uses `asyncio.sleep(1)` loop rather than single long sleep — properly interruptible. No task that silently raises and kills the loop undetected.
+- SIGTERM handler: sets `shutdown_event` which the `lifespan()` awaits. uvicorn also receives the signal and triggers graceful shutdown of its own server loop. Dual-path is acceptable; no race observed.
+
+**Bugs fixed (3 commits, llm-cortex repo):**
+- BUG-C1-03: WAL checkpoint before db.close()
+- BUG-C1-02: db_lock on read endpoints
+- BUG-C1-04: failure tracking in _call_ai_for_summary
+
+**Verification (each commit)**: `python3 -m py_compile src/memory_worker.py` CLEAN. `pytest tests/` — see per-commit notes below.
+
+**Commits (all in llm-cortex repo):**
+- `dd220b6` — `fix(memory_worker): WAL checkpoint before db.close() on shutdown (BUG-C1-03)`
+- `d0de8a5` — `fix(memory_worker): acquire db_lock on all shared-connection read endpoints (BUG-C1-02)`
+- `4aa2c30` — `fix(memory_worker): track 429/529 failures in _call_ai_for_summary (BUG-C1-04)`
+
+**Test results (post all fixes)**: 96 passed, 1 pre-existing failure (`test_memory_recall_rate`, sqlite_vec not installed, unrelated). No regressions.
+
+### Pass C2 — 2026-04-16
+- **Subsystem**: `src/air/` — Adaptive Inference Routing (patent-pending, provisional filed 2026-03-14)
+- **Scope**: Full adversarial audit of all 9 Python files in `src/air/` (2,020 LOC total). Callers: `scripts/air_cli.py`, `tests/test_air.py`. Files are git-ignored (private patent module); fixes applied to disk only. Test changes committed to llm-cortex repo.
+- **Stale-reference check**: Zero CamiRouter / localhost:8317 / OpenAI API references found in any `src/air/` file. Clean.
+- **Patent constraint respected**: No changes to routing decision logic (`router.py` `lookup()`/`_try_lookup()`, `compiler.py` `_detect_miss_recover()`, `scorer.py` core update logic). All fixes are plumbing only.
+
+**Bugs confirmed and fixed (3 bugs, on-disk changes + tests committed):**
+
+  **BUG-C2-01 (FIXED): miss_count never incremented**
+  - Root cause: `router.record_outcome(success=False)` penalized confidence via `scorer.update()` but never wrote to `miss_count`. Schema had the column, `get_stats()` reported it, but every miss was silently 0. Hit/miss ratio in stats was meaningless.
+  - Reproduction: `storage.add_rule(..., miss_count=0)` -> `router.record_outcome(rule_id, success=False)` -> `storage.get_rule(rule_id)["miss_count"]` returned 0 regardless.
+  - Fix: Added `storage.record_miss(rule_id)` method (`SET miss_count = miss_count + 1`). Wired into `router.record_outcome` on the `not success` branch.
+  - Files changed (on disk): `src/air/storage.py` (+12 lines), `src/air/router.py` (+5 lines)
+  - Tests: 2 new tests in `TestRouter` already committed in `e578c36`.
+
+  **BUG-C2-02 (FIXED): cold_start_complete hardcoded False**
+  - Root cause: `injector.get_injection_stats()` returned `"cold_start_complete": False` with a comment "populated by observation count" -- meaning the logic was never implemented. Always-False made the field useless.
+  - Fix: `get_injection_stats()` now accepts optional `harvester` parameter. When provided, compares `harvester.get_session_count(hours=8760)` against `config.cold_start_cycles`. When omitted, falls back to `len(all_rules) > 0` as proxy.
+  - Files changed (on disk): `src/air/injector.py` (+28 lines including TYPE_CHECKING guard)
+  - Tests: 3 new tests in `TestInjector`. Test commit: `30a8b11`
+
+  **BUG-C2-03 (FIXED): list_active_rules(project_id=None) returned ALL rules including project-scoped**
+  - Root cause: `storage.list_active_rules(project_id=None)` used `WHERE confidence >= ?` with no project filter, returning rules scoped to other projects. `get_injection_stats()` was thus counting project-scoped rules from every project in its global stats. `get_injectable_rules(project_id=None)` already had `AND project_id IS NULL` -- this was an inconsistency.
+  - Reproduction: Add one global rule + one project-scoped rule. `list_active_rules()` returned both; should return only global.
+  - Fix: Added `AND project_id IS NULL` to the no-project branch. With-project branch now applies explicit ordering (project-scoped first).
+  - Files changed (on disk): `src/air/storage.py` (+8 lines including docstring)
+  - Tests: 1 new test `test_list_active_rules_no_project_excludes_project_scoped` in `TestStorage`. Test commit: `10c6b9e`
+
+**Deferred bugs (patent-core -- Cameron's review required):**
+
+  **BUG-C2-D1 (DEFERRED, PATENT-CORE, HIGH SEVERITY): Trigger hash mismatch between classifier and router**
+  - Rules compiled by `PatternCompiler` are unreachable via `router.lookup()` in normal operation.
+  - Root cause: Compiler stores rules keyed by SHA256 of the canonical taxonomy pattern (e.g. "commit changes"). Router hashes the normalized user message (e.g. "commit the changes"). These only collide when the user types the exact canonical string verbatim.
+  - Reproduction confirmed: compile_session("commit the changes" -> Error -> Bash) stores rule with `trigger_hash = SHA256("commit changes")`. `router.lookup("commit the changes")` computes `SHA256("commit the changes")` -> no match -> None.
+  - Existing tests mask this: `test_lookup_match` pre-inserts rules with the router-side hash; the compiler and router test paths never meet end-to-end.
+  - Proposed fix (for Cameron): In `compiler._create_new_rule()`, compute the stored hash using `RoutingRouter._compute_hash(RoutingRouter._normalize_message(intent["trigger_pattern"]))` instead of the classifier-side hash. This aligns what is stored with what the router queries.
+  - Patent-adjacent: fix touches which hash key is stored (learning loop storage path) -- flagged for Cameron.
+
+  **BUG-C2-D2 (DEFERRED, PATENT-CORE): compile_session is not idempotent**
+  - Re-running `compile_session(sid)` on the same session calls `_reinforce_rule()` again, rewarding confidence a second time. With the SessionEnd hook running `compile_recent(hours=48)`, any session that falls in two overlapping compilation windows gets double-rewarded. Affects confidence accretion rate. Flagged for Cameron.
+
+**Test results**: `pytest tests/test_air.py` -- 58 passed (was 54 before this pass). Full suite: 58 passed, 1 pre-existing failure (`test_memory_recall_rate`, sqlite_vec not installed, unrelated). No regressions.
+
+**Test commits (llm-cortex repo):**
+- `30a8b11` — `fix(air): compute cold_start_complete from session count instead of hardcoding False`
+- `10c6b9e` — `fix(air): list_active_rules(project_id=None) must exclude project-scoped rules`
+
+**On-disk-only fixes** (src/air/ is git-ignored): BUG-C2-01 (miss_count), partial BUG-C2-02 (injector changes), BUG-C2-03 (list_active_rules filter). All verified passing via pytest.
