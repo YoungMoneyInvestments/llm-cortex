@@ -35,6 +35,7 @@ import os
 import sqlite3
 import struct
 import sys
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -77,15 +78,26 @@ DEFAULT_VEC_WEIGHT = 0.6
 
 # -- Singleton ---------------------------------------------------------------
 
-_store_instance: Optional["UnifiedVectorStore"] = None
+_store_instances: dict[Path, "UnifiedVectorStore"] = {}
+_store_lock = threading.Lock()
 
 
 def get_vector_store(db_path: Optional[Path] = None) -> "UnifiedVectorStore":
-    """Get or create the singleton vector store instance."""
-    global _store_instance
-    if _store_instance is None:
-        _store_instance = UnifiedVectorStore(db_path or DB_PATH)
-    return _store_instance
+    """Get or create the vector store instance keyed by resolved db_path.
+
+    Callers passing the same resolved path share an instance.  Callers
+    passing a different path (e.g. MemoryRetriever(vec_db_path=custom))
+    get a separate instance so they are never silently redirected to the
+    wrong database.
+
+    Calling with no argument returns the default-path instance, identical
+    to the original no-arg behavior.
+    """
+    resolved = Path(db_path or DB_PATH).expanduser().resolve()
+    with _store_lock:
+        if resolved not in _store_instances:
+            _store_instances[resolved] = UnifiedVectorStore(resolved)
+        return _store_instances[resolved]
 
 
 # -- Helpers -----------------------------------------------------------------
