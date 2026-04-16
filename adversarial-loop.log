@@ -888,3 +888,84 @@ All adapters use `vec_distance_cosine(e.embedding, ?) ASC` (smaller = closer). D
 - `eb56607` -- `chore(cleanup): one-time purge of existing memcell/foresight orphans`
 
 **Status**: BUG-C1-06 CLOSED. No deferrals.
+
+### Pass H — 2026-04-16
+- **Mission**: Fix NER false positives in NERExtractor — RE_GITHUB_REPO "overly broad" finding from Pass C1, and @mention handler tagging non-person handles as `person`.
+- **Files changed**: `src/memory_worker.py`, `tests/test_ner_entity_extractor.py`, `scripts/cleanup_ner_false_positives.py`
+
+**Pre-fix graph audit (entity counts by type):**
+| Type | Count |
+|------|-------|
+| unknown | 3,666 |
+| tool | 3,569 |
+| file | 1,260 |
+| person | 681 |
+| system | 524 |
+| ticker | 81 |
+| company | 54 |
+| project | 18 |
+
+**Finding 1 (RE_GITHUB_REPO): Pattern is defined but never used.**
+- Pass C1 flagged `RE_GITHUB_REPO` as overly broad. DB sampling confirmed: 0 entities in the graph have `owner/repo`-shaped IDs from this pattern.
+- Root cause: `RE_GITHUB_REPO` is defined as a class attribute but is not called from any extraction method (`_extract_files`, `_extract_mcp_tools`, etc.). It is dead code.
+- Fix: Tightened the regex to require >= 3 chars on each side of `/` (was >= 1), added a `KNOWN_GITHUB_OWNERS` whitelist (for future use), and added a comment explicitly documenting that the pattern is not wired into any extraction method.
+- No retroactive DB cleanup needed: the pattern never produced any entities.
+
+**Finding 2 (@mention false positives): Real damage, in scope.**
+- Old handler: every `@handle` with len > 2 was tagged `person`.
+- Observed false positives in the graph:
+  - Bot handles tagged person: `botfather`, `martyprobot`, `martyprobot_2026_03_28_23` (and 7 more versioned variants)
+  - Brand/company social handles tagged person: `youngmoneyinvestments`, `youngmoneytrades`, `apextraderfunding`, `auth0spajs`, `alexgonzaleztrades`, `blacklinetrading`, `camibuffett`, `mrtopstep`, `pennyteetrading`, `thefuturesdesk`, `moneylikesmike`, `intuitmachine`, `algorithmictradingstrategies`
+- Fix in `_extract_people`:
+  1. Added static `_is_bot_handle(mention)`: returns True if handle starts with `bot`, ends with `bot`, or contains `bot[_\d]` (catches versioned NinjaTrader strategy bots like `@MartyProBot_2026_03_28_23`). Bot handles -> type `tool`.
+  2. Added `BRAND_HANDLES: Set[str]` class attribute with 12 known brand/company social handles. Brand handles -> type `company`.
+  3. All other handles continue to default to `person`.
+
+**Finding 3 (KNOWN_SYSTEMS): Added Hermes.**
+- `Hermes` (the retail BrokerBridge backend) was not in the list. Added.
+- `CamiRouter` kept (deprecated but needed for historical entity recognition per MEMORY.md).
+
+**Finding 4 (unknown entities): Out of scope, not an NER bug.**
+- 3,666 `unknown` entities come from `knowledge_graph.py:398-400` auto-creating missing relationship endpoints as `type='unknown'`. `knowledge_graph.py` is on the hard-limit no-edit list. Not caused by the regex bugs in scope. Not touched.
+
+**Finding 5 (RE_PEOPLE_CONTEXT over-extraction): Deferred.**
+- The majority of person false positives (e.g. `accepts_connections`, `actual_mutation_confirmed`) come from `RE_PEOPLE_CONTEXT` matching extremely common trigger words like `from` and `asked`. This is a larger problem than @mention classification. Deferred to a future pass.
+
+**Cleanup (scripts/cleanup_ner_false_positives.py):**
+- Bot handles with edges reclassified person->tool: 10
+- Brand handles with edges reclassified person->company: 8
+- Brand handles with no edges deleted: 5
+- Total person entities: 681 -> 659
+- Idempotency verified: second run changes 0 rows.
+- DB backup created at `cortex-knowledge-graph.db.bak-passH`.
+
+**Post-fix graph audit (entity counts by type):**
+| Type | Count |
+|------|-------|
+| unknown | 3,705 |
+| tool | 3,597 |
+| file | 1,260 |
+| person | 659 |
+| system | 526 |
+| ticker | 81 |
+| company | 62 |
+| project | 18 |
+
+**Manual NER samples (5 texts, before/after):**
+1. `@BotFather creates Telegram bots. @MartyProBot is a strategy bot.` → BotFather: person->**tool**, MartyProBot: person->**tool**
+2. `@MartyProBot_2026_03_28_23 fired. @MartyProBot_ fired.` → both: person->**tool**
+3. `@YoungMoneyTrades posted. @MrTopStep shared. @apextraderfunding emailed.` → all: person->**company**
+4. `Talked to @Cameron about the setup. @auth0spajs broke the auth flow.` → Cameron: **person** (unchanged), auth0spajs: person->**company**
+5. `Asked @Andrev_Carpathy about neural nets. @BrokerBridgeBot announced maintenance.` → Andrev_Carpathy: **person** (correct), BrokerBridgeBot: person->**tool**
+
+**Tests added**: 25 new tests in `tests/test_ner_entity_extractor.py`
+
+**Verification:**
+- `python3 -m py_compile src/memory_worker.py` — CLEAN
+- `pytest tests/` — **138 passed**, 1 pre-existing failure (`test_memory_recall_rate`). Baseline before this pass: 113 passing.
+
+**Commits (llm-cortex repo):**
+- `3566fbf` — `fix(ner): tighten RE_GITHUB_REPO and @mention classification (Pass H)`
+- `ae9f0d3` — `chore(ner): reclassify @mention false-positive entities in knowledge graph (Pass H)`
+
+**Status**: RE_GITHUB_REPO and @mention classification CLOSED. RE_PEOPLE_CONTEXT over-extraction DEFERRED (future pass). KNOWN_SYSTEMS Hermes addition DONE.
