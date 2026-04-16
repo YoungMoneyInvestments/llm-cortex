@@ -91,10 +91,6 @@ AUTH_PROFILES_PATH = Path.home() / ".openclaw" / "agents" / "main" / "agent" / "
 # ── NER (Named Entity Recognition) config ────────────────────────────────
 NER_ENABLED = os.environ.get("CORTEX_NER_ENABLED", "true").lower() == "true"
 
-# ── CamiRouter config (preferred path — avoids OAuth rate limit contention) ──
-CAMIROUTER_URL = "http://localhost:8317/v1/chat/completions"
-CAMIROUTER_API_KEY = os.environ.get("CAMIROUTER_API_KEY", "")
-CAMIROUTER_MODEL = "sonnet"  # CamiRouter alias for claude-sonnet-4-6
 
 # ── Logging ─────────────────────────────────────────────────────────────────
 
@@ -932,14 +928,7 @@ def _generate_summary_rule_based(
 
 
 class AICompressor:
-    """AI-powered observation compression with dual-path routing.
-
-    Primary path: CamiRouter (localhost:8317) — OpenAI-compatible endpoint
-    that routes through Cursor subscription. Avoids OAuth rate limit
-    contention with Claude Code sessions.
-
-    Fallback path: Direct Anthropic OAuth — used if CamiRouter is down.
-    """
+    """AI-powered observation compression via direct Anthropic OAuth."""
 
     ANTHROPIC_URL = "https://api.anthropic.com/v1/messages?beta=true"
     OAUTH_HEADERS = {
@@ -950,7 +939,6 @@ class AICompressor:
 
     def __init__(self):
         self._client: Optional[httpx.AsyncClient] = None
-        self._router_client: Optional[httpx.AsyncClient] = None
         self._token: Optional[str] = None
         self._ai_count = 0
         self._fallback_count = 0
@@ -960,8 +948,6 @@ class AICompressor:
         self._degraded_since: Optional[str] = None
         self._backoff_until: float = 0  # time.monotonic() after which we can retry
         self._last_probe_time: float = 0  # last time we probed during degraded state
-        self._using_router = False      # True when CamiRouter is the active path
-        self._router_available = True   # False if CamiRouter probe failed
         # Typed extraction fields — set after each successful compress() call
         self._last_memory_type: Optional[str] = None
         self._last_entities_json: Optional[str] = None
@@ -1056,29 +1042,6 @@ class AICompressor:
         except Exception as e:
             logger.warning(f"Failed to send alert notification: {e}")
 
-    async def _ensure_router_client(self) -> bool:
-        """Set up or verify CamiRouter client."""
-        try:
-            if self._router_client is None:
-                self._router_client = httpx.AsyncClient(
-                    headers={
-                        "Authorization": f"Bearer {CAMIROUTER_API_KEY}",
-                        "Content-Type": "application/json",
-                    },
-                    timeout=30.0,
-                )
-            # Quick health check if we haven't confirmed availability
-            if not self._router_available:
-                resp = await self._router_client.get(
-                    "http://localhost:8317/v1/models",
-                    timeout=3.0,
-                )
-                self._router_available = resp.status_code == 200
-            return self._router_available
-        except Exception:
-            self._router_available = False
-            return False
-
     async def _ensure_client(self) -> bool:
         """Load or refresh the OAuth token from auth-profiles (fallback path)."""
         try:
@@ -1118,7 +1081,7 @@ class AICompressor:
         raw_input: Optional[str],
         raw_output: Optional[str],
     ) -> Optional[str]:
-        """Compress an observation with AI. Tries CamiRouter first, falls back to OAuth.
+        """Compress an observation with AI via direct Anthropic OAuth.
 
         Returns the content string (dense summary).  After a successful call,
         self._last_memory_type and self._last_entities_json are set so the
@@ -1133,21 +1096,10 @@ class AICompressor:
 
         prompt = self._build_prompt(source, tool_name, agent, raw_input, raw_output)
 
-        raw_result: Optional[str] = None
-
-        # Try CamiRouter first (separate rate limit pool)
-        raw_result = await self._compress_via_router(prompt)
+        raw_result = await self._compress_via_oauth(prompt)
         if raw_result is not None:
             self._ai_count += 1
-            self._using_router = True
             self._record_success()
-        else:
-            # Fall back to direct Anthropic OAuth
-            raw_result = await self._compress_via_oauth(prompt)
-            if raw_result is not None:
-                self._ai_count += 1
-                self._using_router = False
-                self._record_success()
 
         if raw_result is None:
             return None
@@ -1157,43 +1109,6 @@ class AICompressor:
         self._last_memory_type = memory_type
         self._last_entities_json = entities_json
         return content
-
-    async def _compress_via_router(self, prompt: str) -> Optional[str]:
-        """Try compression through CamiRouter (OpenAI-compatible)."""
-        try:
-            if not await self._ensure_router_client():
-                return None
-
-            payload = {
-                "model": CAMIROUTER_MODEL,
-                "max_tokens": AI_MAX_TOKENS,
-                "messages": [{"role": "user", "content": prompt}],
-                "stream": False,
-            }
-            resp = await self._router_client.post(CAMIROUTER_URL, json=payload)
-
-            if resp.status_code == 429:
-                logger.debug("CamiRouter rate limited, trying OAuth fallback")
-                return None
-
-            if resp.status_code != 200:
-                logger.debug(f"CamiRouter {resp.status_code}, trying OAuth fallback")
-                self._router_available = False
-                return None
-
-            data = resp.json()
-            text = data.get("choices", [{}])[0].get("message", {}).get("content")
-            if text:
-                return text
-            return None
-
-        except (httpx.ConnectError, httpx.TimeoutException):
-            self._router_available = False
-            return None
-        except Exception as e:
-            logger.debug(f"CamiRouter error: {e}")
-            self._router_available = False
-            return None
 
     async def _compress_via_oauth(self, prompt: str) -> Optional[str]:
         """Try compression through direct Anthropic OAuth."""
@@ -2136,7 +2051,7 @@ async def _update_user_profile(session_id: str, session_summary: str, compressor
 async def _generate_session_summary(session_id: str):
     """Generate and store a summary for a completed session.
 
-    Tries AI compression first (via CamiRouter/OAuth), falls back to
+    Tries AI compression first (via Anthropic OAuth), falls back to
     rule-based aggregation of tool usage, file paths, and decisions.
     """
     if db is None or db_lock is None:
@@ -2267,29 +2182,10 @@ async def _ai_session_summary(
 
 
 async def _call_ai_for_summary(prompt: str) -> Optional[str]:
-    """Call AI (CamiRouter or OAuth) with a custom prompt for session summary."""
+    """Call AI (Anthropic OAuth) with a custom prompt for session summary."""
     if ai_compressor is None:
         return None
 
-    # Try CamiRouter first
-    try:
-        if await ai_compressor._ensure_router_client():
-            payload = {
-                "model": CAMIROUTER_MODEL,
-                "max_tokens": AI_MAX_TOKENS,
-                "messages": [{"role": "user", "content": prompt}],
-                "stream": False,
-            }
-            resp = await ai_compressor._router_client.post(CAMIROUTER_URL, json=payload)
-            if resp.status_code == 200:
-                data = resp.json()
-                text = data.get("choices", [{}])[0].get("message", {}).get("content")
-                if text:
-                    return text
-    except Exception as e:
-        logger.debug(f"CamiRouter session summary failed: {e}")
-
-    # Try OAuth fallback
     try:
         if await ai_compressor._ensure_client():
             payload = {
@@ -2814,8 +2710,7 @@ async def compression_status():
             max(0, AI_RECOVERY_PROBE_INTERVAL - (now - ai_compressor._last_probe_time)),
             1,
         ),
-        "active_path": "camirouter" if ai_compressor._using_router else "oauth",
-        "router_available": ai_compressor._router_available,
+        "active_path": "oauth",
     }
 
 
