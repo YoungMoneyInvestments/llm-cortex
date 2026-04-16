@@ -1073,3 +1073,256 @@ None — all items resolved or explicitly non-applicable.
 - `d66acf1` — `fix(bootstrap): vault routing, timeout, and silent failure (Pass K)`
 
 **Status**: K-1 (vault misdirection), K-2 (timeout), K-3 (silent failure) FIXED. K-4 (dead workspace path) DEFERRED.
+
+### Pass M -- 2026-04-16
+- **Mission**: Adversarial audit of iMessage, Facebook, and Instagram embedding ingestion pipelines.
+- **Repo**: clawd
+- **Files audited**:
+  - `scripts/archive/full_embed_pipeline.py` (485 LOC) -- iMessage pipeline (reads `~/Library/Messages/chat.db`)
+  - `scripts/meta_embed_pipeline.py` (491 LOC) -- FB/IG from Meta data export (one-shot, not scheduled)
+  - `scripts/social_embed_pipeline.py` (454 LOC) -- FB/IG from PostgreSQL (scheduled, active)
+  - `scripts/cron_imessage_embed.sh` -- iMessage cron wrapper (launchd `com.clawd.imessage-embed`, daily 3 AM)
+  - `scripts/cron_social_embed.sh` -- social cron wrapper (crontab `0 */6 * * *`, every 6h)
+  - `mcp-servers/conversation-memory/search/imessage.py`
+  - `mcp-servers/conversation-memory/search/base.py` (relevant: `safe_timestamp_nsdate`)
+  - `mcp-servers/conversation-memory/search/meta.py`
+- **Target DBs**:
+  - `~/clawd/data/imessage-embeddings.db` -- 12,801 chunks (all-MiniLM-L6-v2, 384-dim)
+  - `~/clawd/data/facebook-embeddings.db` -- 10,726 chunks (unix seconds)
+  - `~/clawd/data/instagram-embeddings.db` -- 17,196 chunks (unix seconds)
+
+#### Per-DB Freshness Audit
+
+| DB | Chunk count | Oldest | Newest | As of today (Apr 16) |
+|----|-------------|--------|--------|----------------------|
+| iMessage | 12,801 | 2015-10-10 | 2026-04-16 03:00 | CURRENT (ran 3 AM today) |
+| Facebook | 10,726 | 2010-02-26 | 2026-01-28 | 78 days stale |
+| Instagram | 17,196 | 2015-11-03 | 2026-01-28 | 78 days stale |
+
+**Facebook/Instagram staleness root cause**: The pipeline (`social_embed_pipeline.py`) is running correctly every 6 hours and correctly returning 0 new rows since Jan 28. The problem is upstream: PostgreSQL `messaging_messages` for facebook and instagram platforms has not received new rows since 2026-01-28. Whatever syncs Meta export data into PostgreSQL (likely a periodic manual import of Meta data exports) has not run in 78 days. The pipeline itself is healthy; the data source is stale. Out of scope for this pass.
+
+#### Timestamp Format Audit
+
+| DB | Raw range | Format | Interpretation |
+|----|-----------|--------|---------------|
+| iMessage | 4.66e17 -- 7.98e17 | NSDate nanoseconds (2001 epoch) | Correct per pipeline design |
+| Facebook | 1.27e9 -- 1.77e9 | Unix seconds | Correct |
+| Instagram | 1.45e9 -- 1.77e9 | Unix seconds | Correct |
+
+**iMessage timestamp verdict**: The pipeline writes raw `m['date']` values from `chat.db` which are NSDate nanoseconds. The MCP server (`search/base.py:safe_timestamp_nsdate`) correctly handles these via the `NSDATE_NS_THRESHOLD = 1e15` branch. This is consistent and correct. Pass E's commit `a6c7b38` is the complete fix. No pipeline-side conversion is needed or desirable.
+
+**No mixed-format rows**: confirmed via `SELECT COUNT(*) FROM chunks WHERE start_time IS NULL OR start_time = 0` -- 0 in all three DBs.
+
+#### Embedding Provider Audit
+
+| Pipeline | Provider | Dim | Notes |
+|----------|----------|-----|-------|
+| `full_embed_pipeline.py` (iMessage) | sentence-transformers/all-MiniLM-L6-v2 | 384 | Matches DB schema |
+| `social_embed_pipeline.py` (FB/IG) | sentence-transformers/all-MiniLM-L6-v2 | 384 | Matches DB schema |
+| `meta_embed_pipeline.py` (export-based) | sentence-transformers/all-MiniLM-L6-v2 | 384 | Dead code -- see below |
+| iMessage DB schema | vec0 FLOAT[384] | 384 | Consistent |
+| Facebook/Instagram DB schema | vec0 FLOAT[384] | 384 | Consistent |
+
+All providers are local sentence-transformers. No OpenAI dependency. Consistent with Pass 3 MCP fix.
+
+#### Bug Inventory
+
+**BUG-M-01 (P2, FIXED): Unstable orphan `chat_id` from `hash()` (PYTHONHASHSEED-randomized)**
+- **File**: `scripts/archive/full_embed_pipeline.py:166`
+- **Root cause**: `fake_chat_id = hash(f"orphan_{contact}") % 1000000 * -1`. Python's built-in `hash()` is randomised by `PYTHONHASHSEED` per process. The same contact string produces a different `chat_id` on each pipeline run. The dedup mechanism (tracking processed `message_rowid`) prevents re-embedding the same message, but the `chat_id` for new orphan messages from the same contact lands in a different bucket each run.
+- **Confirmed**: `SELECT contact_identifier, COUNT(DISTINCT chat_id) FROM chunks WHERE chat_id < 0 GROUP BY contact_identifier HAVING COUNT(DISTINCT chat_id) > 1` -- 2 contacts with 3 distinct chat_ids each, 7 affected chunks out of 11,990 orphan chunks.
+- **Impact**: Per-conversation queries using `chat_id` as the grouping key miss 2/3 of the affected contacts' history. Any MCP query that passes `contact_identifier` to filter by conversation would aggregate correctly (since `contact_identifier` is stored per chunk), but any code that groups or joins on `chat_id` silently omits data.
+- **Fix**: Replaced `hash()` with `hashlib.md5()` which is deterministic and PYTHONHASHSEED-immune. New expression: `-(int(hashlib.md5(f"orphan_{contact}".encode()).hexdigest()[:8], 16) % 1000000)`. Added `import hashlib` at the top of the file.
+- **Commit**: `6cef6f3` in clawd repo (`fix(imessage-pipeline): use stable hash for orphan chat_ids`)
+
+**BUG-M-02 (P2, REPORTED): `meta_embed_pipeline.py` schema mismatch with active DB**
+- **File**: `scripts/meta_embed_pipeline.py`
+- **Status**: REPORT ONLY -- not fixed this pass (no regression, no active cron wiring).
+- **Finding**: `meta_embed_pipeline.py` writes a different schema (`thread_id`, `thread_title`, no `conversation_id` column) vs the schema actually in the FB/IG DBs (`conversation_id`, `conversation_name`, no `thread_id`). The active DBs were created by `social_embed_pipeline.py`. If `meta_embed_pipeline.py` is run against an existing DB, the INSERT at line 267 references `thread_id` and `thread_title` which do not exist in the current schema -- it would fail with `table chunks has no column named thread_id`.
+- **Risk**: Any operator running `meta_embed_pipeline.py` believing it is the active pipeline would get a confusing error. The file should be archived or have a header warning.
+- **Deferred**: No launchd or cron entry runs `meta_embed_pipeline.py`. Adding a deprecation warning is cosmetic. Flagged for operator awareness.
+
+#### Other Hunt Items (No Issues Found)
+
+- **Per-contact hard caps**: No per-contact/per-conversation cap in any pipeline. iMessage chunks all contacts equally (CHUNK_MAX_MESSAGES=50/chunk), social pipeline streams all messages per conversation. No runaway-contact flooding risk observed given current DB sizes.
+- **PII redaction**: None in any pipeline. Conversation text is stored verbatim. This is intentional by design (personal assistant context). Flagged for awareness: SSNs, credit card numbers, API keys in message text would be embedded and searchable. No change made.
+- **Deleted message handling**: iMessage pipeline tracks processed `message_rowid`. If Apple removes a message from `chat.db` (e.g. user deletes it), the `message_rowid` stays in `chunk_messages` but the source no longer exists. No reconciliation pass runs. Stale embeddings persist. Flagged as a known gap; no fix per hard limit (do not change data-retention window).
+- **Encoding**: Meta pipeline uses `_decode_meta_text()` (latin-1 re-encode to handle Meta's escaped UTF-8). iMessage pipeline truncates at 1000 chars/message, no emoji issues. No encoding bugs found.
+- **Full Disk Access**: iMessage pipeline opens `chat.db` with `mode=ro` URI. If FDA is not granted, SQLite returns `OperationalError` which the pipeline catches at line 329-335 with an explicit error and exit(1). Fail-loud, not silent.
+- **Concurrent access**: iMessage pipeline opens `chat.db` read-only (`mode=ro`, `uri=True`). SQLite WAL mode on `chat.db` allows concurrent readers. No write lock contention. Embedding DB opened normally (not shared-cache, not WAL-checked). Concurrent runs of the pipeline could produce duplicate chunks if they start simultaneously, but the launchd schedule (daily 3 AM, single interval) makes this very unlikely.
+- **Incremental state integrity**:
+  - iMessage: uses `chunk_messages(message_rowid)` set loaded at startup. Dedup is sound. If state is somehow corrupted, the next run re-reads all ROWIDs from the DB (no separate state file).
+  - Facebook/Instagram: `social-embed-state.json` stores `last_run` ISO timestamp. If the file is corrupted, `_load_state()` catches the parse exception and returns `{}`, causing a full re-scan against existing `(conversation_id, start_time)` dedup set. Safe fallback.
+- **iMessage launchd schedule**: `com.clawd.imessage-embed` fires daily at 3:00 AM (not 6h as cron comment in script header says). Social embed runs every 6h via crontab. Discord runs every 6h via launchd. Schedules are inconsistent but functional; no bug.
+
+#### Commits
+- `6cef6f3` -- clawd -- `fix(imessage-pipeline): use stable hash for orphan chat_ids`
+
+#### Status
+- BUG-M-01: FIXED
+- BUG-M-02 (schema mismatch in `meta_embed_pipeline.py`): REPORTED, deferred
+- FB/IG staleness: REPORTED, upstream data-source issue (PostgreSQL not receiving new Meta messages since Jan 28). Out of scope for pipeline audit.
+
+### Pass L -- 2026-04-16
+- **Subsystem**: Discord embedding pipeline -- `~/clawd/scripts/discord_embed_pipeline.py` + `~/clawd/scripts/cron_discord_embed.sh`
+- **Mission**: Adversarial audit of the pipeline that previously ran to 12GB / 1.72M noise chunks. Pass 1 (commit `b7a588f`) added a blocklist and pruned the DB. Pass L hunts for remaining runaway vectors and hardening gaps.
+
+#### Architecture Summary
+1. **Scheduler**: launchd `com.clawd.discord-embed` fires at 0/6/12/18h daily via `cron_discord_embed.sh`. No concurrency guard before this pass.
+2. **State**: `~/clawd/memory/state/discord-embed-state.json` stores `channels[channel_id] = last_message_id`. Last fetched message ID is written after each channel. If deleted, next run re-processes the entire guild from scratch.
+3. **Chunker**: `chunk_messages()` groups messages into segments by time gap (30 min) or count (30 messages). Each segment becomes one "chunk" with a text blob. No per-channel chunk cap before this pass.
+4. **Embedder**: `generate_embeddings()` calls local `sentence-transformers/all-MiniLM-L6-v2` (384-dim). No API calls. Runs in CPU batches of 32 via `SentenceTransformer.encode()`.
+5. **Writer**: `store_chunks()` inserts into `chunks`, `chunk_messages`, and `chunk_embeddings` (vec0) tables. No `UNIQUE` constraint on message IDs -- duplicate rows possible if same channel re-indexed.
+
+#### Runaway Root Cause (confirmed)
+- The Apr 15 and Apr 16 (pre-commit) runs fetched unusual-whales-alert-relay (1482611303708360835) because `b7a588f` was not committed until 2026-04-16 16:01. All runs before that timestamp (including Apr 15 00:00 which fetched 429,899 messages in ~7h) ran old code with no blocklist.
+- The blocklist is now correctly wired and verified via py_compile. First run with the fix: 18:00 tonight.
+
+#### Bugs Found (by number, status after Pass L)
+
+**BUG-L-01 (HIGH, FIXED): Concurrency overlap -- cron_discord_embed.sh had no lock**
+- Confirmed by log evidence: Apr 15 00:00 run started and lasted 7h24m. The 06:00 launchd tick fired while 00:00 was still running. Both processes wrote to `discord-embed-state.json` concurrently via `write_text()` (non-atomic). This is the "runaway again" scenario: a slow initial backfill + overlapping run = state corruption risk.
+- Fix: Added `exec 200>/tmp/discord_embed_pipeline.lock; flock -n 200 || exit 0` in cron script. fd-based flock releases automatically on process death (no stale lockfile). Overlapping run logs "SKIP:" and exits 0.
+- Commit: `c34b22f`
+
+**BUG-L-02 (HIGH, FIXED): No per-channel message fetch cap**
+- `fetch_all_messages()` accumulated all messages into a list with no upper bound. Any channel with a large backlog consumed the entire run (and could overflow into the next via overlap). Apr 15: 429,899 messages fetched from one channel.
+- Fix: Added `MAX_MESSAGES_PER_CHANNEL = 50_000` constant. `fetch_all_messages()` breaks at the cap and logs "capped at 50000; resumes next run". State is saved from the last fetched message ID, so the next run resumes naturally -- no messages are permanently skipped.
+- Dry-run logic test: 50,000 fetched from 429,899-message channel -> 1,666 max chunks. PASS.
+- Commit: `c34b22f`
+
+**BUG-L-03 (MEDIUM, FIXED): Blocklist fails-open on missing or malformed JSON**
+- `load_blocklist()` returned `set()` silently if `BLOCKLIST_FILE` did not exist. A rename, accidental delete, or bad deploy would silently allow all blocked channels to be re-indexed.
+- Fix: `sys.exit(1)` on missing file; `sys.exit(1)` on `json.JSONDecodeError`. Both print a FATAL message to stdout (captured by cron log).
+- Commit: `c34b22f`
+
+**BUG-L-04 (LOW, FIXED, Task #12): Blocked channel checkpoint in state file**
+- `discord-embed-state.json` contained a stale `last_message_id` for channel `1482611303708360835` (unusual-whales-alert-relay). Harmless while blocklist is active, but stale dead weight.
+- Fix: Stripped entry via one-time Python script; state file now has 67 entries (was 68).
+- Commit: `0a985b6`
+
+**BUG-L-05 (LOW, STALE GUARD): Cron script checked OPENAI_API_KEY (pipeline uses local model)**
+- `cron_discord_embed.sh` had `if [[ -z "$OPENAI_API_KEY" ]]; then exit 1; fi`. Pipeline has used local sentence-transformers since Pass 3 (commit `7cca483`). Guard was stale. Key is present in `.env.local` so it was not blocking runs, but it was misleading.
+- Fix: Removed the guard, replaced with a comment. Bundled with BUG-L-01 commit.
+- Commit: `c34b22f`
+
+**BUG-L-06 (INFORMATIONAL, NOT FIXED): No unique constraint on chunk_messages**
+- `chunk_messages` has no `UNIQUE(message_id)` or `UNIQUE(channel_id, message_id)`. A re-run that resumes from a message ID could potentially create duplicate chunks if state is rolled back. Currently 5 duplicate message_id entries confirmed in DB (3,691 total chunks -- minimal scale). State logic saves `messages[-1]["id"]` atomically per channel, making genuine duplicates unlikely under normal operation.
+- Decision: Not fixed this pass. Adding a UNIQUE constraint requires a schema migration and existing 5 duplicates would need resolution. Deferred pending any future schema refactor.
+
+**BUG-L-07 (INFORMATIONAL, NOT FIXED): Rate-limit 429 retried forever**
+- `discord_request()` has `while True:` with `continue` on 429 and no maximum retry count. Theoretical infinite loop if Discord rate-limits permanently.
+- No evidence of this occurring across 8 days of logs. Deferred -- low priority.
+
+**BUG-L-08 (INFORMATIONAL, NOT FIXED): Full channel history loaded into RAM before chunking**
+- `fetch_all_messages()` builds `all_messages[]` in memory. At 50,000 messages * ~500 bytes = ~25MB peak RAM per channel. With the per-channel cap (BUG-L-02 fix), OOM risk is contained. A streaming chunker would be cleaner but is unnecessary given the cap.
+
+#### Commits
+- `c34b22f` -- clawd -- `fix(discord-embed): harden pipeline against runaway and overlap bugs` -- BUG-L-01, L-02, L-03, L-05
+- `0a985b6` -- clawd -- `chore(discord-embed): strip blocked channel from state file (Task #12)` -- BUG-L-04
+
+#### Deferred
+- BUG-L-06 (idempotency / unique constraint): schema migration risk, 5 dupes at 3,691 chunks is noise
+- BUG-L-07 (429 infinite retry): no evidence of occurrence
+- BUG-L-08 (in-memory fetch before chunking): subsumed by BUG-L-02 cap
+
+#### Status
+- BUG-L-01: FIXED
+- BUG-L-02: FIXED
+- BUG-L-03: FIXED
+- BUG-L-04: FIXED
+- BUG-L-05: FIXED
+- BUG-L-06: DEFERRED
+- BUG-L-07: DEFERRED
+- BUG-L-08: DEFERRED
+
+### Pass N -- 2026-04-16
+- **Mission**: Adversarial audit of `src/unified_vector_store.py` -- performance, correctness, and maintenance gaps. Prior passes B1 (path-keyed singleton) and Pass 5 (env-var default) locked. This pass hunts: VACUUM/compaction, FTS5 optimize, write batching, read-path N+1 queries, missing indexes, schema migration safety, chunk dedup gaps, WAL checkpoint, concurrent-writer safety, and BUG-A5-06 f-string SQL.
+- **File audited**: `src/unified_vector_store.py` (1788 LOC post-fix)
+- **DB**: `~/.cortex/data/cortex-vectors.db`
+
+#### DB Stats at Audit Start
+
+| Metric | Value |
+|--------|-------|
+| DB size | 51 MB |
+| WAL size | 5.3 MB |
+| Total documents | 18,875 |
+| observations | 12,926 |
+| knowledge | 5,913 |
+| conversations | 16 |
+| With embeddings | 18,875 (100%) |
+| Free pages | 7 / 13,042 (~0.05% fragmentation) |
+| Auto-vacuum | NONE (0) |
+| WAL autocheckpoint | 1000 pages |
+
+**Pass X backfill confirmed idle.** No backfill_embeddings.py process running.
+
+#### Query Plan Report
+
+| Query | Plan |
+|-------|------|
+| FTS search with collection filter | `SCAN fts VIRTUAL TABLE + SEARCH d USING INTEGER PRIMARY KEY` -- correct |
+| Document lookup by id | `SEARCH d USING INDEX sqlite_autoindex_documents_1 (id=?)` -- correct |
+| `ORDER BY created_at DESC` | `SCAN documents USING INDEX idx_docs_created` -- correct |
+| `WHERE has_embedding = 0` (pre-fix) | `SCAN documents` -- full table scan on every backfill loop iteration |
+| `WHERE has_embedding = 0` (post-fix) | `SCAN documents USING COVERING INDEX idx_docs_unembedded` -- partial index used |
+| find_duplicates (GROUP BY text_hash) | `SEARCH documents USING COVERING INDEX idx_docs_text_hash` -- correct |
+| sync_from_observations (collection='observations') | `SEARCH documents USING INDEX idx_docs_collection` -- correct |
+
+#### Bug Inventory
+
+| ID | Severity | Description | Status |
+|----|----------|-------------|--------|
+| N-1 | HIGH | `add_batch()` called `_upsert()` per document, which called `embed_document()` per document -- N separate `model.encode()` calls and N separate commits. The batch embedding method `_get_embeddings_batch()` existed but was not used. | FIXED |
+| N-2 | MEDIUM | `vector_search()` with `collection` filter: after fetching `limit*3` vec results, issued one `SELECT ... WHERE id = ? AND collection = ?` per row -- N+1 SQLite round-trips. | FIXED |
+| N-3 | MEDIUM | Missing index on `has_embedding=0`. `backfill_embeddings()` and `embed_pending()` call `WHERE has_embedding=0 LIMIT ?` in a loop. Without the index, SQLite performed a full scan (18K+ rows) on every iteration -- O(n^2) during backfill. | FIXED |
+| N-4 | MEDIUM | `close()` did not evict the instance from `_store_instances`. After B1's path-keyed singleton, a subsequent `get_vector_store()` call returned the closed (dead) instance. No WAL checkpoint issued before close. | FIXED |
+| N-5 | LOW | Chunk-level dedup gap: the dedup check in `_upsert()` fires only before the single-document path. Multi-chunk docs (text > 1000 chars) bypass it entirely -- same content via two different `source_id`s gets chunked and stored twice. | DEFERRED (design decision -- chunk IDs differ by parent, dedup semantics unclear) |
+| N-6 | INFORMATIONAL | VACUUM / FTS optimize not called automatically. `vacuum()` method exists and is correct, but nothing schedules it. | DEFERRED (propose as cron maintenance job -- not safe to run inline per hard limits) |
+
+#### Non-Bugs Verified
+
+- **BUG-A5-06 (f-string SQL injection)**: Scanned all f-strings in the file. The three f-string SQL calls are: (1) `IN ({placeholders})` built from `","join("?" for _ in ...)` -- all values are parameterized; (2) vec0 CREATE statement uses `EMBEDDING_DIM` (an `int` from a dict lookup, not user input); (3) `add_batch` IN query same pattern. No interpolated user data anywhere. Clean.
+- **WAL bloat**: 5.3 MB WAL at 1000-page autocheckpoint threshold (4096 bytes/page = 4.1 MB). Near but not stuck. Active writing from Pass X backfill explains the level.
+- **Fragmentation**: 7 free pages out of 13,042 (~0.05%). No VACUUM need now.
+- **Concurrent-writer safety**: Worker writes via `memory_worker.py`. MCP reads via `mcp_memory_server.py`. Ingest scripts write. SQLite WAL mode allows 1 concurrent writer -- `PRAGMA busy_timeout=5000` provides 5s wait before error. No unguarded multi-process write patterns visible in this file. Acceptable.
+- **Connection pool / stale handles**: Single `self.conn` per instance. `_ensure_connection()` detects dead handles and reconnects. B1's path-keyed singleton means no accidental cross-path sharing. Clean.
+- **Schema re-run safety**: All `CREATE TABLE IF NOT EXISTS` and `CREATE INDEX IF NOT EXISTS` -- idempotent. Migration (add `text_hash` column) guarded with try/except. Safe.
+- **FTS5 `documents_fts` integrity**: `content=documents` + triggers on INSERT/UPDATE/DELETE. Correct. `reindex_fts()` method available for recovery.
+
+#### Fixes Applied
+
+**Fix N-1 -- `add_batch` batch embedding** (lines 629-699)
+- Old: called `self._upsert(full_id, ...)` per doc, each triggering `embed_document()` = N `model.encode()` + N commits.
+- New: inserts all docs with dedup in a loop, commits once, then calls `_get_embeddings_batch()` once for all inserted IDs.
+- API surface unchanged.
+
+**Fix N-2 -- `vector_search` N+1 query** (lines ~1113-1175)
+- Old: per-row `SELECT ... WHERE id = ? AND collection = ?` after vec results.
+- New: one `WHERE id IN (?,?,...)` query; results assembled from a dict keyed by doc_id.
+- Both branches (with and without collection filter) fixed.
+
+**Fix N-3 -- partial index `idx_docs_unembedded`** (lines ~302-315)
+- Added `CREATE INDEX IF NOT EXISTS idx_docs_unembedded ON documents(id) WHERE has_embedding = 0` to `_init_schema()`.
+- EXPLAIN confirms: `SCAN documents USING COVERING INDEX idx_docs_unembedded`.
+- Applied to live DB on first reconnect.
+
+**Fix N-4 -- `close()` singleton eviction + WAL checkpoint** (lines ~1605-1630)
+- Added `PRAGMA wal_checkpoint(TRUNCATE)` before close.
+- Added `_store_instances.pop(self.db_path.resolve(), None)` under `_store_lock`.
+- `self.conn = None` after close to prevent accidental double-use.
+
+#### Commits
+- `a12041d` -- llm-cortex -- `fix(vector-store): Pass N -- batch embed, N+1 query, partial index, close eviction`
+
+#### Tests Added (3 new in `tests/test_unified_vector_store.py`)
+- `test_close_evicts_from_singleton_registry` -- Fix N-4
+- `test_add_batch_uses_single_embed_call` -- Fix N-1 (mock asserts exactly 1 batch call for 3 docs)
+- `test_add_batch_deduplicates_identical_texts` -- Fix N-1 dedup behavior
+
+All 6 tests pass.
+
+#### Deferrals
+- **N-5 (chunk dedup)**: `_upsert` dedup skips multi-chunk path. Fix requires deciding whether chunks with the same parent should be treated as duplicates of other-source chunks. Design call needed.
+- **N-6 (VACUUM / FTS optimize schedule)**: `vacuum()` method is correct. Needs a cron job or maintenance script. Not run inline per hard limits.
