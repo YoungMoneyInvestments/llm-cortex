@@ -1427,3 +1427,123 @@ Worker restart confirmed < 5 seconds downtime (launchctl kickstart).
 - `mcp_memory_server_sse.py` (SSE HTTP transport on port 37781): Also in-process via `handle_tool_call()`, no HTTP changes needed.
 - Generated key file `~/.cortex/data/.worker_api_key` is readable only by owner (chmod 600). Hook scripts read key from env, not file — no hook changes needed since Cameron's plist already exports the key.
 - `scripts/context_loader.py` key file fallback: if env var is missing and file doesn't exist, the HTTP call will 401 and return `"(cortex worker unreachable)"` gracefully — acceptable fail-open for context_loader (non-critical path).
+- `scripts/context_loader.py` key file fallback: if env var is missing and file doesn't exist, the HTTP call will 401 and return `"(cortex worker unreachable)"` gracefully — acceptable fail-open for context_loader (non-critical path).
+
+---
+
+## Pass R — Config / Env-Var Consistency Audit (2026-04-16)
+
+**Goal:** Find silent config drift: env vars with different defaults in different files, dead defaults, required-but-silent vars, stale references.
+
+### Env Var Inventory
+
+| Var | Files | Default(s) | Purpose |
+|-----|-------|-----------|---------|
+| `CORTEX_DATA_DIR` | memory_worker, memory_retriever, credential_manager, unified_vector_store (all `~/.cortex/data`); air/config.py (was `~/clawd/data` — FIXED) | `~/.cortex/data` (canonical) | Root for all runtime DBs |
+| `CORTEX_WORKSPACE` | context_loader, working_memory, hybrid_search, query_knowledge_graph | `~/cortex` (dead default — path does not exist on fresh install) | Flat-file memory root |
+| `CORTEX_DB_PATH` | air/config.py | `$CORTEX_DATA_DIR/cortex-observations.db` | Override for AIR's observations DB path |
+| `CORTEX_GRAPH_FILE` | query_knowledge_graph | `$CORTEX_WORKSPACE/.planning/knowledge-graph.json` | Override for knowledge-graph JSON path |
+| `CORTEX_ENV_FILE` | unified_vector_store | none (optional) | Path to env file containing OPENAI_API_KEY |
+| `CORTEX_WORKER_URL` | context_loader | `http://localhost:37778` | Memory worker HTTP endpoint |
+| `CORTEX_WORKER_API_KEY` | memory_worker, context_loader | env→key-file→generate (worker); env→key-file→empty (loader) | Worker auth — Pass Z active |
+| `CORTEX_SUBSCRIPTION_TIER` | memory_worker | `DEFAULT_TIER.value` (free) | Default tier for new observations |
+| `CORTEX_SERVER_TIER_CAP` | memory_worker, mcp_memory_server | `CLAUDE_CODEMAX` | Server-side tier ceiling |
+| `CORTEX_CURRENT_TIER` | mcp_memory_server | fallback to `CORTEX_SERVER_TIER_CAP` | MCP feature gating tier |
+| `CORTEX_EMBEDDING_PROVIDER` | unified_vector_store, backfill_embeddings | `local` | Embedding backend |
+| `CORTEX_NER_ENABLED` | memory_worker | `true` | Toggle NER pipeline |
+| `CORTEX_AGENT_NAME` | mcp_memory_server (`"main"`), mcp_memory_server_sse (`"codex"`) | intentionally different per transport | Agent identity tag on observations |
+| `CORTEX_PROJECT_DIR` | context_loader | `os.getcwd()` | Override project name for cortex recall |
+| `OPENAI_API_KEY` | unified_vector_store | none (required if provider=openai) | OpenAI embedding API key |
+| `ANTHROPIC_API_KEY` | air/config.py | none (required if AIR_CLASSIFIER_MODE=api) | Anthropic API key for AIR classifier |
+| `AIR_CLASSIFIER_MODE` | air/config.py | `local` | AIR classifier backend |
+| `AIR_DB_PATH` | air/config.py | `$CORTEX_DATA_DIR/air_routes.db` | AIR routing rules DB |
+| `AIR_CONFIDENCE_INIT` | air/config.py | `0.5` | Initial confidence score |
+| `AIR_CONFIDENCE_REWARD` | air/config.py | `0.1` | Confidence reward per correct route |
+| `AIR_CONFIDENCE_PENALTY` | air/config.py | `0.2` | Confidence penalty per miss |
+| `AIR_CONFIDENCE_DECAY_RATE` | air/config.py | `0.95` | Per-cycle confidence decay |
+| `AIR_PRUNE_THRESHOLD` | air/config.py | `0.2` | Routes below this are pruned |
+| `AIR_INJECT_THRESHOLD_HIGH` | air/config.py | `0.7` | High-confidence injection threshold |
+| `AIR_INJECT_THRESHOLD_LOW` | air/config.py | `0.5` | Low-confidence injection threshold |
+| `AIR_COLD_START_CYCLES` | air/config.py | `10` | Suppress routing until N cycles seen |
+| `AIR_CROSS_PROJECT_THRESHOLD` | air/config.py | `0.9` | Threshold for cross-project routing |
+| `STORAGE_VPS_SSH_HOST` | conversation-memory/config.py | `104.237.203.117` | Storage VPS public IP |
+| `STORAGE_VPS_SSH_PORT` | conversation-memory/config.py | `47822` | Storage VPS SSH port |
+| `STORAGE_VPS_SSH_USER` | conversation-memory/config.py | `Administrator` | Storage VPS SSH user |
+| `STORAGE_VPS_DB_NAME` | conversation-memory/config.py | `rag_memory` | Storage VPS PostgreSQL DB name |
+| `STORAGE_VPS_DB_USER` | conversation-memory/config.py | `postgres` | Storage VPS DB user |
+| `STORAGE_VPS_PSQL_PATH` | conversation-memory/config.py | `C:\Program Files\PostgreSQL\17\bin\psql.exe` | Remote psql binary path |
+| `NT8_HOST` | smart_backfill.py | `100.107.193.101` | NinjaTrader host |
+| `NT8_PORT` | smart_backfill.py | `49999` | NinjaTrader socket port |
+| `POSTGRES_HOST` | smart_backfill.py | `100.67.112.3` | PostgreSQL host |
+| `POSTGRES_PORT` | smart_backfill.py | `5432` | PostgreSQL port |
+| `POSTGRES_DB` | smart_backfill.py | `tradingcore` | PostgreSQL database |
+| `POSTGRES_USER` | smart_backfill.py | `trading_user` | PostgreSQL user |
+| `POSTGRES_PASSWORD` | smart_backfill.py | `""` (empty — REQUIRED to set) | PostgreSQL password |
+
+Total: 37 env vars inventoried across both repos.
+
+### Config File Inventory
+
+| File | Purpose |
+|------|---------|
+| `~/clawd/.env.local` | Live runtime secrets (loaded by `_load_env()` in mcp_memory_server.py at startup) |
+| `~/clawd/config/model-tiers.json` | Model tier definitions for OpenClaw |
+| `~/clawd/config/ibkr.json` | IBKR connection config |
+| `~/clawd/config/mcporter.json` | MCPorter config |
+| `~/clawd/config/alert-flags.json` | Alert flag settings |
+| `~/clawd/config/discord-critical-channels.json` | Discord channel IDs |
+| `~/clawd/config/discord-embed-blocklist.json` | Discord embed blocklist |
+| `~/clawd/config/paperclip-ready.json` | Paperclip readiness flags |
+| `conversation-memory/package.json` | Node package manifest |
+
+No config/ directory exists in llm-cortex — all config is via env vars.
+
+### Drift Report
+
+**1. CORTEX_DATA_DIR — resolved (1 file)**
+- `src/air/config.py` defaulted to `~/clawd/data` — all other modules use `~/.cortex/data`
+- Fix: changed air/config.py default to `~/.cortex/data`
+
+**2. CORTEX_WORKSPACE — dead default (4 files, documented)**
+- All 4 files default to `~/cortex/` which does not exist on a fresh install
+- Not changed (backward-compatible: creating the dir is a one-time operator step)
+- Documented prominently in `.env.example`
+
+**3. CORTEX_AGENT_NAME — intentional mismatch (documented)**
+- `mcp_memory_server.py` defaults to `"main"` (stdio transport, interactive sessions)
+- `mcp_memory_server_sse.py` defaults to `"codex"` (SSE transport, Codex/Cursor sessions)
+- Intentional: different transports serve different agents. Documented in `.env.example`.
+
+**4. CAMIROUTER_URL — no stale references found**
+- Searched all Python files in llm-cortex. Zero hits. CamiRouter cleanup is complete.
+
+**5. CORTEX_WORKER_API_KEY — deferred to Pass Z**
+- Worker and context_loader have different fallback strategies; Pass Z is actively wiring this.
+- Documented in `.env.example`. Not modified.
+
+**6. POSTGRES_PASSWORD — required-but-silent**
+- smart_backfill.py defaults to empty string. psycopg2 will fail at connection time with a clear error.
+- Not a silent failure; documented in `.env.example` as requiring operator action.
+
+### Changes Made
+
+**`src/air/config.py`:**
+- Line 103: changed `CORTEX_DATA_DIR` default from `Path.home() / "clawd" / "data"` to `Path.home() / ".cortex" / "data"` — aligns with all other modules.
+
+**`.gitignore`:**
+- Added `!.env.example` exception so the new example file can be committed despite `.env.*` rule.
+
+**`.env.example` (new file):**
+- 37 env vars documented with defaults, purposes, and cross-references.
+- Grouped by: data paths, worker, subscription/tier, embeddings, features/NER, agent identity, AIR, Storage VPS, trading backfill.
+- 103 lines.
+
+### Test Results
+
+Baseline (pre-change): 144 passed, 1 failed (pre-existing: test_memory_recall_rate, sqlite_vec extension missing).
+Post-change: 144 passed, 1 failed (same pre-existing failure — no regression).
+
+### Commits
+
+See below for SHAs after commit.
+
