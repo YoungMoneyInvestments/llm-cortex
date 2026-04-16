@@ -288,3 +288,54 @@
 
 - **Tests**: `pytest tests/` (74 tests) — 74 passed, 0 failed. Same result as pre-fix baseline. No regression.
 - **Commit**: `8d71fa9` in llm-cortex repo (`fix(memory_retriever): four bugs from adversarial pass A5`)
+
+### Pass 9 — 2026-04-16
+- **Subsystem**: Knowledge-base ingest — `~/clawd/db/knowledge-base.db` -> `~/.cortex/data/cortex-vectors.db`
+- **Pass 8 status**: `scripts/ingest_strategy_kb.py` exists as untracked (file-based KB ingester) but never committed. Pass 9 proceeded independently with a DB-source adapter.
+
+**Schema audit — knowledge-base.db:**
+- 8 tables total. Row counts:
+  - `sources`: 0, `chunks`: 0, `strategies`: 0, `source_links`: 0
+  - `content_metrics`: 0, `topic_performance`: 0 (metadata-only, all empty)
+  - `twitter_mentions`: 9 (Cameron's @KingCam23 Twitter replies)
+  - `content_posts`: 16 (Cameron's published trading content on Twitter)
+- **Critical finding**: 6 of 8 tables are empty. The mission brief implied rich content across all tables. Truth: only 25 rows total are embed-worthy. Reported accurately, not papered over.
+
+**Content samples (embed-worthy tables):**
+- `content_posts`: Trading education tweets — backtesting, position sizing, regime detection, risk management. Post 12 is an exact duplicate of post 11 (same tweet posted twice on different dates).
+- `twitter_mentions`: Replies to @KingCam23 from handles: grok, thesambrunson, xrpgains, RyanStadler79, SolaFolda, spotgamma, jworthy, NevrEnoughX.
+
+**Skipped columns**: None — no PII (email, phone, API keys) found in either table after regex scan.
+
+**Ingester created**: `scripts/ingest_knowledge_base.py` — DB-source adapter (~130 lines).
+- Reads `knowledge-base.db` read-only via `file:?mode=ro` URI
+- Calls `store.add_knowledge(f"kb-{table}-{pk}", text, metadata)` for each eligible row
+- Tags stored as `metadata["tags"]` CSV matching `cami_memory_save` convention
+- `content_posts` tag: `"knowledge-base,content_posts"`
+- `twitter_mentions` tag: `"knowledge-base,twitter_mentions,twitter,{handle}"`
+- Guard: refuses to write if `DB_PATH` resolves to retired `~/clawd/data/cortex-vectors.db`
+
+**Backup**: `~/.cortex/data/cortex-vectors.db.bak-pass9` (pre-ingest; pass5 backup preserved at `.bak-pass5-canonical`)
+
+**Dry-run estimate**: 16 content_posts + 9 twitter_mentions = 25 docs
+
+**Real run results**:
+- DB rows before: 17,792 | after: 17,816 | delta: 24
+- Delta=24 (not 25): content_posts 11 and 12 share identical tweet text; `_upsert` text_hash dedup correctly skipped post 12 as a same-collection duplicate. Expected and correct.
+- All 24 unique docs confirmed present in cortex (`kg-kb-content_posts-{1-16 except 12}`, `kg-kb-twitter_mentions-{1-9}`)
+
+**Idempotency re-run**: second pass delta = 0. PASS.
+
+**Smoke test** (FTS, sqlite_vec not installed in this env):
+- `"backtesting overfitting"` -> kg-kb-content_posts-1 in top-5 (KB hit)
+- `"position sizing stops"` -> kg-kb-content_posts-13 in top-5 (KB hit)
+- `"regime detection trending"` -> kg-kb-content_posts-11 as top result (KB hit, top-1)
+
+**Tests**: `pytest tests/` — 77 passed, 1 pre-existing failure (`test_memory_recall_rate`, sqlite_vec not installed, unrelated). No regressions.
+
+**Commit**: `4a3df45` in llm-cortex repo (`feat(cortex): ingest clawd knowledge-base.db into knowledge layer`)
+
+**Deferrals**:
+- Empty tables (sources, chunks, strategies, source_links, content_metrics, topic_performance): no data to ingest today; ingester can be extended per-table when data is added.
+- `ingest_strategy_kb.py` (Pass 8 untracked): independent scope, not ingested in Pass 9.
+- `test_memory_recall_rate` failure: pre-existing, requires sqlite_vec installation for vector search quality, out of scope.
