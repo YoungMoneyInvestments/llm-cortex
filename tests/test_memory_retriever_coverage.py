@@ -169,6 +169,45 @@ class TestNormalizeScores(unittest.TestCase):
     def test_empty_results_no_crash(self):
         self.r._normalize_scores([])  # must not raise
 
+    def test_vector_store_positive_hybrid_scores_not_inverted(self):
+        """Hybrid search returns positive scores (0-1, higher=better) tagged with
+        origin='vector_store'. _normalize_scores must NOT invert them.
+        After normalization, good matches (high hybrid_score) must remain > bad matches.
+
+        This is a regression test for the score-inversion bug: the BM25-inversion
+        formula (max_s - raw) / (max_s - min_s) was unconditionally applied to
+        vector_store results, flipping rankings so best match scored 0.0 and
+        worst match scored 1.0.
+        """
+        results = [
+            {"origin": "vector_store", "score": 0.95},  # best match
+            {"origin": "vector_store", "score": 0.85},  # good match
+            {"origin": "vector_store", "score": 0.75},  # moderate match
+            {"origin": "vector_store", "score": 0.25},  # bad match
+            {"origin": "vector_store", "score": 0.15},  # worse match
+            {"origin": "vector_store", "score": 0.05},  # worst match
+        ]
+        self.r._normalize_scores(results)
+        scores = [r["score"] for r in results]
+
+        # After normalization, the originally-best match (0.95) must still be
+        # the highest scorer, and the originally-worst (0.05) must be the lowest.
+        # The bug inverted this: best became 0.0, worst became 1.0.
+        self.assertGreater(
+            scores[0], scores[5],
+            f"Best match (was 0.95) score {scores[0]:.3f} must be > "
+            f"worst match (was 0.05) score {scores[5]:.3f}. "
+            "Inversion bug: positive hybrid scores must NOT be BM25-inverted."
+        )
+        self.assertEqual(
+            max(scores), scores[0],
+            "Highest input score must produce highest normalized score."
+        )
+        self.assertEqual(
+            min(scores), scores[5],
+            "Lowest input score must produce lowest normalized score."
+        )
+
 
 class TestDeduplicateResults(unittest.TestCase):
     """Tests for _deduplicate_results() — ID-based and text-based dedup."""
