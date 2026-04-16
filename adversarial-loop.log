@@ -968,4 +968,108 @@ All adapters use `vec_distance_cosine(e.embedding, ?) ASC` (smaller = closer). D
 - `3566fbf` — `fix(ner): tighten RE_GITHUB_REPO and @mention classification (Pass H)`
 - `ae9f0d3` — `chore(ner): reclassify @mention false-positive entities in knowledge graph (Pass H)`
 
+---
+
+## Pass J — conversation-memory server.py adversarial audit
+**Date**: 2026-04-16
+**Target**: `~/clawd/mcp-servers/conversation-memory/server.py` (690 lines post-fix)
+**Repo**: clawd
+**Auditor scope**: tool schema consistency, input validation, date/time args, error mapping, identity-resolver coupling, singleton state, search_all aggregation, tool-name conflicts, stdio framing
+
+### Tool Surface Inventory
+
+| Tool name | Handler | Required args | Optional args | Return shape |
+|-----------|---------|---------------|---------------|-------------|
+| `search_person_conversations` | `search_person_conversations()` | person, query | limit (int, default 10, max 50), platform (enum) | person{}, query, count, results[], platform_errors[]? |
+| `get_person_recent` | `get_person_recent()` | person | limit (int, default 10, max 50), platform (enum) | person{}, count, results[], platform_errors[]? |
+| `search_all_conversations` | `search_all_conversations()` | query | limit (int, default 10, max 50), platform (enum) | query, platforms_searched[], count, results[], platform_errors[]? |
+| `list_frequent_contacts` | `list_frequent_contacts()` | (none) | platform (enum), limit (int, default 20, max 50) | platform_filter, count, contacts[] |
+
+Schema matches handler signatures on all four tools. No required arg with missing default.
+
+### Bugs Found and Fixed
+
+**B1 — CONFIRMED BUG (P1): Spurious response sent to JSON-RPC notifications**
+- Location: `handle_request()`, formerly lines 502-506
+- Symptom: Any notification other than `notifications/initialized` (e.g. `notifications/cancelled`) fell through to the catch-all error return. A response was then sent with `id: null`, which violates JSON-RPC 2.0 and can cause MCP client hangs.
+- Fix: Replaced method-name guard with canonical `"id" not in request` check per JSON-RPC 2.0 spec.
+- Commit: `3a678f0`
+
+**B2 — CONFIRMED BUG (P1): Missing per-platform error isolation**
+- Location: `search_person_conversations()`, `get_person_recent()`, `search_all_conversations()`
+- Symptom: A single platform failure (e.g. `FACEBOOK_DB` missing → `FileNotFoundError` from `.conn`) aborted the entire tool call via the outer `try/except` in `handle_request()`, discarding results already collected from healthy platforms. iMessage+Discord results were lost whenever FB/IG DB was absent.
+- Fix: Wrapped each platform block in its own try/except. Errors logged to stderr. Failed platforms reported in `platform_errors` list. `platforms_searched` excludes failed platforms.
+- Commit: `ce2ad46`
+
+**B3 — CONFIRMED BUG (P2): list_frequent_contacts limit unbounded**
+- Location: `list_frequent_contacts()` handler + TOOLS schema
+- Symptom: No `min(limit, MAX_LIMIT)` clamp in handler; no `maximum` in JSON schema. All other tools clamp and declare maximum. Allowed caller to request arbitrarily large result sets from identity graph iteration.
+- Fix: Added `limit = min(limit, MAX_LIMIT)` to handler; added `"maximum": 50` to schema.
+- Commit: `ce2ad46`
+
+### Checked, No Issue Found
+
+- **FTS5 injection**: No FTS5 MATCH queries in this server. LIKE injection fixed in Pass E. N/A.
+- **Date/time args**: No tools accept date/time parameters. N/A.
+- **Tool-name conflicts**: Zero `cami_*` names in server.py. No collision with llm-cortex tools.
+- **Stdio framing**: `_send_message` writes to `sys.stdout.buffer` with Content-Length framing. All print() calls inside `run_tests()` (CLI mode only). Adapters write to stderr. No stdout pollution.
+- **Singleton thread-safety**: stdio MCP is single-threaded. Singletons safe.
+- **search_all aggregation**: Each platform fetches up to `limit` candidates before global merge_results(). No dedup needed — chunk_id namespaces are independent per platform. Result quality: more candidates → better top-K. Correct behavior.
+- **Identity-resolver coupling**: server.py calls `resolver.resolve()` which already uses phone/email fast-path (Pass D1). No change needed.
+
+### Deferrals
+
+None — all items resolved or explicitly non-applicable.
+
+### Commits (clawd repo)
+- `3a678f0` — `fix(conversation-memory): suppress responses to JSON-RPC notifications`
+- `ce2ad46` — `fix(conversation-memory): isolate per-platform errors and clamp list_frequent_contacts limit`
+
+### Verification
+- `python -m py_compile server.py` — CLEAN
+- `pytest tests/test_server_stdio.py` — **2 passed**
+
 **Status**: RE_GITHUB_REPO and @mention classification CLOSED. RE_PEOPLE_CONTEXT over-extraction DEFERRED (future pass). KNOWN_SYSTEMS Hermes addition DONE.
+
+### Pass K — 2026-04-16
+- **Mission**: Adversarial audit of the SessionStart bootstrap path (`context_loader.py`).
+- **Script under audit**: `/Users/cameronbennion/Projects/llm-cortex/scripts/context_loader.py`
+- **Hook invocation**: `/Users/cameronbennion/clawd/venv/bin/python3 .../context_loader.py --hours 48` (timeout: 10000ms)
+- **Baseline**: 1,485 bytes / 12 lines / 5.1s wall time (with busy worker)
+
+#### External calls
+| Call | Target | On failure |
+|------|--------|-----------|
+| SQLite read | `~/.cortex/data/cortex-observations.db` profile table | Returns "" (silent) |
+| HTTP POST | `localhost:37778/api/memory/search` (cortex worker) | Was: silent empty; now: "(cortex worker unreachable)" |
+| Filesystem glob | `~/cortex/memory/*.md`, handoffs, working-memory | Silently returns no results (dirs don't exist) |
+| Filesystem read | Obsidian vault `.md` files | Silently returns "" per file |
+
+#### Bug inventory
+
+| ID | Severity | Description | Status |
+|----|----------|-------------|--------|
+| K-1 | HIGH | `brokerbridge-retail-hermes` matched generic `brokerbridge` fallback, routing to BrokerBridgeMCP vault instead of BrokerBridge vault. Wrong project context injected every session from `~/Projects/brokerbridge-retail-hermes/`. | FIXED |
+| K-2 | MEDIUM | `cortex_recall()` timeout was 5s — consuming 50% of the 10s hook budget on every session when worker was busy (Pass X backfill). | FIXED |
+| K-3 | LOW | Worker unreachable returned `""` silently — no visible signal to the user. | FIXED |
+| K-4 | DEFERRAL | `CORTEX_WORKSPACE` defaults to `~/cortex/` which doesn't exist. All of `MEMORY_DIR`, `HANDOFF_DIR`, `WORKING_MEMORY_DIR` silently find zero files. The clawd fork hardcodes `/Users/cameronbennion/clawd`. Working memory, handoffs, and recent-file detection are dead for the current deployment. Design question: unify workspace path. | DEFERRED |
+
+#### Non-bugs verified
+- **TZ/DST**: `datetime.now()` and `datetime.fromtimestamp()` are both naive-local — comparison is consistent. No off-by-hour risk.
+- **`--hours 48` bound**: Correctly computed as `datetime.now() - timedelta(hours=48)`. Both sides use local time.
+- **Output size**: Bounded — profile (~700 bytes), working memory (zero, dir absent), handoffs (zero), obsidian (hard-capped: 1500+800 chars per file, max ~3.2KB). Max worst-case ~5KB total. Fine.
+- **Concurrency**: `~/cortex/.planning/working-memory/` absent, `_load_working_memory` early-returns `None`. No writes, no race.
+- **BUG-C1-06 memcells**: Script does NOT query memcells. Not applicable.
+- **Pass E iMessage timestamps**: Script does NOT query iMessage data. Not applicable.
+- **CamiRouter/OpenAI refs**: None found in script. Clean.
+
+#### Verification
+- Vault routing: `brokerbridge-retail-hermes` now returns `## Obsidian Vault — BrokerBridge` (correct). MCP and bare paths unaffected.
+- Timeout: script wall time reduced from 5.1s to 2.1s with busy worker.
+- Unreachable signal: "(cortex worker unreachable)" visible in output.
+- Syntax: `python3 -m py_compile scripts/context_loader.py` — CLEAN
+
+#### Commit
+- `d66acf1` — `fix(bootstrap): vault routing, timeout, and silent failure (Pass K)`
+
+**Status**: K-1 (vault misdirection), K-2 (timeout), K-3 (silent failure) FIXED. K-4 (dead workspace path) DEFERRED.
