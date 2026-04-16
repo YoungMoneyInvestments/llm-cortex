@@ -2411,3 +2411,70 @@ all sources into one ranked result list.
 **STATUS: COMPLETE -- design doc written and committed. Implementation pending Cameron approval.**
 
 **STATUS: COMPLETE -- inversion bug fixed, 1 regression test added, 263 tests pass, recall 70% (7/10) under hybrid path.**
+
+---
+
+## Pass Y — Idempotent Replace for Strategy-KB Ingesters
+**Date**: 2026-04-16
+**Status**: COMPLETE
+
+### Problem
+When a strategy-kb file's content changes, re-running the ingesters would
+leave stale chunks from the previous (potentially larger) version in cortex-vectors.db
+forever.  Chunk IDs are `{stable-path-doc-id}-chunk-{N}` -- if a file shrinks
+from 8 chunks to 5, chunks 5-7 are never deleted (they have no ON CONFLICT key
+to trigger the existing upsert).
+
+### Root Cause Clarification
+The task brief described "content-hashed IDs" as the cause.  Actually chunk IDs
+ARE path-stable, not content-hashed.  The real mechanism is chunk count drift:
+a file that shrinks leaves old -chunk-N rows with no corresponding content.
+
+### Fix
+1. **`UnifiedVectorStore.delete_document_and_chunks(base_doc_id)`** added to
+   `src/unified_vector_store.py`.  Deletes the exact ID plus any `id LIKE
+   base_doc_id + '-chunk-%'` rows.  Uses LIKE suffix (not prefix) so sibling
+   IDs like `kg-kb-content_posts-1` vs `kg-kb-content_posts-10` are safe.
+   Returns row count deleted.  49 new lines.
+
+2. **`scripts/ingest_strategy_kb.py`** updated: calls
+   `delete_document_and_chunks` before each `add_knowledge`.
+   `force_replace=True` default; `--no-force-replace` flag to opt out.
+   `--dry-run` reports how many existing rows would be cleared.
+
+3. **`scripts/ingest_knowledge_base.py`** updated similarly.  KB doc IDs are
+   stable PKs (`kb-content_posts-{pk}`) so delete-before-insert is safe.
+   `--idempotency-check` now passes `force_replace` through the second pass.
+
+### One-Time Cleanup
+0 orphans found -- all strategy-kb files exist on disk, all kb-* PKs back to
+live rows in knowledge-base.db.  Backup created:
+`~/.cortex/data/cortex-vectors.db.bak-passY`.
+
+### Verification
+- `python3 -m py_compile` all 4 touched files: OK
+- `pytest tests/` baseline 263 -> 268 (5 new tests)
+- `ingest_strategy_kb.py` run twice: Row delta = 0 both times (idempotent)
+- `ingest_knowledge_base.py --idempotency-check`: Second pass delta = 0, PASS
+- Modify-then-re-ingest proof: added dummy line to bad_news_vs_uncertainty.md,
+  old 8 chunks cleared + replaced, then reverted -- chunk count correct after each step
+
+### Source ID Distribution (top 10 at time of fix)
+- obs-*: 13,050
+- kg-manual-*: 5,932
+- kg-strategy-kb--*: 28
+- kg-kb-content_posts-*: 15
+- kg-kb-twitter_mentions-*: 9
+- kg-other-*: 8
+Total docs: 19,042
+
+### Commits
+- `3f85752 feat(unified_vector_store): add delete_document_and_chunks for idempotent replace`
+- `76b2375 fix(ingest_strategy_kb): replace old chunks on re-ingest (Pass Y tech-debt)`
+- `cead07a fix(ingest_knowledge_base): replace old chunks on re-ingest (Pass Y)`
+
+### Files Changed
+- `src/unified_vector_store.py` (+49 lines)
+- `scripts/ingest_strategy_kb.py` (+46 -9 lines)
+- `scripts/ingest_knowledge_base.py` (+32 -5 lines)
+- `tests/test_unified_vector_store.py` (+145 lines, 5 new tests)
