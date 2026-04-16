@@ -290,6 +290,38 @@ class TestStorage:
         rules = storage.get_all_rules()
         assert len(rules) == 1
 
+    def test_list_active_rules_no_project_excludes_project_scoped(self, storage):
+        """list_active_rules(project_id=None) must NOT return project-scoped rules.
+
+        Without this fix, get_injection_stats() would count rules from every
+        project in global stats, inflating high/medium counts.
+        """
+        # Add a global rule (no project_id)
+        storage.add_rule({
+            "trigger_pattern": "global rule",
+            "trigger_hash": "hash_global",
+            "optimal_route": "global route",
+            "confidence": 0.8,
+            "project_id": None,
+        })
+        # Add a project-scoped rule
+        storage.add_rule({
+            "trigger_pattern": "project rule",
+            "trigger_hash": "hash_proj",
+            "optimal_route": "project route",
+            "confidence": 0.8,
+            "project_id": "my-project",
+        })
+
+        # No project context: must return only the global rule
+        global_rules = storage.list_active_rules(project_id=None)
+        assert len(global_rules) == 1
+        assert global_rules[0]["trigger_pattern"] == "global rule"
+
+        # With project context: must return both (project + global)
+        project_rules = storage.list_active_rules(project_id="my-project")
+        assert len(project_rules) == 2
+
 
 # ── Scorer Tests (8) ──────────────────────────────────────────────────
 
