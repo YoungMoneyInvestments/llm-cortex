@@ -1945,7 +1945,7 @@ Created `scripts/smoke_test.py` — re-runnable, 8 scenarios, JSON output to `~/
 | B | Message search (all 4 platforms) | PASS | 2.7s | discord + instagram hit; iMessage/Facebook not available in this env |
 | C | Person recent (cross-platform, no TypeError) | PASS | 27ms | 8 results (instagram), sort=correct, no TypeError regression |
 | D | Authenticated worker endpoint | PASS | 1.3s | auth=200 (3 results), no-auth=401 |
-| E | Session bootstrap | PASS | 89ms | Well under 3s budget; cortex recall present; output 3289 chars |
+| E | Session bootstrap | PASS | 1406ms | Well under 3s budget; cortex recall confirmed (strict "Cortex Recall (" check); output 3992 chars |
 | F | Identity resolver "Cam" | PASS | 17ms | Returns Cameron (not FB junk); phone/email direct-lookup routing correct |
 | G | Knowledge graph Pass Q | PASS | 54ms | 9974 entities, 0 new self-ref aliases post-A2, 0 @mention person junk post-H, retype correct |
 | H | Embedding round-trip | PASS | 3.0s | 384-dim floats confirmed; vector_search returns 3 hits |
@@ -1979,10 +1979,12 @@ Created `scripts/smoke_test.py` — re-runnable, 8 scenarios, JSON output to `~/
 - `search_all_conversations()` returns `source` (not `platform`) on result items, and `platforms_searched` (not `platform_errors`). Smoke test was checking wrong field names. Fixed to use correct field names.
 
 ### Knowledge Graph State (Scenario G)
-- Self-referential aliases: **230** — unchanged from Pass Q baseline. Pass A2 forward-fix is working (no new additions).
+- Self-referential aliases: **0** — Pass W purged all 230 residual rows from the pre-A2 race window; Pass A2 forward-fix prevents new ones.
 - @mention person junk: **0** — Pass H fix is holding.
 - Retype candidates: `github=tool`, `openai=company`, `ninjatrader=system` — all correctly typed from Pass Q retype pass.
 - Connected entities: **5119** — graph has healthy edge coverage.
+
+*(Note: Original Pass V entry logged 230 as the baseline because Pass W had not yet run at time of first smoke test. Corrected on Pass V rerun post-Pass-W.)*
 
 ### Pass Q / Pass U Confirms
 - Pass Q landed at commit `1007a1c` — entity dedup, forward-fix for type downgrades, 5 new tests.
@@ -2005,3 +2007,65 @@ Created `scripts/smoke_test.py` — re-runnable, 8 scenarios, JSON output to `~/
 - **Scenario A latency:** KG load on first call takes ~15s (loads 9974 entities into memory). Not a regression — same as prior passes. Acceptable for MCP server (loaded once per process lifetime).
 
 **STATUS: COMPLETE — 8/8 scenarios pass, 0 regressions.**
+
+---
+
+## Pass W -- Self-Referential Alias Regression Investigation (2026-04-16)
+
+### Mission
+Pass Q found 230 self-referential aliases (`alias = canonical_id`) in production DB after Pass A2 was supposed to have cleaned all 6,853 such rows. Task: identify the writer, add defensive guard, purge rows, add unit test.
+
+### Root Cause (confirmed)
+
+**Race window between code fix and service restart.**
+
+Timeline:
+- 16:14 and 16:16 local time: Two old `memory_worker` processes (PIDs 82680, 83671) start with the PRE-A2 buggy `add_entity` code
+- 16:18: Pass A2 commits fix + deletes 6,853 rows from DB -- but does NOT restart the running worker processes
+- 16:18 to 17:21: Old workers (still loaded with unfixed code) continue processing observations; each `add_entity` call triggers `self.add_alias(entity_id, normalized_id)` on the same string, writing fresh self-referential rows
+- 17:18:55: Last self-referential entry logged: `Alias added: 'cortex' -> 'cortex'`
+- 17:21: LaunchAgent restarts `memory_worker`, new process loads symlinked (fixed) code -- no new self-referential aliases written after this point
+- 17:43: Pass Q audits, finds 230, defers to Pass W
+
+**Evidence:** `~/.openclaw/logs/memory-worker-stderr.log` shows all three process starts with PIDs and timestamps. The two pre-fix processes (82680, 83671) produced all the self-referential entries. Process 49044 (post-fix) produced zero.
+
+**No new writer.** The `add_entity` fix in Pass A2 is working correctly. The 230 rows are residue from the race window only.
+
+### Fix Applied
+
+1. **Defensive guard in `add_alias`** (`src/knowledge_graph.py` line 280):
+   ```python
+   if normalized_alias == normalized_canonical:
+       logger.debug("Rejecting self-referential alias: %s", normalized_alias)
+       return
+   ```
+   This is insurance: even if another caller passes `(id, id)` in the future, the function itself refuses.
+
+2. **Two new regression tests** (`tests/test_knowledge_graph_coverage.py`):
+   - `test_add_alias_rejects_self_referential_identical` -- same raw strings
+   - `test_add_alias_rejects_self_referential_after_normalization` -- different raw, same after `_normalize_id`
+
+3. **Production DB purge** (`~/clawd/data/cortex-knowledge-graph.db`):
+   - Backup created: `cortex-knowledge-graph.db.bak-passW`
+   - `DELETE FROM aliases WHERE alias = canonical_id` -- 230 rows removed
+   - Post-purge count: **0**
+
+### Test Results
+- `pytest tests/test_knowledge_graph_coverage.py` -- **26 passed, 0 failed**
+- Both new BUG-W-01 tests pass
+
+### Commits
+- `fix(knowledge_graph): reject self-referential alias at add_alias (Pass W)`
+- `chore(db): purge 230 self-referential alias rows + Pass W log entry`
+
+### Writer Identified
+- **File:** `src/knowledge_graph.py`, `add_entity()` method (pre-A2 version)
+- **Commit that introduced bug:** pre-A2 code, fixed in Pass A2 commit
+- **Mechanism:** `add_entity` called `self.add_alias(entity_id, normalized_id)` where both args normalize to the same string
+- **Writer at time of offense:** PIDs 82680 and 83671 (old worker instances running unfixed code during the race window)
+
+### Freshest Row Timestamps
+- Aliases table has no timestamp column (schema: `alias TEXT PRIMARY KEY, canonical_id TEXT NOT NULL`)
+- Last known write: 2026-04-16 17:18:55 (from memory-worker-stderr.log, entry `Alias added: 'cortex' -> 'cortex'`)
+
+**STATUS: COMPLETE -- defensive guard added, 2 tests green, 230 rows purged, count = 0.**
