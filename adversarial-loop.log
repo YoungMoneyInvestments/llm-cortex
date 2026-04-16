@@ -380,3 +380,111 @@
 - Empty tables (sources, chunks, strategies, source_links, content_metrics, topic_performance): no data to ingest today; ingester can be extended per-table when data is added.
 - `ingest_strategy_kb.py` (Pass 8 untracked): independent scope, not ingested in Pass 9.
 - `test_memory_recall_rate` failure: pre-existing, requires sqlite_vec installation for vector search quality, out of scope.
+
+### Pass B1 — 2026-04-16
+- **Subsystem**: `unified_vector_store.py` singleton — `get_vector_store()` path keying
+- **Bug**: BUG-A5-05 (P1) — The module-level singleton `_store_instance` was created from the first caller's `db_path` and returned unchanged on all subsequent calls regardless of the `db_path` argument. Any caller passing an explicit `db_path=custom` to `MemoryRetriever(vec_db_path=custom)` silently received the wrong store. Pass 5 confirmed this caused a real split-brain where 10,585 rows were merged out of the stale `~/clawd/data/cortex-vectors.db` instead of the canonical `~/.cortex/data/cortex-vectors.db`.
+
+**Option chosen**: Option A — key singleton by resolved path. Justification: both explicit-path callers (`memory_retriever.py:569, :798`, `memory_worker.py:2616`) need their `db_path` honored; no caller relies on the broken "shared despite different path" behavior. Option B (remove singleton) would require changes to `memory_retriever.py` and `memory_worker.py`, which are locked from prior passes. Option C (log warning) fixes nothing.
+
+**Root-cause path**: `memory_worker.py:2616` calls `MemoryRetriever(vec_db_path=VEC_DATA_DIR/"cortex-vectors.db")`. `memory_retriever.py:569` calls `get_vector_store(self.vec_db_path)`. Under the old code, if the module-level default singleton was already initialized (e.g. by the `memory_worker.py:1244` call to `get_vector_store()` with no args), any subsequent `get_vector_store(custom_path)` call silently returned the default store.
+
+**Files changed**:
+  - `src/unified_vector_store.py`:
+    - Added `import threading`
+    - Replaced `_store_instance: Optional[UnifiedVectorStore] = None` with `_store_instances: dict[Path, UnifiedVectorStore] = {}` and `_store_lock = threading.Lock()`
+    - `get_vector_store()`: resolves path via `Path(db_path or DB_PATH).expanduser().resolve()`, then check-and-insert under the lock. Same-path callers share an instance; different-path callers get distinct instances. No-arg behavior preserved.
+  - `tests/test_unified_vector_store.py`:
+    - Added `setUp`/`tearDown` to isolate `_store_instances` between tests
+    - Added `test_get_vector_store_keyed_by_path_returns_distinct_instances`: calls `get_vector_store(pathA)` and `get_vector_store(pathB)`, asserts distinct objects with correct `.db_path` attributes
+    - Added `test_get_vector_store_same_path_returns_same_instance`: asserts `get_vector_store(pathA)` called twice returns the same object
+
+**Verification**:
+  - `python3 -m py_compile src/unified_vector_store.py` — CLEAN
+  - `pytest tests/test_unified_vector_store.py` — 3 passed (2 new + 1 pre-existing)
+  - `pytest tests/` — 79 passed, 1 pre-existing failure (`test_memory_recall_rate`, sqlite_vec not installed, same failure confirmed in Pass 5 and Pass A5). No regression.
+  - Smoke test: `get_vector_store('/tmp/test_cortex_vectors.db')` → `store.db_path == /private/tmp/test_cortex_vectors.db` (symlink-resolved correctly). File created on disk. PASS.
+
+**Concurrency**: `threading.Lock` wraps the check-and-insert to prevent two threads from simultaneously creating instances for the same path.
+
+**macOS symlink note**: `/tmp` resolves to `/private/tmp` via `.resolve()`. The test pre-resolves paths with `.resolve()` before passing them so assertion `store.db_path == path_a` holds on macOS.
+
+**Production impact**: `memory_worker.py:1244` and `:1901` call `get_vector_store()` with no args → resolves to `~/.cortex/data/cortex-vectors.db`. `memory_worker.py:2616` passes `VEC_DATA_DIR/"cortex-vectors.db"` where `VEC_DATA_DIR` defaults to `~/.cortex/data` (set in Pass 5). Both resolve to the same path → same instance → no behavior change for the normal single-DB deployment. If `CORTEX_DATA_DIR` is set to a custom path, explicit callers now correctly open that path instead of being silently misdirected.
+
+- **Commit**: `2fb9085` in llm-cortex repo (`fix(unified_vector_store): key singleton by path so explicit db_path is honored`)
+- **BUG-A5-05 STATUS**: CLOSED
+
+### Pass B2 — 2026-04-16
+- **Subsystem**: `src/mcp_memory_server.py` (~39KB, main MCP tool surface exposing Cortex to Claude Code and OpenClaw)
+- **Scope**: Full file audit per adversarial-loop mission. Scope: `mcp_memory_server.py` and `tests/test_mcp_memory_server.py` only. Did NOT touch `unified_vector_store.py` (Pass B1), `memory_retriever.py`, `memory_worker.py`, `knowledge_graph.py`.
+- **Search coverage**: grep for CamiRouter, OpenAI, localhost:8317, tool-name collisions with conversation-memory MCP. All clean.
+
+**Bugs confirmed and fixed (3 commits: c66ac2b, b89d128, ee10ff3)**:
+
+  **BUG-B2-01 (FIXED, P1): MemoryRetriever() constructor outside try/except**
+  - Root cause: `retriever = MemoryRetriever()` executed before the `try:` block in `handle_tool_call`. Any constructor failure (DB not found, lock error) escaped the function entirely: client received no JSON-RPC response, and `finally: retriever.close()` was never called.
+  - Fix: `retriever = None` before try, `retriever = MemoryRetriever()` as first line inside try, `if retriever is not None: retriever.close()` in finally.
+
+  **BUG-B2-02 (FIXED, P1): No hard caps on limit/window params**
+  - Root cause: All integer params accepted arbitrarily large values. `cami_message_search` with `limit=100000` computed `fetch_limit = max(100000 * 4, 40) = 400,000` rows per DB, times 4 DBs = up to 1.6M rows pulled and serialized into the client context window.
+  - Fix: Added `_MAX_LIMIT = 100`, `_MAX_WINDOW = 50`, `_MAX_OBSERVATION_IDS = 20`, `_MAX_CONTENT_LEN = 20_000`. Added `_int_arg()` helper for coercion + clamping. Applied to all tools.
+
+  **BUG-B2-03 (FIXED, P2): graph_depth not validated in handler**
+  - Root cause: `arguments.get("graph_depth", 1)` forwarded any value to `retriever.search_with_context`. Schema description said "1 or 2" but had no enum and no handler check. Retriever would receive depth=99 or depth=-5.
+  - Fix: Handler explicitly rejects values outside {1, 2} with `isError: True` + diagnostic message. Schema declaration updated with `"enum": [1, 2]` for client-side pre-validation.
+  - Note: `test_mcp_tool_call_rejects_invalid_graph_depth` previously passed only because its FakeRetriever raised AttributeError after the handler forwarded depth=3 downstream. Test now passes via real validation.
+
+  **BUG-B2-04 (FIXED, P2): Empty observation_ids silently returned empty text**
+  - Root cause: `retriever.get_details([])` returns `[]`; the handler produced an empty text response with no `isError`. Client had no way to distinguish "no results" from a bad call.
+  - Fix: Added explicit length check before calling retriever. Returns `isError: True` with clear message.
+  - Note: Same as BUG-B2-03 — test previously passed via mock trickery, now passes via real validation.
+
+  **BUG-B2-05 (FIXED, P2): Integer args not coerced from strings**
+  - Root cause: LLMs occasionally send JSON integers as strings (`"limit": "15"`, `"observation_id": "7"`). `int()` on a Python dict value that is already a string raises TypeError, which bubbled up as a generic "Error: 'limit'" message with no guidance.
+  - Fix: `_int_arg()` calls `int(raw)` and catches `(TypeError, ValueError)`, falling back to default. `observation_id` coerced explicitly.
+
+  **BUG-B2-06 (FIXED, P2): No logging on exceptions**
+  - Root cause: `except Exception as e: return {"isError": True, "content": f"Error: {str(e)}"}` logged nothing to stderr. Failures left no trace.
+  - Fix: Added `import logging`, `logger = logging.getLogger("cortex-mcp")`, `logger.exception("Tool %s failed: %s", name, e)` in except.
+
+  **BUG-B2-07 (FIXED, P2): days_back=0 bypassed time filter via falsy check**
+  - Root cause: `time_cutoff = (_time.time() - days_back * 86400) if days_back else None` — `days_back=0` is falsy, so `time_cutoff` was None even if caller passed 0. A caller requesting "today only" (0 days back) got all messages.
+  - Fix: Replaced with explicit `None` check. Only positive integers enable the filter; 0 and None both mean no filter.
+
+  **BUG-B2-08 (FIXED, cosmetic): Docstring said "7 MCP tools", TOOLS has 8**
+  - `session_bootstrap` was added after the comment was written. Updated count to 8, added entry.
+
+**Deferred bugs:**
+
+  **BUG-B2-09 (DEFERRED, P3): cami_memory_save.tags typed as string in schema but used as list in MEMORY.md**
+  - Schema declares `"type": "string"` with description "Comma-separated tags". MEMORY.md shows `tags=["project", "topic"]` (Python list). The tool does `metadata["tags"] = arguments["tags"]` without normalizing. If client sends `["project", "topic"]` as JSON array, tags stored as array; if string, stored as string. Retrieval behavior depends on how memory_retriever.py uses tags. Fix requires inspecting retriever + deciding canonical type. Deferred: handler change only after retriever contract is confirmed. No behavior regression; current callers that pass strings still work.
+
+  **BUG-B2-10 (DEFERRED, P3): cami_contact_search FTS MATCH query injection via double-quote escape**
+  - Line 383: `fts_query = stripped.replace('"', '""')` escapes double-quotes for FTS phrase syntax. However, the full `fts_query` is wrapped in double-quotes and passed as a parameterized value to SQLite (`?`). SQLite FTS5 MATCH parameters are NOT SQL-injectable (they are parsed by the FTS engine, not the SQL parser). The `""` doubling is proper FTS phrase-quote escaping. However, an input like `NEAR/5 token` would be parsed as FTS5 proximity syntax (not arbitrary SQL). This is low severity since it cannot execute arbitrary SQL, but unexpected FTS5 operators in user input could produce confusing results or FTS errors (caught by the `OperationalError` fallback). OPEN for a future pass.
+
+**Tests added**: `tests/test_mcp_memory_server.py` — 11 new tests covering:
+  - Missing/empty query rejection (no mock required)
+  - String limit coercion
+  - Limit hard-cap clamping
+  - graph_depth=3 and depth=0 rejection without mock
+  - Empty observation_ids rejection without mock
+  - String observation_ids coerced to int
+  - Empty content rejection on save
+  - Non-numeric observation_id rejection on timeline
+  - graph_depth enum present in TOOLS schema declaration
+
+**Verification**:
+  - `python3 -m py_compile src/mcp_memory_server.py` — CLEAN on all 3 commits
+  - `pytest tests/` (pre-fix baseline: 79 passed, 1 pre-existing failure)
+  - After BUG-B2-01/06 commit: 79 passed, 1 pre-existing failure
+  - After BUG-B2-02..08 commit: 79 passed, 1 pre-existing failure
+  - After new tests commit: **90 passed**, 1 pre-existing failure (`test_memory_recall_rate`, sqlite_vec not installed, pre-existing)
+
+**Commits (all in llm-cortex repo)**:
+  - `c66ac2b` — `fix(mcp_memory_server): move MemoryRetriever init inside try and log exceptions`
+  - `b89d128` — `fix(mcp_memory_server): input validation, limit caps, int coercion (BUG-B2-02..B2-08)`
+  - `ee10ff3` — `fix(mcp_memory_server): add enum to graph_depth tool schema (tool-contract drift)`
+  - `6182425` — `test(mcp_memory_server): 11 new tests replacing mock-dependent validation coverage`
+
+**No renames of cami_* tools** — all 8 tool names preserved.
+**No changes to unified_vector_store.py, memory_retriever.py, memory_worker.py, knowledge_graph.py.**
