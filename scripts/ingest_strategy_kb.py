@@ -179,8 +179,16 @@ def discover_files(source_def: dict) -> Iterator[tuple[Path, dict]]:
 # Ingestion
 # ---------------------------------------------------------------------------
 
-def ingest(dry_run: bool = False) -> dict:
-    """Run ingestion. Returns summary stats."""
+def ingest(dry_run: bool = False, force_replace: bool = True) -> dict:
+    """Run ingestion. Returns summary stats.
+
+    Args:
+        dry_run: If True, report what would be done without writing to DB.
+        force_replace: If True (default), delete existing chunks for each
+            doc before re-inserting so stale chunks from a previous (longer)
+            version of the file are removed.  Set to False only when you
+            explicitly want append-only semantics.
+    """
     store = get_vector_store(DB_PATH)
 
     rows_before = _count_knowledge_rows(store)
@@ -188,7 +196,7 @@ def ingest(dry_run: bool = False) -> dict:
     total_files = 0
     total_chunks_estimate = 0
     ingested = 0
-    skipped = 0
+    replaced = 0
     errors = 0
 
     files_to_ingest: list[tuple[Path, str, dict]] = []
@@ -201,7 +209,7 @@ def ingest(dry_run: bool = False) -> dict:
     total_files = len(files_to_ingest)
 
     if dry_run:
-        print(f"\n=== DRY RUN: would ingest {total_files} files ===")
+        print(f"\n=== DRY RUN: would ingest {total_files} files (force_replace={force_replace}) ===")
         for path, doc_id, metadata in files_to_ingest:
             size = path.stat().st_size
             text = path.read_text(encoding="utf-8", errors="replace")
@@ -209,19 +217,38 @@ def ingest(dry_run: bool = False) -> dict:
             from unified_vector_store import DEFAULT_CHUNK_MAX_CHARS
             n_chunks = max(1, (len(text) + DEFAULT_CHUNK_MAX_CHARS - 1) // DEFAULT_CHUNK_MAX_CHARS)
             total_chunks_estimate += n_chunks
-            print(f"  [FILE] {path.name}")
+            # The internal doc ID stored in documents table has kg- prefix
+            internal_id = f"kg-{doc_id}"
+            if force_replace:
+                # Report how many existing rows would be cleared
+                existing = store._safe_execute(
+                    "SELECT COUNT(*) as cnt FROM documents WHERE id = ? OR id LIKE ?",
+                    (internal_id, internal_id + "-chunk-%"),
+                ).fetchone()
+                existing_cnt = existing["cnt"] if existing else 0
+                replace_note = f" (would clear {existing_cnt} existing row(s))" if existing_cnt else ""
+            else:
+                replace_note = ""
+            print(f"  [FILE] {path.name}{replace_note}")
             print(f"         id={doc_id}")
             print(f"         size={size} bytes, ~{n_chunks} chunk(s)")
             print(f"         tags={metadata['tags']}")
         print(f"\nTotal: {total_files} file(s), ~{total_chunks_estimate} chunk(s)\n")
         return {"files": total_files, "chunks_estimate": total_chunks_estimate, "dry_run": True}
 
-    # Real ingest
+    # Real ingest — delete-before-insert for idempotent replace
     for path, doc_id, metadata in files_to_ingest:
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
+            if force_replace:
+                # The internal ID stored in documents has the kg- prefix added by add_knowledge
+                internal_id = f"kg-{doc_id}"
+                n_deleted = store.delete_document_and_chunks(internal_id)
+                if n_deleted:
+                    logger.info(f"[REPLACE] Cleared {n_deleted} stale row(s) for {doc_id}")
+                    replaced += 1
             store.add_knowledge(doc_id, text, metadata)
-            logger.info(f"[OK] Ingested: {path.name} → {doc_id}")
+            logger.info(f"[OK] Ingested: {path.name} -> {doc_id}")
             ingested += 1
         except Exception as exc:
             logger.error(f"[ERROR] Failed to ingest {path}: {exc}")
@@ -233,16 +260,19 @@ def ingest(dry_run: bool = False) -> dict:
     summary = {
         "files_attempted": total_files,
         "ingested": ingested,
+        "replaced": replaced,
         "errors": errors,
         "rows_before": rows_before,
         "rows_after": rows_after,
         "row_delta": delta,
+        "force_replace": force_replace,
         "dry_run": False,
     }
 
     print(f"\n=== INGEST COMPLETE ===")
     print(f"  Files attempted : {total_files}")
     print(f"  Ingested        : {ingested}")
+    print(f"  Replaced        : {replaced}")
     print(f"  Errors          : {errors}")
     print(f"  Rows before     : {rows_before}")
     print(f"  Rows after      : {rows_after}")
@@ -275,9 +305,16 @@ def main():
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="List what would be ingested without writing to DB",
+        help="Report what would be ingested/replaced without writing to DB",
+    )
+    parser.add_argument(
+        "--no-force-replace",
+        action="store_true",
+        help="Disable delete-before-insert (append-only; may leave orphaned chunks)",
     )
     args = parser.parse_args()
+
+    force_replace = not args.no_force_replace
 
     if not args.dry_run:
         bak_path = DB_PATH.parent / (DB_PATH.name + ".bak-pass8")
@@ -289,7 +326,7 @@ def main():
         else:
             logger.info(f"Backup already exists: {bak_path}")
 
-    result = ingest(dry_run=args.dry_run)
+    result = ingest(dry_run=args.dry_run, force_replace=force_replace)
 
     if not args.dry_run:
         # Write ingestion record
