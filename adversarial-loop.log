@@ -1326,3 +1326,104 @@ All 6 tests pass.
 #### Deferrals
 - **N-5 (chunk dedup)**: `_upsert` dedup skips multi-chunk path. Fix requires deciding whether chunks with the same parent should be treated as duplicates of other-source chunks. Design call needed.
 - **N-6 (VACUUM / FTS optimize schedule)**: `vacuum()` method is correct. Needs a cron job or maintenance script. Not run inline per hard limits.
+
+---
+
+## Pass Z — Unauthenticated Read Endpoints (BUG-C1-01, BUG-D2-03, BUG-D2-04)
+
+**Date:** 2026-04-16
+**Files changed:** `src/memory_worker.py`, `scripts/context_loader.py`, `tests/test_schema_safety.py`
+**Commit:** `c895104`
+
+### Audit Findings
+
+**CORTEX_WORKER_API_KEY pre-existing wiring:**
+- `src/memory_worker.py` line 80: `CORTEX_API_KEY = os.environ.get("CORTEX_WORKER_API_KEY", "")` — env var read but defaults to empty string.
+- `scripts/context_loader.py` lines 289-306: Already sends `Authorization: Bearer` on its one HTTP call. Previously fell back to hardcoded `"cortex-local-2026"`.
+- All 4 hook scripts (`post_tool_use.sh`, `user_prompt_submit.sh`, `session_end.sh`, etc.): Read `CORTEX_WORKER_API_KEY` and send `Authorization: Bearer` on POST calls.
+- `src/mcp_memory_server.py`: In-process only — calls `MemoryRetriever()` directly, makes zero HTTP calls to the worker. The prior audit claim "MCP server calls HTTP with no auth headers" was stale. No HTTP changes needed in MCP server.
+- Live worker plist: `CORTEX_WORKER_API_KEY=cortex-local-2026` — key was already configured.
+
+**Endpoints that had no auth (now all locked):**
+- `GET /api/observations/recent` — observation history
+- `GET /api/sessions/recent` — session history
+- `POST /api/memory/search` — L1 full memory search
+- `POST /api/memory/timeline` — L2 chronological context
+- `POST /api/memory/details` — L3 full observation content
+- `GET /api/compression/status` — AI compressor state
+- `GET /api/stats` — worker statistics
+- `GET /api/retention/stats` — retention state
+- `GET /api/ner/stats` — NER statistics
+- `GET /api/profile` — user profile (most sensitive — AI-extracted personal profile facts)
+
+`GET /api/health` — intentionally left unauthenticated for readiness probes.
+
+### Changes Made
+
+**`src/memory_worker.py`:**
+- Added `import hmac, secrets` to stdlib imports.
+- Replaced `CORTEX_API_KEY = os.environ.get(...)` with `_resolve_api_key()` function that does: env var -> key file (`~/.cortex/data/.worker_api_key`) -> generate random key with `secrets.token_hex(32)`, write with `chmod 600`, return `(key, was_generated)`.
+- Added `_key_matches(candidate)` helper using `hmac.compare_digest` for constant-time comparison.
+- Updated `require_auth()` signature to accept `request: Request` as first param; now accepts credentials via: (1) `Authorization: Bearer`, (2) `X-Cortex-Api-Key` header, (3) `?api_key=` query param. Auth failures logged at INFO level (source IP, endpoint path, never the key value).
+- Added `Depends(require_auth)` to all 10 previously-open endpoints.
+- Added startup WARNING in `lifespan()` when `_API_KEY_WAS_GENERATED` is True (BUG-D2-04 fix).
+
+**`scripts/context_loader.py`:**
+- Replaced hardcoded `"cortex-local-2026"` fallback with: env var -> key file read. Empty string if neither available (will 401, fails fast and visibly).
+
+**`tests/test_schema_safety.py`:**
+- Fixed `test_require_auth_fails_clearly_without_valid_credentials` to pass `_FakeRequest()` as first arg to `require_auth()` (signature changed).
+- Added `_FakeRequest` minimal mock class.
+- Added 3 new tests:
+  - `test_unauthenticated_memory_search_returns_401` — no header → 401
+  - `test_authenticated_memory_search_returns_non_401` — Bearer header → not 401
+  - `test_api_key_query_param_accepted` — `?api_key=` → not 401
+
+### Test Results
+
+```
+141 passed, 5 subtests passed (was 138 + 3 new)
+```
+
+### Live Smoke Tests (post-restart)
+
+```bash
+# /api/health — no key — 200 (exempt)
+curl http://localhost:37778/api/health → HTTP 200
+
+# /api/memory/search — no key — 401
+curl -X POST http://localhost:37778/api/memory/search -d '{"query":"test"}' → HTTP 401
+
+# /api/memory/search — Bearer key — 200
+curl -X POST ... -H "Authorization: Bearer cortex-local-2026" → HTTP 200
+
+# /api/memory/search — X-Cortex-Api-Key header — 200
+curl -X POST ... -H "X-Cortex-Api-Key: cortex-local-2026" → HTTP 200
+
+# /api/memory/search — ?api_key= query param — 200
+curl -X POST "...?api_key=cortex-local-2026" → HTTP 200
+
+# /api/profile — no key — 401
+curl http://localhost:37778/api/profile → HTTP 401
+
+# context_loader.py HTTP call — 200 (reads key from env)
+python3 scripts/context_loader.py --hours 1 → success (cortex recall returned)
+```
+
+Worker restart confirmed < 5 seconds downtime (launchctl kickstart).
+
+### Bugs Closed
+
+- **BUG-C1-01** (CLOSED): No auth on memory read endpoints — all 10 endpoints now require auth.
+- **BUG-D2-03** (CLOSED): Duplicate of C1-01 — same fix.
+- **BUG-D2-04** (CLOSED): Missing CORTEX_WORKER_API_KEY silences all writes AND was undiscoverable — now logs startup WARNING if generated; existing key in plist means this is a no-op for Cameron's live setup.
+
+### Bonus Fix (not in bug registry)
+
+- `require_auth()` previously used `credentials.credentials != CORTEX_API_KEY` — string equality, not constant-time. Replaced with `hmac.compare_digest()` throughout.
+
+### Deferrals / Notes
+
+- `mcp_memory_server_sse.py` (SSE HTTP transport on port 37781): Also in-process via `handle_tool_call()`, no HTTP changes needed.
+- Generated key file `~/.cortex/data/.worker_api_key` is readable only by owner (chmod 600). Hook scripts read key from env, not file — no hook changes needed since Cameron's plist already exports the key.
+- `scripts/context_loader.py` key file fallback: if env var is missing and file doesn't exist, the HTTP call will 401 and return `"(cortex worker unreachable)"` gracefully — acceptable fail-open for context_loader (non-critical path).
