@@ -1303,6 +1303,24 @@ class EntityExtractor:
     }
     _KNOWN_PROJECTS_LOWER: Dict[str, str] = {p.lower(): p for p in KNOWN_PROJECTS}
 
+    # ── Known @mention handles that are brands/companies, not people ──
+    # These are social media handles or bot accounts that should be typed as
+    # 'company' rather than 'person' when seen in @mention patterns.
+    BRAND_HANDLES: Set[str] = {
+        # Cameron's own trading brand accounts
+        "youngmoneyinvestments", "youngmoneytrades",
+        # Competing / partner trading educators / brands seen in observations
+        "pennyteetrading", "mrtopstep", "thefuturesdesk",
+        "moneylikesmike", "alexgonzaleztrades", "blacklinetrading",
+        "intuitmachine",
+        # Cami's social handle (AI persona, not a real person)
+        "camibuffett",
+        # Third-party services
+        "apextraderfunding", "auth0spajs",
+        # Algo trading content accounts
+        "algorithmictradingstrategies",
+    }
+
     # ── Compiled regex patterns ──
 
     # File paths: /something/something.ext or ~/something
@@ -1310,9 +1328,19 @@ class EntityExtractor:
         r'(?:~|/)[A-Za-z0-9_./-]+\.[A-Za-z0-9]{1,10}'
     )
 
-    # GitHub repo paths: owner/repo (at least one slash, alphanumeric + hyphens)
+    # GitHub repo paths: owner/repo
+    # Requires the owner to be a known GitHub org/user to avoid tagging
+    # arbitrary "word/word" patterns (e.g. "train/test", "input/output").
+    # NOTE: this regex is defined for future use; it is not wired into any
+    # extraction method yet.  Keep it narrow — only match when owner is a
+    # known GitHub principal, and require >=3 chars on each side.
+    KNOWN_GITHUB_OWNERS: Set[str] = {
+        "YoungMoneyInvestments", "youngmoneyinvestments",
+        "claude-cortex", "ruvnet",
+        "cameronbennion",
+    }
     RE_GITHUB_REPO = re.compile(
-        r'\b([A-Za-z0-9_-]+/[A-Za-z0-9_.-]+)\b'
+        r'\b([A-Za-z0-9][A-Za-z0-9_-]{2,}/[A-Za-z0-9][A-Za-z0-9_.-]{2,})\b'
     )
 
     # ~/Projects/ directory references
@@ -1446,6 +1474,26 @@ class EntityExtractor:
             if len(project_name) > 2:
                 seen.setdefault(project_name, "project")
 
+    @staticmethod
+    def _is_bot_handle(mention: str) -> bool:
+        """Return True if the @mention looks like a bot/automation account.
+
+        Heuristics (all case-insensitive):
+        - Starts with 'bot' (e.g. @BotFather)
+        - Ends with 'bot' (e.g. @MartyProBot)
+        - Contains 'bot' immediately followed by _ or a digit, indicating a
+          versioned bot name (e.g. @MartyProBot_2026_03_28_23, @MartyProBot_)
+        """
+        ml = mention.lower()
+        if ml.startswith("bot"):
+            return True
+        if ml.endswith("bot"):
+            return True
+        # Versioned bot: "bot" followed by underscore or digit
+        if re.search(r"bot[_\d]", ml):
+            return True
+        return False
+
     def _extract_people(self, text: str, seen: Dict[str, str]):
         """Extract people names from contextual patterns and @mentions."""
         # Contextual patterns ("talked to Cameron", etc.)
@@ -1454,11 +1502,19 @@ class EntityExtractor:
             if len(name) > 2 and name not in self._CAMELCASE_EXCLUDE:
                 seen.setdefault(name, "person")
 
-        # @mentions
+        # @mentions — classify by handle characteristics before tagging as person
         for match in self.RE_AT_MENTION.finditer(text):
             mention = match.group(1)
             if len(mention) > 2:
-                seen.setdefault(mention, "person")
+                mention_lower = mention.lower()
+                # Bot/automation handles → tool entity type
+                if self._is_bot_handle(mention):
+                    seen.setdefault(mention, "tool")
+                # Known brand/company social handles → company entity type
+                elif mention_lower in self.BRAND_HANDLES:
+                    seen.setdefault(mention, "company")
+                else:
+                    seen.setdefault(mention, "person")
 
     def _extract_companies(self, text: str, seen: Dict[str, str]):
         """Extract company names."""
