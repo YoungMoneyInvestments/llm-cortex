@@ -2460,10 +2460,29 @@ async def _call_ai_for_summary(prompt: str) -> Optional[str]:
             resp = await ai_compressor._client.post(ai_compressor.ANTHROPIC_URL, json=payload)
             if resp.status_code == 200:
                 data = resp.json()
-                return data["content"][0]["text"]
+                content_blocks = data.get("content", [])
+                text_block = next(
+                    (b for b in content_blocks if b.get("type") == "text"),
+                    None,
+                )
+                if text_block is None:
+                    ai_compressor._record_failure(
+                        f"session summary: no text block in response "
+                        f"(got {len(content_blocks)} blocks)",
+                        is_rate_limit=False,
+                    )
+                    return None
+                ai_compressor._record_success()
+                return text_block["text"]
             elif resp.status_code in (429, 529):
                 ai_compressor._record_failure(
                     f"session summary rate limited ({resp.status_code})",
+                    is_rate_limit=True,
+                )
+            elif resp.status_code >= 500:
+                # Transient server error — trigger backoff, same as compress()
+                ai_compressor._record_failure(
+                    f"session summary HTTP {resp.status_code} (transient)",
                     is_rate_limit=True,
                 )
             else:
@@ -2473,6 +2492,7 @@ async def _call_ai_for_summary(prompt: str) -> Optional[str]:
                 )
     except Exception as e:
         logger.debug(f"OAuth session summary failed: {e}")
+        ai_compressor._record_failure(f"session summary exception: {e}")
 
     return None
 
