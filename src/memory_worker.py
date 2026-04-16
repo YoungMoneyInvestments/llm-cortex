@@ -19,10 +19,12 @@ Port: 37778 (37777 reserved for claude-mem)
 """
 
 import asyncio
+import hmac
 import json
 import logging
 import os
 import re
+import secrets
 import signal
 import sqlite3
 import subprocess
@@ -77,7 +79,48 @@ HIGH_SIGNAL_TOOLS = frozenset({
 })
 
 # ── API Authentication config ──────────────────────────────────────────
-CORTEX_API_KEY = os.environ.get("CORTEX_WORKER_API_KEY", "")
+# Path where a generated key is persisted so the MCP server and context_loader
+# can read it without requiring an env var on fresh installs.
+_GENERATED_KEY_FILE = Path.home() / ".cortex" / "data" / ".worker_api_key"
+
+
+def _resolve_api_key() -> tuple[str, bool]:
+    """Return (key, was_generated).
+
+    Resolution order:
+    1. CORTEX_WORKER_API_KEY env var — set and non-empty → use it as-is.
+    2. Generated key persisted in _GENERATED_KEY_FILE — read and return.
+    3. Neither available → generate a random key, persist it with chmod 600,
+       and return it (fail-open with a logged WARNING so Cameron notices).
+    """
+    env_key = os.environ.get("CORTEX_WORKER_API_KEY", "").strip()
+    if env_key:
+        return env_key, False
+
+    if _GENERATED_KEY_FILE.exists():
+        try:
+            key = _GENERATED_KEY_FILE.read_text().strip()
+            if key:
+                return key, False
+        except OSError:
+            pass
+
+    # Generate a fresh key and persist it
+    key = secrets.token_hex(32)
+    try:
+        _GENERATED_KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _GENERATED_KEY_FILE.write_text(key)
+        _GENERATED_KEY_FILE.chmod(0o600)
+    except OSError as exc:
+        # If we can't write the file, log but continue — key lives in memory only
+        logging.getLogger("cortex-worker").warning(
+            "CORTEX_WORKER_API_KEY not set and could not write key file %s: %s",
+            _GENERATED_KEY_FILE, exc,
+        )
+    return key, True
+
+
+CORTEX_API_KEY, _API_KEY_WAS_GENERATED = _resolve_api_key()
 
 # ── Rate limiting config ───────────────────────────────────────────────
 RATE_LIMIT_MAX = 100           # max observations per minute per session_id
@@ -291,11 +334,46 @@ quota_manager: Optional["QuotaManager"] = None
 _bearer_scheme = HTTPBearer(auto_error=False)
 
 
+def _key_matches(candidate: str) -> bool:
+    """Constant-time comparison to prevent timing attacks."""
+    if not candidate or not CORTEX_API_KEY:
+        return False
+    return hmac.compare_digest(
+        candidate.encode("utf-8"),
+        CORTEX_API_KEY.encode("utf-8"),
+    )
+
+
 async def require_auth(
+    request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer_scheme),
 ):
-    """Dependency that enforces bearer token auth on POST endpoints."""
-    if credentials is None or credentials.credentials != CORTEX_API_KEY:
+    """Dependency that enforces bearer token auth on all non-health endpoints.
+
+    Accepts credentials via (in priority order):
+    1. Authorization: Bearer <key>  header
+    2. X-Cortex-Api-Key: <key>      header
+    3. ?api_key=<key>               query param
+
+    Auth failures are logged at INFO level (source IP + endpoint, never the key).
+    """
+    candidate: Optional[str] = None
+
+    if credentials is not None:
+        candidate = credentials.credentials
+    else:
+        # Fall back to custom header or query param
+        candidate = (
+            request.headers.get("X-Cortex-Api-Key")
+            or request.query_params.get("api_key")
+        )
+
+    if not _key_matches(candidate or ""):
+        client_ip = (request.client.host if request.client else "unknown")
+        logger.info(
+            "Auth failure: %s %s from %s",
+            request.method, request.url.path, client_ip,
+        )
         raise HTTPException(
             status_code=401,
             detail="Invalid or missing Authorization: Bearer <key> header",
@@ -2486,6 +2564,18 @@ async def lifespan(app: FastAPI):
 
     logger.info(f"Cortex Worker starting on port {WORKER_PORT}")
 
+    # BUG-D2-04: Warn loudly when no env var was configured.
+    # A generated key is usable but Cameron should notice and set the env var.
+    if _API_KEY_WAS_GENERATED:
+        logger.warning(
+            "CORTEX_WORKER_API_KEY is not set. A random key has been generated and "
+            "saved to %s (chmod 600). Set CORTEX_WORKER_API_KEY to suppress this warning. "
+            "All API endpoints (except /api/health) now require this key.",
+            _GENERATED_KEY_FILE,
+        )
+    else:
+        logger.info("API key loaded (CORTEX_WORKER_API_KEY configured).")
+
     # Write PID file
     PID_FILE.parent.mkdir(parents=True, exist_ok=True)
     PID_FILE.write_text(str(os.getpid()))
@@ -2731,7 +2821,7 @@ async def end_session(req: SessionEndRequest):
     return {"status": "ended", "observation_count": count}
 
 
-@app.get("/api/observations/recent")
+@app.get("/api/observations/recent", dependencies=[Depends(require_auth)])
 async def get_recent_observations(
     limit: int = 20,
     offset: int = 0,
@@ -2773,7 +2863,7 @@ async def get_recent_observations(
     }
 
 
-@app.get("/api/sessions/recent")
+@app.get("/api/sessions/recent", dependencies=[Depends(require_auth)])
 async def get_recent_sessions(limit: int = 10, offset: int = 0):
     """Get recent sessions with pagination."""
     if db is None:
@@ -2801,7 +2891,7 @@ def _get_retriever():
     return MemoryRetriever(obs_db_path=DB_PATH, vec_db_path=VEC_DATA_DIR / "cortex-vectors.db")
 
 
-@app.post("/api/memory/search")
+@app.post("/api/memory/search", dependencies=[Depends(require_auth)])
 async def memory_search(req: MemorySearchRequest):
     """L1: Search cortex memory (compact index). Used by Cami via OpenClaw tools."""
     loop = asyncio.get_event_loop()
@@ -2824,7 +2914,7 @@ async def memory_search(req: MemorySearchRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/memory/timeline")
+@app.post("/api/memory/timeline", dependencies=[Depends(require_auth)])
 async def memory_timeline(req: MemoryTimelineRequest):
     """L2: Chronological context around an observation. Used by Cami via OpenClaw tools."""
     loop = asyncio.get_event_loop()
@@ -2841,7 +2931,7 @@ async def memory_timeline(req: MemoryTimelineRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/memory/details")
+@app.post("/api/memory/details", dependencies=[Depends(require_auth)])
 async def memory_details(req: MemoryDetailsRequest):
     """L3: Full observation details. Used by Cami via OpenClaw tools."""
     if not req.observation_ids:
@@ -2880,7 +2970,7 @@ async def memory_save(req: MemorySaveRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/compression/status")
+@app.get("/api/compression/status", dependencies=[Depends(require_auth)])
 async def compression_status():
     """AI compression health status. Check this when alerted."""
     if ai_compressor is None:
@@ -2923,7 +3013,7 @@ async def compression_reset():
     return {"status": "reset", "previous_failures": prev_failures}
 
 
-@app.get("/api/stats")
+@app.get("/api/stats", dependencies=[Depends(require_auth)])
 async def get_stats():
     """Get worker statistics."""
     if db is None:
@@ -2971,7 +3061,7 @@ async def get_stats():
 # ── Retention endpoints ────────────────────────────────────────────────
 
 
-@app.get("/api/retention/stats")
+@app.get("/api/retention/stats", dependencies=[Depends(require_auth)])
 async def get_retention_stats():
     """Current retention state: rows by age tier, cleanup candidates, last run."""
     if retention_manager is None:
@@ -2991,7 +3081,7 @@ async def trigger_retention(dry_run: bool = False):
 # ── NER endpoints ──────────────────────────────────────────────────────
 
 
-@app.get("/api/ner/stats")
+@app.get("/api/ner/stats", dependencies=[Depends(require_auth)])
 async def get_ner_stats():
     """NER extraction statistics: total entities, relationships, last run."""
     if entity_extractor is None:
@@ -3021,7 +3111,7 @@ async def get_ner_stats():
 # ── Profile endpoints ─────────────────────────────────────────────────────
 
 
-@app.get("/api/profile")
+@app.get("/api/profile", dependencies=[Depends(require_auth)])
 async def get_profile():
     """Return all user profile entries grouped by category, ordered by confidence."""
     if db is None:

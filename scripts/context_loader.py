@@ -286,7 +286,16 @@ def cortex_recall(cwd: Optional[str] = None) -> str:
     Returns an empty string if the worker is unreachable or no results are found.
     """
     worker_url = os.environ.get("CORTEX_WORKER_URL", "http://localhost:37778")
-    api_key = os.environ.get("CORTEX_WORKER_API_KEY", "cortex-local-2026")
+    # Key resolution: env var → generated key file → empty (will 401, fast fail)
+    _env_key = os.environ.get("CORTEX_WORKER_API_KEY", "").strip()
+    if _env_key:
+        api_key = _env_key
+    else:
+        _key_file = Path.home() / ".cortex" / "data" / ".worker_api_key"
+        try:
+            api_key = _key_file.read_text().strip() if _key_file.exists() else ""
+        except OSError:
+            api_key = ""
 
     # Determine project name from CWD
     project_dir = cwd or os.environ.get("CORTEX_PROJECT_DIR") or os.getcwd()

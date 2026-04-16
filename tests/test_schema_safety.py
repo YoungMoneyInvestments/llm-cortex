@@ -39,6 +39,17 @@ def test_memory_worker_defaults_are_generic(monkeypatch, tmp_path):
     assert memory_worker.PID_FILE == tmp_path / ".openclaw" / "worker.pid"
 
 
+class _FakeRequest:
+    """Minimal stand-in for a FastAPI Request to satisfy require_auth()."""
+
+    def __init__(self, method="GET", path="/api/test", headers=None, query_params=None, client_host="127.0.0.1"):
+        self.method = method
+        self.url = type("URL", (), {"path": path})()
+        self.headers = headers or {}
+        self.query_params = query_params or {}
+        self.client = type("Client", (), {"host": client_host})()
+
+
 def test_require_auth_fails_clearly_without_valid_credentials(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.delenv("CORTEX_WORKER_API_KEY", raising=False)
@@ -46,10 +57,62 @@ def test_require_auth_fails_clearly_without_valid_credentials(monkeypatch, tmp_p
     memory_worker = import_fresh("memory_worker")
 
     with pytest.raises(HTTPException) as exc_info:
-        asyncio.run(memory_worker.require_auth(None))
+        asyncio.run(memory_worker.require_auth(_FakeRequest(), None))
 
     assert exc_info.value.status_code == 401
     assert "Authorization" in exc_info.value.detail
+
+
+# ── BUG-C1-01 / BUG-D2-03 tests: auth on read endpoints ──────────────────────
+
+
+def test_unauthenticated_memory_search_returns_401(monkeypatch, tmp_path):
+    """Read endpoints must return 401 when no credentials are supplied (BUG-C1-01 / BUG-D2-03)."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("CORTEX_WORKER_API_KEY", "test-key-abc")
+    from fastapi.testclient import TestClient
+
+    memory_worker = import_fresh("memory_worker")
+    client = TestClient(memory_worker.app, raise_server_exceptions=False)
+
+    resp = client.post("/api/memory/search", json={"query": "test"})
+    assert resp.status_code == 401
+
+
+def test_authenticated_memory_search_returns_non_401(monkeypatch, tmp_path):
+    """A valid API key in the Authorization: Bearer header must not be rejected (BUG-C1-01 / BUG-D2-03)."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("CORTEX_WORKER_API_KEY", "test-key-abc")
+    from fastapi.testclient import TestClient
+
+    memory_worker = import_fresh("memory_worker")
+    client = TestClient(memory_worker.app, raise_server_exceptions=False)
+
+    resp = client.post(
+        "/api/memory/search",
+        json={"query": "test"},
+        headers={"Authorization": "Bearer test-key-abc"},
+    )
+    # Either the DB is not initialised (503) or the worker returns results (200).
+    # Either way it must NOT be 401.
+    assert resp.status_code != 401
+
+
+def test_api_key_query_param_accepted(monkeypatch, tmp_path):
+    """X-Cortex-Api-Key query-param must be accepted as an alternative to Bearer header."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("CORTEX_WORKER_API_KEY", "test-key-abc")
+    from fastapi.testclient import TestClient
+
+    memory_worker = import_fresh("memory_worker")
+    client = TestClient(memory_worker.app, raise_server_exceptions=False)
+
+    resp = client.post(
+        "/api/memory/search",
+        json={"query": "test"},
+        params={"api_key": "test-key-abc"},
+    )
+    assert resp.status_code != 401
 
 
 def test_observation_request_accepts_any_source(monkeypatch, tmp_path):
