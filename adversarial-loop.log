@@ -1770,3 +1770,66 @@ Retypes applied: 10
 - **Self-referential aliases** (230): regression from Pass A2. Functionally harmless. Deferred to Pass A2 owner.
 - **Add GitHub/OpenAI to KNOWN_SYSTEMS**: domain decision deferred -- classification as system vs tool vs company requires Cameron input.
 
+
+---
+
+## Pass U — AICompressor Edge Cases
+**Date**: 2026-04-16
+**Scope**: `src/memory_worker.py` — `AICompressor` class, `_call_ai_for_summary` function
+**Prior work preserved**: _compress_via_oauth / _call_ai_for_summary structure, db_lock coverage (C1), tier enforcement (I), auth on endpoints (Z)
+
+### Edge Cases Evaluated
+
+| # | Edge | Reproducible? | Fixed? | Notes |
+|---|------|--------------|--------|-------|
+| U-01 | 5xx not treated as transient (no backoff) | YES | YES | 500/502/503/504 now use `is_rate_limit=True` |
+| U-02 | _call_ai_for_summary missing _record_success on 200 | YES | YES | Degraded state never cleared on session summary success |
+| U-02b | _call_ai_for_summary missing _record_failure in except | YES | YES | Exceptions were silently swallowed (debug log only) |
+| U-03 | data["content"][0]["text"] crashes on non-text first block | YES | YES | Fixed in both _compress_via_oauth and _call_ai_for_summary |
+| U-04 | _parse_typed_response fallback stores unbounded raw_text | YES | YES | Capped at _MAX_CONTENT_LEN=300 chars |
+| - | Empty string / None inputs | NO (not a bug) | N/A | raw_input/raw_output use `or 'N/A'`; prompt always valid |
+| - | Very long observations | NO (not a bug) | N/A | Upstream truncation via truncated_input()/truncated_output() at 4000/8000 chars |
+| - | Non-English / emoji content | NO (not a bug) | N/A | No charset assumptions; fix U-04 truncates by char count correctly |
+| - | Prompt injection | DEFERRED | N/A | Hard limit: cannot change prompt text |
+| - | Retry loop backoff cap | NO (not a bug) | N/A | No retry loop; backoff is passive via is_available() |
+| - | Double-charge on 401 retry | NO (not a bug) | N/A | _ai_count incremented once per compress() call |
+| - | Batch compress() | NO (not a bug) | N/A | Caller builds combined text and calls once; partial-success handled by rule-based fallback |
+| - | Circular/recursive summary | NO (not a bug) | N/A | No self-referential call path exists |
+| - | Token quota accounting on failure | NO (not a bug) | N/A | Quota consumed at ingest time (before compress); not charged again on retry |
+| - | Timeout default change | DEFERRED | N/A | Hard limit: need evidence; 30s is explicit and reasonable |
+
+### Bugs Fixed
+
+**BUG-U-01**: `_compress_via_oauth` line 1242 — 5xx responses fell through the generic `_record_failure(reason)` branch (no `is_rate_limit=True`), so `_backoff_until` was never set. Next observation immediately retried against a degraded API. Fix: add `if resp.status_code >= 500` check before the generic 4xx check, calling `_record_failure(reason, is_rate_limit=True)`.
+
+**BUG-U-02**: `_call_ai_for_summary` had no `_record_success()` on HTTP 200 and no `_record_failure()` in the `except Exception` clause. A session summary success after degradation never cleared the degraded state. Connection errors during session summaries were silently swallowed (debug log only) and never counted toward the failure threshold. Fix: add both calls, plus 5xx transient treatment for parity with `_compress_via_oauth`.
+
+**BUG-U-03**: `data["content"][0]["text"]` in both `_compress_via_oauth` (line 1249) and `_call_ai_for_summary` (line 2463) raised `IndexError` or `KeyError` when: content array was empty, first block was `tool_use`/`thinking`, or `content` key was missing entirely. The `except Exception` handler caught these but recorded a vague failure reason. Fix: replace with `next((b for b in content_blocks if b.get("type") == "text"), None)` and record an explicit failure if no text block found.
+
+**BUG-U-04**: `_parse_typed_response` fallback paths returned the full `raw_text` without bounds: the `except` branch returned `raw_text` directly, and the success path used `or raw_text` when `content` was empty. An Anthropic response with non-JSON body (error HTML, partial response, etc.) would store the entire text as the observation summary in SQLite and the ChromaDB embedding document. Fix: add `_MAX_CONTENT_LEN = 300` class constant; both fallback paths now use `raw_text[:_cap]`. Normal short content is unchanged.
+
+### Tests Added
+
+**`tests/test_ai_compressor_edge_cases.py`** — 25 tests, 23 pass, 2 skip (require live ai_compressor not present in CI):
+
+- `TestFivexxBackoff` (6 tests): 500/502/503/504/429/529 all set `_backoff_until > now`
+- `TestCallAiForSummaryStateTracking` (2 tests, skipped in CI): live compressor state tracking
+- `TestCallAiForSummaryStateMockCompressor` (2 tests): 200 resets failures; exception increments failures
+- `TestContentBlockExtraction` (8 tests): empty array, non-text first block, no text block, normal path, missing key, non-JSON 200, both _call_ai_for_summary variants
+- `TestParseTypedResponseTruncation` (7 tests): invalid JSON capped, empty content capped, unicode capped by char count, short text unchanged, code-block-wrapped JSON still parses
+
+### Commits
+- `1f3e5e7` — fix(AICompressor): treat 5xx as transient (U-01) and robust content-block extraction (U-03 partial)
+- `3505322` — fix(_call_ai_for_summary): add _record_success/failure and robust content-block extraction (U-02 & U-03)
+- `034a7ec` — fix+test(AICompressor): bound fallback content to 300 chars (U-04) and add Pass U edge-case tests
+
+### Test Results
+- Before: 231 passed (Pass P baseline with pre-existing failures)
+- After: 260 passed, 2 skipped (no new failures)
+- New tests: 25 (23 pass, 2 skip)
+- Runtime: 0.23s for new tests only; 300s full suite
+
+### Deferrals
+- **Prompt injection**: hard limit — cannot change compression prompt text.
+- **Timeout default**: hard limit — need evidence that 30s is wrong; no data.
+- **5xx in _call_ai_for_summary before fix**: the 5xx backoff gap in `_call_ai_for_summary` is now also fixed (as part of U-02 work) even though it wasn't in the original U-01 scope.
