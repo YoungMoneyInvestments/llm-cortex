@@ -245,7 +245,8 @@ TOOLS = [
                 },
                 "graph_depth": {
                     "type": "integer",
-                    "description": "How many hops to traverse in the knowledge graph (1 or 2, default: 1)",
+                    "description": "How many hops to traverse in the knowledge graph (default: 1)",
+                    "enum": [1, 2],
                     "default": 1,
                 },
             },
