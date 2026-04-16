@@ -2380,6 +2380,10 @@ async def lifespan(app: FastAPI):
                 pass
 
     if db:
+        try:
+            db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except Exception:
+            pass
         db.close()
 
     if PID_FILE.exists():
