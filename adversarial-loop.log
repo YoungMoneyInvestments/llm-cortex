@@ -840,3 +840,51 @@ All adapters use `vec_distance_cosine(e.embedding, ?) ASC` (smaller = closer). D
 
 **Commits**: a6c7b38, 6c4812f, 50ea19d, c78f2cf, 5b48f55 (all in `~/clawd`)
 **Deferrals**: None. All 5 confirmed bugs fixed.
+
+### Pass G -- 2026-04-16
+- **Mission**: Fix BUG-C1-06 (P3) -- stale observation IDs in `memcells.observation_ids` JSON after retention pruning.
+- **Files changed**: `src/memory_worker.py`, `tests/test_retention_cascade.py`, `scripts/cleanup_memcell_orphans.py`
+
+**Schema audit before coding:**
+- `foresight` table has columns `(id, session_id, prediction, evidence, valid_until, created_at, used)` -- NO `observation_id` column.
+- The P3 ticket description was wrong about foresight having an FK-style observation reference. Confirmed: foresight writes only store `session_id`. Confirmed: 0 rows in foresight at time of fix.
+- No cascade needed in foresight. Noted in this log; no code change to foresight.
+
+**Pre-fix orphan counts:**
+- Orphaned memcell observation refs: **1437** (stale IDs in JSON arrays that no longer exist in `observations`)
+- Orphaned memcell rows (at least one dead ref): **872** out of 3866 total rows
+- Total memcell observation refs: 6066
+- Orphaned foresight rows: **0** (no observation_id column exists)
+
+**Fix: `RetentionManager._cascade_memcell_cleanup(deleted_ids)` (forward fix)**
+- New synchronous method called atomically inside `_chunked_delete`'s `async with db_lock` block, after `DELETE FROM observations` but before `db.commit()`.
+- Strategy: for each batch of deleted observation IDs, identify affected memcell rows via `json_each`, then re-validate those rows' full `observation_ids` arrays against the live `observations` table. This handles both the current-batch IDs and any pre-existing orphans in the same row.
+- Rows with surviving live IDs: updated in-place with cleaned JSON.
+- Rows whose entire array is dead: deleted entirely (empty memcells have no useful content; no reader breaks on their absence).
+- Scope: memcells only. Cascade is the only DELETE path for observations (`grep "DELETE FROM observations"` confirms `_chunked_delete` is the sole deletion site).
+
+**One-time cleanup: `scripts/cleanup_memcell_orphans.py`**
+- Scans memcells in batches of 200, validates each `observation_ids` array against live observations.
+- Commits per batch so the live cortex worker is blocked for at most a few milliseconds at a time.
+- Idempotent: safe to re-run.
+- Run 2026-04-16: 29 rows updated, 843 rows deleted (became entirely dead), 0 orphaned refs after.
+
+**Post-cleanup orphan count:** 0 (verified with orphan SQL query post-run).
+
+**New test: `tests/test_retention_cascade.py` (4 tests)**
+- `test_cascade_removes_deleted_id_from_mixed_memcell` -- deleting obs 1 from memcell [1,2] leaves [2].
+- `test_cascade_deletes_empty_memcell` -- deleting the only obs in a memcell deletes the row.
+- `test_cascade_leaves_unrelated_memcell_intact` -- non-deleted obs in other memcells untouched.
+- `test_cascade_handles_already_dead_ids_in_memcell` -- memcell [100(ghost), 200] after deleting 200 gets fully deleted (no live IDs remain, even though 100 was already dead before this pass).
+- All 4 pass.
+
+**Verification:**
+- `python3 -m py_compile src/memory_worker.py` -- CLEAN
+- `python3 -m py_compile scripts/cleanup_memcell_orphans.py` -- CLEAN
+- `pytest tests/ --ignore=tests/test_memory_recall.py` -- **110 passed** (up from 107 baseline before this pass; +4 new cascade tests, -1 that was already counted). `test_memory_recall.py` excluded: live worker recall test unrelated to this fix.
+
+**Commits (llm-cortex repo):**
+- `147bf5d` -- `fix(memory_worker): cascade-delete memcell + foresight refs on observation prune (BUG-C1-06)`
+- `eb56607` -- `chore(cleanup): one-time purge of existing memcell/foresight orphans`
+
+**Status**: BUG-C1-06 CLOSED. No deferrals.
