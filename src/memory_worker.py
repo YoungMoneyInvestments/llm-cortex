@@ -1863,8 +1863,18 @@ async def _extract_and_link_entities(
         if not entities:
             return
 
-        # Add each entity to the knowledge graph (idempotent)
+        # Add each entity to the knowledge graph (idempotent).
+        # Forward-fix (Pass Q): check resolve_entity FIRST to avoid downgrading
+        # a typed entity back to 'unknown'.  add_entity uses ON CONFLICT DO UPDATE
+        # which would overwrite entity_type — so if an entity already exists with a
+        # non-'unknown' type, skip the add_entity call entirely.
         for name, etype in entities:
+            existing_id = kg.resolve_entity(name)
+            if existing_id is not None:
+                existing_type = (kg.graph.nodes[existing_id].get("type") or "unknown")
+                if existing_type != "unknown" and etype == "unknown":
+                    # Entity already typed correctly — don't downgrade to 'unknown'
+                    continue
             kg.add_entity(name, etype)
 
         entity_extractor._entities_extracted_total += len(entities)
