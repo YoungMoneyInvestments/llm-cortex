@@ -774,3 +774,69 @@
 
 **Commits**: (see below — two focused commits)
 **Deferrals**: None. All BUG-D2-01 and BUG-D2-02 items closed.
+
+### Pass E — 2026-04-16
+- **Mission**: Adversarial audit of `conversation-memory` search adapters (discord.py, imessage.py, meta.py). Hunt cross-adapter contract drift, timestamp bugs, distance direction, limit clamping, SQL injection, placeholder overflow, encoding, VPS connector wiring, and connection lifecycle.
+- **Repo**: `~/clawd` (conversation-memory MCP server)
+- **Files changed**: `mcp-servers/conversation-memory/search/base.py`, `search/discord.py`, `search/imessage.py`, `search/meta.py`, `server.py`
+
+**Contract audit summary (row shape)**:
+
+| Field | iMessage | Discord | Facebook | Instagram |
+|-------|----------|---------|----------|-----------|
+| text | chunk_text | text | chunk_text | chunk_text |
+| source | "imessage" | "discord" | "facebook" | "instagram" |
+| distance | cosine ASC | cosine ASC | cosine ASC | cosine ASC |
+| similarity | 1-distance | 1-distance | 1-distance | 1-distance |
+| timestamp | NSDate ns | unix s | unix s | unix s |
+| contact_name | yes | None | derived from participants JSON | derived from participants JSON |
+| contact_identifier | phone | None | conversation_name | conversation_name |
+| channel_name | None | channel_name | None | None |
+| author_name | None | enriched from VPS | None | None |
+| message_count | yes | yes | yes | yes |
+
+All adapters use `vec_distance_cosine(e.embedding, ?) ASC` (smaller = closer). Direction is consistent.
+
+**BUG-E-01 (P0, FIXED): iMessage NSDate nanoseconds timestamps silently dropped**
+- Root cause: `safe_timestamp()` in `base.py` has a guard `if ts > MAX_VALID_TIMESTAMP: return None`. iMessage stores `start_time` as nanoseconds since 2001-01-01 (NSDate epoch). Actual values: 4.7e17 to 8.0e17. All exceed `MAX_VALID_TIMESTAMP=32503680000`. Result: every iMessage `SearchResult.timestamp` was `None`.
+- Impact: `get_person_recent` iMessage results always sort as oldest possible. Cross-platform recency ranking entirely broken for iMessage. Timestamps in to_dict() all null.
+- Fix: Added `safe_timestamp_nsdate()` in `base.py` that detects values >= 1e15, divides by 1e9, adds 978307200-second NSDate epoch offset. Updated `from_imessage_row` to call it. Tested against all 3 real DB extremes: 4.66e17 -> 2015-10-09, 6.38e17 -> 2021-03-28, 7.98e17 -> 2026-04-15. Correct.
+- Commit: `a6c7b38`
+
+**BUG-E-02 (P0, FIXED): TypeError crash in get_person_recent cross-platform sort**
+- Root cause: `server.py:181` — `all_results.sort(key=lambda x: x.timestamp or 0, reverse=True)`. When iMessage results (timestamp=None) and Discord/FB/IG results (timestamp=datetime) are mixed, `None or 0` produces int 0 while datetime stays datetime. Python 3 raises `TypeError: '<' not supported between instances of 'datetime.datetime' and 'int'`.
+- Impact: Any cross-platform `get_person_recent` call that hits both iMessage and at least one other platform crashes entirely.
+- Fix: Replace `or 0` with `or datetime.min` so None timestamps sort as oldest datetime instead of an int. Added `from datetime import datetime` import to server.py.
+- Commit: `6c4812f`
+
+**BUG-E-03 (P1, FIXED): LIKE wildcard injection in meta.py _build_name_filter**
+- Root cause: `_build_name_filter` inserts display names directly into `LIKE '%{name}%'` patterns via f-string. Names containing `%` or `_` silently expand into wildcards. A name like "O_Brien" would match "OxBrien"; "100%" would match any row. SQL injection into query semantics (not value injection since params are parameterized, but the pattern itself is dangerous).
+- Impact: Incorrect/over-broad matching for any FB/IG contact whose display name contains LIKE metacharacters. No SQL injection for values; pure semantic drift.
+- Fix: Escape `\\`, `%`, `_` in name before f-string interpolation. Add `ESCAPE '\\'` clause to both LIKE predicates. Verified against O_Brien, Test%Name, backslash cases.
+- Commit: `50ea19d`
+
+**BUG-E-04 (P2, FIXED): No per-adapter limit clamping**
+- Root cause: `search()` and `get_recent()` in all three adapters accepted arbitrary `limit` values. Server.py clamps to MAX_LIMIT=50 before calling adapters, but direct callers (CLI, tests, future code) bypass that gate.
+- Fix: Added `limit = max(1, min(limit, MAX_LIMIT))` at entry of `search()` and `get_recent()` in all three adapters. Imported `MAX_LIMIT` from `config` in each adapter.
+- Commit: `c78f2cf`
+
+**BUG-E-05 (P2, FIXED): Discord author enrichment silently truncated at 500 messages**
+- Root cause: `_enrich_with_authors` in discord.py called `vps.get_author_for_messages(all_message_ids[:500])`. The `chunk_to_messages` dict is built from all messages, so chunks whose messages appear after position 500 in `all_message_ids` never get an `author_name` assignment. `VPSConnector.get_author_for_messages` already batches in 500-row blocks internally, making the outer cap redundant and harmful.
+- Fix: Removed the `[:500]` slice, passing full `all_message_ids` list to VPS.
+- Commit: `5b48f55`
+
+**Checked / not bugs**:
+- `_build_name_filter` SQL injection (values): parameterized correctly, not a bug.
+- SQLite IN-clause placeholder overflow: SQLite 3.51.0 supports 32K+ bind vars in IN clauses. With MAX_LIMIT=50 and chunk fan-out, max practical count ~2500. Not a concern.
+- `vec_distance_cosine` direction: all four adapters sort ASC (smaller=closer). Consistent.
+- Connection lifecycle: singleton + long-lived connection is intentional for stdio MCP server. Not a leak.
+- Discord post-prune stale rows: JOIN on chunk_embeddings->chunks naturally excludes rows with no embedding entry. Not a concern.
+- Meta.py encoding: json.loads with try/except handles emoji/mixed-script participants JSON; fallback to conv_name if decode fails.
+- VPS connector (Pass 6): all config reads from `config.py` which has correct defaults (104.237.203.117:47822). Connector wired correctly.
+
+**Verification**:
+- `python3 -m py_compile search/base.py search/imessage.py search/discord.py search/meta.py search/__init__.py server.py` — all CLEAN
+- `pytest tests/ -x -v` — 2 passed (pre-existing suite covers stdio framing)
+
+**Commits**: a6c7b38, 6c4812f, 50ea19d, c78f2cf, 5b48f55 (all in `~/clawd`)
+**Deferrals**: None. All 5 confirmed bugs fixed.
