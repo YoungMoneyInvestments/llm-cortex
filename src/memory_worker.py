@@ -50,6 +50,13 @@ from subscription import DEFAULT_TIER, get_tier_config, parse_tier
 WORKER_PORT = 37778
 DATA_DIR = Path.home() / "clawd" / "data"
 DB_PATH = DATA_DIR / "cortex-observations.db"
+# Canonical vector DB lives in ~/.cortex/data — shared singleton path used by
+# unified_vector_store.py module default (CORTEX_DATA_DIR env var, else ~/.cortex/data).
+# Keep separate from DATA_DIR to avoid split-brain: observations stay in clawd/data,
+# vectors stay in .cortex/data. (BUG-006 fix, Pass 5)
+VEC_DATA_DIR = Path(
+    os.environ.get("CORTEX_DATA_DIR", str(Path.home() / ".cortex" / "data"))
+)
 PID_FILE = Path.home() / ".openclaw" / "worker.pid"
 LOG_DIR = Path.home() / ".openclaw" / "logs"
 LOG_FILE = LOG_DIR / "memory-worker.log"
@@ -2606,7 +2613,7 @@ async def get_recent_sessions(limit: int = 10, offset: int = 0):
 
 def _get_retriever():
     """Return a MemoryRetriever instance (same DB as worker)."""
-    return MemoryRetriever(obs_db_path=DB_PATH, vec_db_path=DATA_DIR / "cortex-vectors.db")
+    return MemoryRetriever(obs_db_path=DB_PATH, vec_db_path=VEC_DATA_DIR / "cortex-vectors.db")
 
 
 @app.post("/api/memory/search")

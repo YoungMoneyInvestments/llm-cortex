@@ -166,7 +166,36 @@
 - **BUG-005 STATUS**: FIXED
 
 ### Pass 5 — 2026-04-16
-- (Pass 5 entry not recorded in this log — owned by unified_vector_store.py work per mission brief. BUG-006 remains open.)
+- **Subsystem**: unified_vector_store / cortex-vectors.db path consolidation
+- **Bug**: BUG-006 — Two `cortex-vectors.db` files existed and were diverging:
+  - `~/.cortex/data/cortex-vectors.db` (14MB after WAL checkpoint): 7,055 rows, newest 2026-04-16 — **active writer** (PID 1530 FDs 16/17/18)
+  - `~/clawd/data/cortex-vectors.db` (36MB): 10,586 rows, newest 2026-04-13 — stopped receiving writes 3 days prior
+- **Root cause**: `unified_vector_store.py` global singleton `get_vector_store()` uses first-caller path. `memory_worker.py` set `DATA_DIR = ~/clawd/data` and passed `vec_db_path=DATA_DIR/"cortex-vectors.db"` to `MemoryRetriever`, but the module-level default (`CORTEX_DATA_DIR` env var, else `~/.cortex/data`) wins for the singleton. lsof confirmed worker was writing to `~/.cortex/data`, not `~/clawd/data`. The `clawd/data` DB diverged and stalled at Apr 13 when the singleton path took over.
+- **Canonical path decision**: `~/.cortex/data/cortex-vectors.db` — it is the active write target per lsof, has the most recent rows (Apr 16), and matches the `unified_vector_store.py` module default. The task brief noted `clawd/data` as the expected canonical; investigation reversed this. The larger (36MB) file was older.
+- **Pre-merge stats**:
+  - Canonical (`~/.cortex/data`): 7,055 rows, newest 2026-04-16 02:54:47
+  - Losing (`~/clawd/data`): 10,586 rows, newest 2026-04-13 19:27:10
+  - Overlap: 1 row (kg-manual-20260329-082820)
+  - Unique rows in losing (to merge): 10,585
+- **Merge execution**:
+  - Stopped `com.cortex.memory-worker` (launchctl unload) — verified PID gone
+  - `PRAGMA wal_checkpoint(TRUNCATE)` on canonical — flushed 5MB WAL
+  - Backed up both DBs: `cortex-vectors.db.bak-pass5-canonical` and `cortex-vectors.db.bak-pass5-merge-candidate`
+  - Merged all 10,585 unique rows from losing DB into canonical via `INSERT INTO documents ... ON CONFLICT(id) DO NOTHING`
+  - Set `has_embedding=0` for merged rows (forcing backfill rather than copying potentially stale embeddings)
+  - Ran `INSERT INTO documents_fts(documents_fts) VALUES('rebuild')` to regenerate FTS5 index
+  - Post-merge canonical: 17,641 rows (knowledge=5,802, observations=11,839), newest 2026-04-16 21:14:37
+  - Renamed losing DB + sidecars to `.bak-pass5-retired` (not deleted)
+- **Files changed**:
+  - `src/memory_worker.py`: Added `VEC_DATA_DIR` constant using `CORTEX_DATA_DIR` env var (default `~/.cortex/data`), separate from `DATA_DIR` (which stays at `~/clawd/data` for observations). Changed `_get_retriever()` to pass `vec_db_path=VEC_DATA_DIR/"cortex-vectors.db"` instead of `DATA_DIR/"cortex-vectors.db"`. Prevents path split-brain on next startup.
+- **Verification**:
+  - `python3 -m py_compile src/memory_worker.py` — clean
+  - Worker restarted (`launchctl load`); `lsof -p $(pgrep -f memory_worker) | grep cortex-vectors` confirms only `~/.cortex/data/cortex-vectors.db` open
+  - `GET /api/health` → `{"status":"healthy","uptime_seconds":24,"pending_observations":0,...}`
+  - `POST /api/memory/search {"query":"BrokerBridge architecture"}` → 3 results returned (observations + vector store sources)
+  - `pytest tests/` → 77 passed, 1 failed (`test_memory_recall_rate`) — pre-existing failure confirmed by git stash test (same failure on prior commit `a99a006`). Not a regression.
+- **Root cause note (deferred)**: The singleton-masks-path pattern in `get_vector_store()` is the underlying bug. If any future caller passes an explicit `db_path`, it will be silently ignored after the first call. Fix in a future pass: either remove the path param from the public API, or reset `_store_instance` when a different path is requested.
+- **BUG-006 STATUS**: FIXED
 
 ### Pass 6 — 2026-04-16
 - **Subsystem**: VPS connector SSH — `~/clawd/mcp-servers/conversation-memory/`
