@@ -27,6 +27,7 @@ Usage:
 """
 
 import json
+import logging
 import os
 import sqlite3
 import sys
@@ -36,6 +37,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from memory_retriever import MemoryRetriever
+
+logger = logging.getLogger("cortex-mcp")
 
 # Lazy-loaded sentence-transformer model for message search (384-dim, all-MiniLM-L6-v2)
 _ST_MODEL = None
@@ -457,9 +460,11 @@ def search_contacts(query: str, relationship_type: str = None, limit: int = 10) 
 
 def handle_tool_call(name: str, arguments: dict) -> dict:
     """Handle a tool call and return the result."""
-    retriever = MemoryRetriever()
+    retriever = None
 
     try:
+        retriever = MemoryRetriever()
+
         if name == "cami_memory_search":
             results = retriever.search(
                 query=arguments["query"],
@@ -860,12 +865,14 @@ def handle_tool_call(name: str, arguments: dict) -> dict:
             }
 
     except Exception as e:
+        logger.exception("Tool %s failed: %s", name, e)
         return {
             "content": [{"type": "text", "text": f"Error: {str(e)}"}],
             "isError": True,
         }
     finally:
-        retriever.close()
+        if retriever is not None:
+            retriever.close()
 
 
 # ── MCP Protocol handler ───────────────────────────────────────────────────
