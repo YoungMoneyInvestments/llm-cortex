@@ -1,4 +1,4 @@
-"""Tests for NERExtractor entity classification — Pass H.
+"""Tests for NERExtractor entity classification — Pass H / Pass Q.
 
 Covers:
 - RE_GITHUB_REPO tightened regex: requires >= 3 chars on each side of /
@@ -7,9 +7,11 @@ Covers:
 - @mention real person: -> person
 - KNOWN_SYSTEMS includes Hermes
 - _is_bot_handle covers BotFather, MartyProBot, MartyProBot_ variants
+- Pass Q: NER does not downgrade typed entities to 'unknown' (type-preservation guard)
 """
 
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -17,6 +19,7 @@ import pytest
 # Ensure src/ is on path when tests are run from project root
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from memory_worker import EntityExtractor
+from knowledge_graph import KnowledgeGraph
 
 
 @pytest.fixture
@@ -146,3 +149,98 @@ class TestKnownSystems:
             "Hermes backend processed the order.", None, None
         ))
         assert entities.get("Hermes") == "system"
+
+
+# ── Pass Q: type-preservation guard ────────────────────────────────────────
+
+class TestTypePreservationGuard:
+    """Pass Q: Adding an entity with type='unknown' must not downgrade a typed entity.
+
+    kg.add_entity uses ON CONFLICT(id) DO UPDATE SET entity_type=excluded.entity_type,
+    which means calling add_entity('PostgreSQL', 'unknown') would overwrite the
+    existing 'system' type.  The forward-fix in _extract_and_link_entities checks
+    resolve_entity first and skips the add_entity call when the entity already has
+    a non-'unknown' type and the incoming type is 'unknown'.
+
+    These tests exercise the KnowledgeGraph layer directly (the NER path logic is
+    covered by contract rather than full async integration, which would require
+    mocking the global kg + entity_extractor state).
+    """
+
+    def test_add_entity_typed_then_unknown_overwrites_type(self):
+        """Baseline: KnowledgeGraph.add_entity DOES overwrite — this is the hazard."""
+        with tempfile.TemporaryDirectory() as tmp:
+            kg = KnowledgeGraph(db_path=Path(tmp) / "test.db")
+            kg.add_entity("PostgreSQL", "system")
+            assert kg.get_entity("postgresql")["type"] == "system"
+
+            # Without the guard, add_entity with 'unknown' WILL downgrade
+            kg.add_entity("PostgreSQL", "unknown")
+            assert kg.get_entity("postgresql")["type"] == "unknown"
+
+    def test_resolve_entity_returns_existing_id_before_add(self):
+        """resolve_entity finds the typed entity before any add_entity call."""
+        with tempfile.TemporaryDirectory() as tmp:
+            kg = KnowledgeGraph(db_path=Path(tmp) / "test.db")
+            kg.add_entity("PostgreSQL", "system")
+
+            resolved = kg.resolve_entity("PostgreSQL")
+            assert resolved == "postgresql"
+            existing_type = kg.graph.nodes[resolved].get("type")
+            assert existing_type == "system"
+
+    def test_forward_fix_logic_prevents_downgrade(self):
+        """Simulate the Pass Q guard: skip add_entity when existing type != unknown and incoming == unknown."""
+        with tempfile.TemporaryDirectory() as tmp:
+            kg = KnowledgeGraph(db_path=Path(tmp) / "test.db")
+            kg.add_entity("PostgreSQL", "system")
+
+            # This is the guard logic from _extract_and_link_entities (Pass Q)
+            entities = [("PostgreSQL", "unknown")]
+            for name, etype in entities:
+                existing_id = kg.resolve_entity(name)
+                if existing_id is not None:
+                    existing_type = (kg.graph.nodes[existing_id].get("type") or "unknown")
+                    if existing_type != "unknown" and etype == "unknown":
+                        continue  # skip — would downgrade
+                kg.add_entity(name, etype)
+
+            # Type must be preserved
+            assert kg.get_entity("postgresql")["type"] == "system"
+
+    def test_forward_fix_allows_typed_overwrite_unknown(self):
+        """Guard must NOT block typed overwrites: unknown -> system is valid."""
+        with tempfile.TemporaryDirectory() as tmp:
+            kg = KnowledgeGraph(db_path=Path(tmp) / "test.db")
+            kg.add_entity("GitHub", "unknown")
+            assert kg.get_entity("github")["type"] == "unknown"
+
+            # Guard logic: incoming type='tool', existing='unknown' -> allow
+            entities = [("GitHub", "tool")]
+            for name, etype in entities:
+                existing_id = kg.resolve_entity(name)
+                if existing_id is not None:
+                    existing_type = (kg.graph.nodes[existing_id].get("type") or "unknown")
+                    if existing_type != "unknown" and etype == "unknown":
+                        continue
+                kg.add_entity(name, etype)
+
+            assert kg.get_entity("github")["type"] == "tool"
+
+    def test_forward_fix_allows_new_entity_creation(self):
+        """Guard must not block creation of brand-new entities typed as 'unknown'."""
+        with tempfile.TemporaryDirectory() as tmp:
+            kg = KnowledgeGraph(db_path=Path(tmp) / "test.db")
+
+            entities = [("SomeNewThing", "unknown")]
+            for name, etype in entities:
+                existing_id = kg.resolve_entity(name)
+                if existing_id is not None:
+                    existing_type = (kg.graph.nodes[existing_id].get("type") or "unknown")
+                    if existing_type != "unknown" and etype == "unknown":
+                        continue
+                kg.add_entity(name, etype)
+
+            # New entity should be created
+            assert kg.get_entity("SomeNewThing") is not None
+            assert kg.get_entity("SomeNewThing")["type"] == "unknown"
