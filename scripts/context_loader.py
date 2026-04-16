@@ -309,10 +309,10 @@ def cortex_recall(cwd: Optional[str] = None) -> str:
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with urllib.request.urlopen(req, timeout=2) as resp:
             body = json.loads(resp.read().decode("utf-8"))
     except (urllib.error.URLError, OSError, json.JSONDecodeError, TimeoutError):
-        return ""
+        return "(cortex worker unreachable)"
 
     results = body.get("results", [])
     if not results:
@@ -344,11 +344,13 @@ def cortex_recall(cwd: Optional[str] = None) -> str:
 OBSIDIAN_VAULT = Path.home() / "Library" / "Mobile Documents" / "iCloud~md~obsidian" / "Documents" / "Cameron"
 
 # Maps project directory name (or path fragment) to vault folder name.
-# Checked in order — first match wins.
+# Checked in order — first match wins. More-specific patterns must come before
+# broader fallbacks (e.g. brokerbridge-retail-hermes before bare brokerbridge).
 _PROJECT_VAULT_MAP: list[tuple[str, str]] = [
-    ("broker-bridge-retail", "BrokerBridge"),
+    ("brokerbridge-retail-hermes", "BrokerBridge"),  # unified retail product (2026-04-14+)
+    ("broker-bridge-retail", "BrokerBridge"),         # legacy name (still exists on disk)
     ("MCP-Servers/brokerbridge", "BrokerBridgeMCP"),
-    ("brokerbridge", "BrokerBridgeMCP"),   # fallback for bare name
+    ("brokerbridge", "BrokerBridgeMCP"),              # fallback for bare name
     ("openclaw", "OpenClaw"),
     ("matrix-lstm", "MatrixLSTM"),
     ("moltytrades", "MoltyTrades"),
