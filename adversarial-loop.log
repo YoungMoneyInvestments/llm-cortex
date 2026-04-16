@@ -2515,6 +2515,6 @@ items, accepted risks, verification status, and recommended next steps.
 - **All numeric claims sourced from:** log entries, live API responses, git log
 
 ### Commits
-- See commit SHA below after commit
+- `ec9952c docs: adversarial loop final report (Pass HH)`
 
 **STATUS: COMPLETE -- 710-line report written, all claims source-backed, no source code modified.**
