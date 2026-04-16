@@ -1308,21 +1308,31 @@ class AICompressor:
             f"Observation:\n{observation_text}"
         )
 
+    # Maximum characters allowed in stored content.  Downstream storage
+    # (SQLite summary column, ChromaDB embedding documents) must not receive
+    # unbounded text when the model returns non-JSON or omits the content key.
+    _MAX_CONTENT_LEN = 300
+
     @staticmethod
     def _parse_typed_response(raw_text: str) -> tuple[str, Optional[str], Optional[str]]:
         """Parse a typed JSON compression response.
 
         Returns (content, memory_type, entities_json).
         Falls back gracefully if JSON is invalid or fields are missing.
+        Content is always bounded to _MAX_CONTENT_LEN characters.
         """
         VALID_TYPES = {"episodic", "decision", "preference", "fact"}
+        _cap = AICompressor._MAX_CONTENT_LEN
         try:
             clean = raw_text.strip()
             if clean.startswith("```"):
                 clean = re.sub(r"^```(?:json)?\s*", "", clean)
                 clean = re.sub(r"\s*```$", "", clean)
             parsed = json.loads(clean)
-            content = str(parsed.get("content", raw_text)).strip() or raw_text
+            raw_content = str(parsed.get("content", "")).strip()
+            # If the parsed content is empty, fall back to a truncated snippet
+            # of raw_text rather than storing the full (potentially huge) blob.
+            content = raw_content[:_cap] if raw_content else raw_text[:_cap]
             memory_type = parsed.get("type")
             if memory_type not in VALID_TYPES:
                 memory_type = "episodic"
@@ -1333,7 +1343,7 @@ class AICompressor:
             entities = [str(e) for e in entities if e]
             return content, memory_type, json.dumps(entities)
         except (json.JSONDecodeError, TypeError, KeyError):
-            return raw_text, "episodic", json.dumps([])
+            return raw_text[:_cap], "episodic", json.dumps([])
 
 
 async def _sync_to_vector_store(obs_id: int, summary: str, row: sqlite3.Row):
