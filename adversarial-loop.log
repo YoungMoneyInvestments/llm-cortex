@@ -211,3 +211,42 @@
 - **Commit**: `8a04df1` in clawd repo (`fix(vps_connector): use explicit IPs + port for Tailscale/SSH reliability`)
 - **Deferred**: Worktrees (nervous-shaw, clever-kare, silly-matsumoto) still have the old `config.py` — they are working branches and should be updated when rebased or merged.
 - **BUG-007 STATUS**: FIXED
+
+### Pass A2 — 2026-04-16
+- **Subsystem**: knowledge_graph.py (~40KB, entity relationship graph, backs `cami_memory_graph_search` MCP tool)
+- **DB audit**: 9,731 entities, 37,721 relationships, 6,853 aliases (all self-referential — see BUG-A2-01). Entity types: unknown (3,597), tool (3,519), file (1,260), person (680), system (523), ticker (81), company (54), project (17). Top entities by degree: strat (4,160 edges), brokerbridge (3,804), discord (2,304). 2,645 orphan entities (no edges -- normal for entities extracted but never co-mentioned). Zero dangling FK violations. No case-duplicate entity IDs.
+- **Stale-reference check**: No references to localhost:8317, CamiRouter, or OpenAI API found in knowledge_graph.py. Clean.
+- **Bugs confirmed and fixed (commit 6cef09f)**:
+
+  **BUG-A2-01 (FIXED): Self-referential alias table -- 100% of 6,853 rows useless**
+  - Root cause: `add_entity` called `add_alias(entity_id, normalized_id)` at line 366. `add_alias` normalizes both arguments via `_normalize_id()`. Since `normalized_id` is already the normalized form of `entity_id`, both normalize to the same string, producing alias='cameron' -> canonical_id='cameron'. All 6,853 rows were alias=canonical_id.
+  - Impact: Alias lookups in `resolve_entity` never resolved to a different canonical. Alias table wasted 6,853 rows and was meaningless for its intended purpose.
+  - Fix: Removed the auto-alias call in `add_entity`. Callers must use `add_alias()` explicitly for genuinely different aliases.
+  - DB cleanup: All 6,853 self-referential rows deleted (backup: cortex-knowledge-graph.db.bak-passA2).
+
+  **BUG-A2-02 (FIXED): `find_path` explored full graph before applying max_hops filter**
+  - Root cause: Used `nx.shortest_path()` (no cutoff), then filtered `len(path) <= max_hops + 1` after full BFS. On a 37k-edge graph this traverses the entire graph even when max_hops=1. Additionally `nx.NodeNotFound` was not caught -- could raise unhandled exception if `resolve_entity` returned a node ID that no longer exists in the in-memory graph.
+  - Fix: Switch to `nx.single_source_shortest_path(cutoff=max_hops)` which stops BFS at the depth limit. Added `NodeNotFound` to the except clause alongside `NetworkXNoPath`.
+
+  **BUG-A2-03 (FIXED): `query_by_relationship(direction='in')` returned same results as `direction='out'`**
+  - Root cause: Method iterated `self.graph.edges(data=True)` unconditionally. `graph.edges()` in NetworkX only yields outgoing edges. The `direction` parameter was used only to label results 'incoming' or 'outgoing' -- not to actually filter direction.
+  - Reproduction: `query_by_relationship('discussed', 'in')` and `query_by_relationship('discussed', 'out')` both returned 2,767 results with identical edge lists, just different 'direction' label strings.
+  - Fix: Route through `graph.in_edges(data=True)` when `direction='in'` so the filter is structural, not cosmetic.
+
+  **BUG-A2-04 (FIXED): `decay_strength` O(stale * E) inner loop for in-memory update**
+  - Root cause: For each decayed relationship row, the code did a full `self.graph.edges(keys=True, data=True)` scan to find the matching edge by `db_id`. With 37,721 edges and potentially thousands of stale rows, this is O(stale * E).
+  - Fix: Build a `db_id -> (u, v, k)` dict once before the per-row loop. In-memory update is now O(1) per row.
+
+- **Deferred bugs**:
+
+  **BUG-A2-05 (DEFERRED): `resolve_entity` fuzzy scan O(N) + false positive matches**
+  - `resolve_entity("nonexistent_xyz")` takes 0.457s scanning all 9,731 entity IDs.
+  - `resolve_entity("disc")` returns 'dis' (not 'discord'). `resolve_entity("test")` returns 'tests'.
+  - Severity: Performance (0.5s per miss) + correctness (wrong entity returned for short tokens). Threshold of 0.8 is not high enough for short query terms.
+  - Deferred: Requires raising threshold or disabling fuzzy for short names -- a behavior change needing Cameron's input on acceptable false-positive rate.
+
+  **BUG-A2-06 (DEFERRED): `decay_strength` multiplicative compounding**
+  - Strength is reduced relative to the current stored value on each call, not the original. Repeated decay calls compound (e.g. 0.5 * 0.5 * 0.5 = 0.125 after 3 calls rather than a smooth linear curve from original). Intent is unclear -- could be intentional. Deferred until Cameron clarifies desired decay semantics.
+
+- **Tests**: `pytest tests/test_knowledge_graph.py` -- 1 passed. Full suite 77 passed, 1 pre-existing failure (`test_memory_recall_rate` -- sqlite_vec not installed, unrelated).
+- **Commit**: `6cef09f` in llm-cortex repo (`fix(knowledge_graph): four confirmed bugs in graph traversal and alias table`)
