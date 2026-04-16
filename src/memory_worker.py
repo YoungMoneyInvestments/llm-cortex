@@ -1291,6 +1291,8 @@ class EntityExtractor:
         "PostgreSQL", "SQLite", "NetworkX", "FastAPI", "Uvicorn",
         "Playwright", "ChromaDB", "Tailscale", "Docker", "Nginx",
         "KPL", "Strat", "VWAP",
+        # Retail / Hermes platform
+        "Hermes",
     }
     _KNOWN_SYSTEMS_LOWER: Dict[str, str] = {s.lower(): s for s in KNOWN_SYSTEMS}
 
@@ -1870,18 +1872,102 @@ class RetentionManager:
         return await self._chunked_update(all_ids)
 
     async def _chunked_delete(self, ids: list[int]) -> int:
-        """DELETE observations in batches, releasing db_lock between batches."""
+        """DELETE observations in batches, releasing db_lock between batches.
+
+        Each batch is atomic: observation DELETE + memcells cascade all happen
+        inside the same db_lock acquisition so no concurrent reader can see a
+        half-cleaned state.
+        """
         total = 0
         for i in range(0, len(ids), RETENTION_BATCH_SIZE):
             batch = ids[i:i + RETENTION_BATCH_SIZE]
+            batch_set = set(batch)
             placeholders = ",".join("?" for _ in batch)
             async with db_lock:
                 db.execute(f"DELETE FROM observations WHERE id IN ({placeholders})", batch)
+                self._cascade_memcell_cleanup(batch_set)
                 db.commit()
             total += len(batch)
             if i + RETENTION_BATCH_SIZE < len(ids):
                 await asyncio.sleep(0.1)
         return total
+
+    def _cascade_memcell_cleanup(self, deleted_ids: set) -> None:
+        """Remove dead observation IDs from memcells.observation_ids JSON arrays.
+
+        Called inside an active db_lock acquisition (no re-entry needed).
+        Rows whose observation_ids array becomes empty are deleted entirely —
+        a memcell with no observations has no useful content.
+
+        Strategy: for any memcell that references at least one of the just-deleted
+        IDs, re-validate its entire array against the live observations table.  This
+        handles both the current-batch deletes *and* any previously-orphaned IDs that
+        happened to live in the same row, eliminating accumulated stale refs in a
+        single pass.
+
+        Args:
+            deleted_ids: set of observation IDs that were just deleted (used only to
+                narrow which memcell rows to inspect).
+        """
+        if db is None or not deleted_ids:
+            return
+
+        # Fetch only memcell rows that actually reference at least one deleted ID.
+        # json_each lets SQLite expand the array so we avoid loading all 3k+ rows.
+        placeholders = ",".join("?" for _ in deleted_ids)
+        affected = db.execute(
+            f"""SELECT DISTINCT mc.id, mc.observation_ids
+                FROM memcells mc, json_each(mc.observation_ids) je
+                WHERE CAST(je.value AS INTEGER) IN ({placeholders})""",
+            list(deleted_ids),
+        ).fetchall()
+
+        if not affected:
+            return
+
+        # Build the set of IDs that are still alive.  We only need to look up the
+        # IDs referenced by the affected rows — far cheaper than a full table scan.
+        candidate_ids: set[int] = set()
+        for row in affected:
+            try:
+                candidate_ids.update(json.loads(row["observation_ids"]))
+            except (ValueError, TypeError):
+                pass
+
+        if candidate_ids:
+            ph2 = ",".join("?" for _ in candidate_ids)
+            live_ids: set[int] = {
+                r[0]
+                for r in db.execute(
+                    f"SELECT id FROM observations WHERE id IN ({ph2})",
+                    list(candidate_ids),
+                ).fetchall()
+            }
+        else:
+            live_ids = set()
+
+        delete_mc_ids: list[int] = []
+        updates: list[tuple[str, int]] = []
+
+        for row in affected:
+            try:
+                obs_list = json.loads(row["observation_ids"])
+            except (ValueError, TypeError):
+                continue
+            cleaned = [oid for oid in obs_list if oid in live_ids]
+            if cleaned:
+                updates.append((json.dumps(cleaned), row["id"]))
+            else:
+                delete_mc_ids.append(row["id"])
+
+        if updates:
+            db.executemany(
+                "UPDATE memcells SET observation_ids = ? WHERE id = ?",
+                updates,
+            )
+        if delete_mc_ids:
+            del_ph = ",".join("?" for _ in delete_mc_ids)
+            db.execute(f"DELETE FROM memcells WHERE id IN ({del_ph})", delete_mc_ids)
 
     async def _chunked_update(self, ids: list[int]) -> int:
         """NULL raw fields in batches, releasing db_lock between batches."""
