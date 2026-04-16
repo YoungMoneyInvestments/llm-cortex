@@ -25,13 +25,11 @@ Usage:
     details = retriever.get_details(["obs-42", "obs-43"])
 """
 
-import json
 import logging
 import os
 import re
 import sqlite3
 import sys
-import time
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -417,8 +415,8 @@ class MemoryRetriever:
             results = self._search_observations_fts(query, limit, source, agent, session_id)
             if results is not None:
                 return results
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("FTS5 search failed, falling back to LIKE: %s", e)
 
         # Fallback to LIKE matching
         return self._search_observations_like(query, limit, source, agent, session_id)
@@ -439,16 +437,24 @@ class MemoryRetriever:
         if not exists:
             return None
 
-        # Build FTS5 query — OR-join for permissive matching
+        # Build FTS5 query — OR-join for permissive matching.
+        # Each term is sanitized to alphanumeric + _ and - only.  If a term
+        # consists entirely of characters that are stripped (e.g. pure emoji or
+        # punctuation), its sanitized form is empty and must be excluded from the
+        # query — an empty phrase literal '""' passed to FTS5 MATCH silently
+        # returns no rows without triggering the LIKE fallback.
         terms = query.strip().split()
         if not terms:
             return None
-        fts_query = " OR ".join(
-            f'"{("".join(c for c in t if c.isalnum() or c in "_-"))}"'
+        cleaned_terms = [
+            "".join(c for c in t if c.isalnum() or c in "_-")
             for t in terms if t
-        )
-        if not fts_query:
+        ]
+        # Drop terms that sanitized to empty (pure emoji, punctuation-only, etc.)
+        fts_terms = [ct for ct in cleaned_terms if ct]
+        if not fts_terms:
             return None
+        fts_query = " OR ".join(f'"{ct}"' for ct in fts_terms)
 
         # Build filter conditions on the joined observations table
         filters = ["o.status = 'processed'"]
@@ -984,12 +990,25 @@ class MemoryRetriever:
         if not expanded_entity_names:
             return base_results
 
-        # Search for observations mentioning related entities
+        # Search for observations mentioning related entities.
+        # Cap the fan-out: a large graph (hops=2 on a dense KG) can yield hundreds
+        # of neighbors.  Each expansion fires a full search(), so without a cap the
+        # loop is O(|neighbors|) searches.  20 entities is enough context without
+        # hammering the DB on every graph-augmented query.
+        _MAX_EXPANSION_ENTITIES = 20
+        capped_entity_names = list(expanded_entity_names)[:_MAX_EXPANSION_ENTITIES]
+        if len(expanded_entity_names) > _MAX_EXPANSION_ENTITIES:
+            logger.debug(
+                "search_with_context: capped graph expansion from %d to %d entities",
+                len(expanded_entity_names),
+                _MAX_EXPANSION_ENTITIES,
+            )
+
         # Build a query from the expanded entity names
         existing_ids = {r.get("obs_id") or r.get("id") for r in base_results}
         expansion_results = []
 
-        for entity_name in expanded_entity_names:
+        for entity_name in capped_entity_names:
             # Search for each related entity (small limit to avoid overwhelming)
             try:
                 entity_results = self.search(
