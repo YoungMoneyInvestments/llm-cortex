@@ -1547,3 +1547,39 @@ Post-change: 144 passed, 1 failed (same pre-existing failure — no regression).
 
 See below for SHAs after commit.
 
+### Pass S -- 2026-04-16
+
+**Mission**: Close Pass N deferral N-6 — `vacuum()` was never called and FTS5 `optimize` was never run, causing fragmentation and FTS segment bloat over time.
+
+**Findings**:
+- `unified_vector_store.vacuum()` existed but had zero callers.
+- FTS table names differ per DB: `documents_fts` (vectors), `observations_fts` (observations). `cortex-knowledge-graph.db` has no FTS table.
+- `cortex-observations.db` was 0 bytes in one path; live memory worker holds an active lock on the real 36 MB copy — maintenance must tolerate graceful lock failures.
+- Python `sqlite3` module defaults to `isolation_level=""` which opens an implicit transaction, causing `VACUUM` to fail with "cannot VACUUM from within a transaction". Fix: `isolation_level=None` (autocommit).
+
+**Work Done**:
+
+**`scripts/maintenance.py`** (307 lines):
+- PRAGMA `busy_timeout=30000` + `isolation_level=None` on each connection.
+- Per-DB phases: WAL checkpoint, FTS optimize (where applicable), VACUUM.
+- flock on `/tmp/cortex_maintenance.lock` — overlapping runs skip cleanly.
+- WAL mtime guard: skip DB if WAL modified < 5s ago (Pass Q coordination for entity merges).
+- Skip logic for missing and 0-byte files.
+- Structured per-DB result dict; exit 0 even when a DB is locked (graceful skip), exit 1 only on unexpected error.
+- Writes `~/.cortex/data/maintenance-last-run.json` with per-DB size before/after, phase timings, status.
+- `--dry-run` flag prints plan without executing.
+
+**`~/Library/LaunchAgents/com.cortex.maintenance.plist`**:
+- Runs weekly Sunday 04:00.
+- Same Python interpreter as memory-worker (`/Users/cameronbennion/clawd/venv/bin/python3`).
+- stdout + stderr to `~/.cortex/logs/maintenance.log`.
+- NOT loaded via launchctl — Cameron loads manually after review.
+
+**First-Run Results**:
+- cortex-vectors.db: 51.094 MB -> 47.648 MB (saved 3.446 MB). All phases ok.
+- cortex-observations.db: 36.590 MB, locked by live worker. Checkpoint ok (31s busy wait), FTS + VACUUM gracefully skipped.
+- cortex-knowledge-graph.db: 0.051 MB. Checkpoint + VACUUM ok, FTS n/a.
+
+**Commits**:
+- `fb30f64` -- llm-cortex -- `feat(maintenance): weekly VACUUM + FTS optimize + WAL checkpoint script`
+
