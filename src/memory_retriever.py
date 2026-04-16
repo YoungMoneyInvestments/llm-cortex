@@ -234,13 +234,17 @@ class MemoryRetriever:
                     r["score"] = 0.5
                 continue
 
-            if origin in ("observations", "vector_store"):
+            if origin in ("observations", "vector_store") and max_s <= 0:
                 # BM25/rank: more negative = better. Invert so higher = better.
+                # Only applies when all scores are non-positive (raw FTS path).
+                # Hybrid search returns positive 0-1 scores (higher = better)
+                # and must NOT be inverted — fall through to the generic branch.
                 for r in group:
                     raw = r.get("score", 0)
                     r["score"] = (max_s - raw) / (max_s - min_s)
             else:
-                # Generic: assume higher = better
+                # Generic: assume higher = better (covers hybrid vector_store
+                # results where hybrid_score is already 0-1 positive).
                 for r in group:
                     raw = r.get("score", 0)
                     r["score"] = (raw - min_s) / (max_s - min_s)
