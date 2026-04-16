@@ -2204,6 +2204,16 @@ async def _call_ai_for_summary(prompt: str) -> Optional[str]:
             if resp.status_code == 200:
                 data = resp.json()
                 return data["content"][0]["text"]
+            elif resp.status_code in (429, 529):
+                ai_compressor._record_failure(
+                    f"session summary rate limited ({resp.status_code})",
+                    is_rate_limit=True,
+                )
+            else:
+                ai_compressor._record_failure(
+                    f"session summary HTTP {resp.status_code}",
+                    is_rate_limit=False,
+                )
     except Exception as e:
         logger.debug(f"OAuth session summary failed: {e}")
 
