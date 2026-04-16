@@ -748,3 +748,29 @@
 - Accent / diacritic normalization: no accented names in current graph. If they appear, `search_by_name` in `schema.py` should run both query and display names through `unicodedata.normalize('NFC', ...)` before substring match. Out of scope today.
 - `_find_by_alias` dead code cleanup: harmless, but could be removed when aliases are populated. Deferred.
 - `get_frequent_contacts` redundant conditions (lines 241-244): dead code, not a bug. Deferred.
+
+### Pass I — 2026-04-16
+- **Mission**: Wire `clamp_tier()` and `require_feature()` helpers (added by Pass D2, commit `0e4acce`) into the live call paths. Closes BUG-D2-01 (P1) and BUG-D2-02 (P1).
+- **Files changed**: `src/memory_worker.py`, `src/mcp_memory_server.py`, `src/memory_retriever.py`, `tests/test_subscription_and_credentials.py`
+- **Env var chosen**: `CORTEX_SERVER_TIER_CAP` — default `claude_codemax` (Cameron's top paid tier). Secondary env var `CORTEX_CURRENT_TIER` used in MCP server to resolve active tier (falls back to `CORTEX_SERVER_TIER_CAP`, then `claude_codemax`).
+
+**BUG-D2-01 (P1, FIXED): Client-declared tier escalation in memory_worker.py**
+- Root cause: `receive_observation` and `start_session` called `parse_tier(req.subscription_tier).value` directly — no ceiling. A client sending `claude_codemax` got 240 obs/min + 1.2M daily tokens regardless of what the server should grant.
+- Fix: Added `SERVER_TIER_CAP: SubscriptionTier` constant loaded from `CORTEX_SERVER_TIER_CAP` env var (default `claude_codemax`). Both handlers now call `clamp_tier(original_tier, SERVER_TIER_CAP)` and emit `logger.warning("tier_clamped ...")` when the clamp fires. Imports updated to include `SubscriptionTier, clamp_tier`.
+
+**BUG-D2-02 (P1, FIXED): Dead feature gates for knowledge_graph and graph_expansion**
+- Root cause: `cami_memory_graph_search` ran for all tiers; `TierFeatures.knowledge_graph` was never checked. `search_with_context` performed graph expansion for all callers regardless of tier.
+- Fix (mcp_memory_server.py): Added `_MCP_TIER` module-level constant resolved from `CORTEX_CURRENT_TIER` or `CORTEX_SERVER_TIER_CAP` env var (default `claude_codemax`). At the top of the `cami_memory_graph_search` handler, `require_feature(_MCP_TIER, "knowledge_graph")` is called; `PermissionError` returns MCP error `{"isError": True, "content": [{"type": "text", "text": "Error: graph search requires a higher subscription tier"}]}`. Imports updated to include `SubscriptionTier, parse_tier, require_feature`.
+- Fix (memory_retriever.py): `search_with_context` gained optional `tier=None` parameter. When non-None and tier lacks `graph_expansion`, a `logger.info(...)` is emitted and base results returned early (degraded, not errored). The MCP handler passes `tier=_MCP_TIER` to thread the tier through.
+
+**New tests added** (2 tests, both pass):
+- `test_worker_receive_observation_clamps_escalated_tier_and_warns`: verifies that when server cap is `CLAUDE_STANDARD` and client claims `CLAUDE_CODEMAX`, clamped result is `CLAUDE_STANDARD` and warning log fires.
+- `test_mcp_graph_search_denied_for_standard_tier`: overrides `_MCP_TIER` to `CLAUDE_STANDARD` and verifies `handle_tool_call("cami_memory_graph_search", ...)` returns `isError=True` with "higher subscription tier" in message.
+
+**Verification**:
+- `python3 -m py_compile src/memory_worker.py src/mcp_memory_server.py src/memory_retriever.py` — all CLEAN
+- `pytest tests/` — 109 passed, 1 failed (pre-existing `test_memory_recall_rate` unrelated to this pass — was failing before at same assertion). Up from 107 passing before this pass.
+- Baseline before this pass: 107 passing + 1 pre-existing failure. Note: Pass D2's log stated 103 passing, but actual baseline when Pass I started was 107 (other passes had already run and added tests).
+
+**Commits**: (see below — two focused commits)
+**Deferrals**: None. All BUG-D2-01 and BUG-D2-02 items closed.
