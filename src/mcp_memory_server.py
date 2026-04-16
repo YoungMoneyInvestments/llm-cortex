@@ -2,7 +2,7 @@
 """
 MCP Memory Server — Exposes Cortex memory retrieval as MCP tools.
 
-Provides 7 MCP tools that follow the token-efficient 3-layer pattern:
+Provides 8 MCP tools that follow the token-efficient 3-layer pattern:
   1. cami_memory_search       — L1: Compact index search (~20 tokens/result)
   2. cami_memory_timeline     — L2: Chronological context (~100 tokens/item)
   3. cami_memory_details      — L3: Full observation text (variable)
@@ -10,6 +10,7 @@ Provides 7 MCP tools that follow the token-efficient 3-layer pattern:
   5. cami_memory_graph_search — Graph-augmented search with entity expansion
   6. cami_message_search      — Semantic search over iMessage/Discord via sqlite-vec
   7. cami_contact_search      — Search unified contacts database
+  8. session_bootstrap        — Bootstrap session with current time + 48h history
 
 Usage:
     # Start as MCP server (stdio transport)
@@ -39,6 +40,25 @@ sys.path.insert(0, str(Path(__file__).parent))
 from memory_retriever import MemoryRetriever
 
 logger = logging.getLogger("cortex-mcp")
+
+# Hard caps applied to all tool limit/window/graph_depth params.
+# These prevent the LLM from accidentally requesting thousands of results
+# that would flood the client context window.
+_MAX_LIMIT = 100          # cami_memory_search, cami_memory_graph_search, cami_message_search, cami_contact_search
+_MAX_WINDOW = 50          # cami_memory_timeline window
+_MAX_OBSERVATION_IDS = 20 # cami_memory_details
+_MAX_CONTENT_LEN = 20_000 # cami_memory_save content
+
+
+def _int_arg(arguments: dict, key: str, default: int, *, lo: int = 1, hi: int) -> int:
+    """Parse an integer argument, coercing strings, clamping to [lo, hi]."""
+    raw = arguments.get(key, default)
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        val = default
+    return max(lo, min(hi, val))
+
 
 # Lazy-loaded sentence-transformer model for message search (384-dim, all-MiniLM-L6-v2)
 _ST_MODEL = None
@@ -466,9 +486,13 @@ def handle_tool_call(name: str, arguments: dict) -> dict:
         retriever = MemoryRetriever()
 
         if name == "cami_memory_search":
+            query = arguments.get("query")
+            if not isinstance(query, str) or not query.strip():
+                return {"content": [{"type": "text", "text": "Error: 'query' must be a non-empty string"}], "isError": True}
+            limit = _int_arg(arguments, "limit", 15, lo=1, hi=_MAX_LIMIT)
             results = retriever.search(
-                query=arguments["query"],
-                limit=arguments.get("limit", 15),
+                query=query,
+                limit=limit,
                 source=arguments.get("source"),
                 agent=arguments.get("agent"),
             )
@@ -488,11 +512,16 @@ def handle_tool_call(name: str, arguments: dict) -> dict:
             return {"content": [{"type": "text", "text": "\n".join(lines)}]}
 
         elif name == "cami_memory_timeline":
+            try:
+                obs_id = int(arguments["observation_id"])
+            except (KeyError, TypeError, ValueError):
+                return {"content": [{"type": "text", "text": "Error: 'observation_id' must be an integer"}], "isError": True}
+            window = _int_arg(arguments, "window", 5, lo=1, hi=_MAX_WINDOW)
             context = retriever.timeline(
-                observation_id=arguments["observation_id"],
-                window=arguments.get("window", 5),
+                observation_id=obs_id,
+                window=window,
             )
-            lines = [f"Timeline around observation #{arguments['observation_id']}:\n"]
+            lines = [f"Timeline around observation #{obs_id}:\n"]
             for r in context:
                 marker = ">>>" if r.get("is_target") else "   "
                 lines.append(
@@ -501,7 +530,14 @@ def handle_tool_call(name: str, arguments: dict) -> dict:
             return {"content": [{"type": "text", "text": "\n".join(lines)}]}
 
         elif name == "cami_memory_details":
-            details = retriever.get_details(arguments["observation_ids"])
+            raw_ids = arguments.get("observation_ids")
+            if not isinstance(raw_ids, list) or len(raw_ids) == 0:
+                return {"content": [{"type": "text", "text": "Error: 'observation_ids' must be a non-empty list of integers"}], "isError": True}
+            try:
+                obs_ids = [int(x) for x in raw_ids[:_MAX_OBSERVATION_IDS]]
+            except (TypeError, ValueError):
+                return {"content": [{"type": "text", "text": "Error: 'observation_ids' must contain only integers"}], "isError": True}
+            details = retriever.get_details(obs_ids)
             parts = []
             for d in details:
                 parts.append(
@@ -516,12 +552,16 @@ def handle_tool_call(name: str, arguments: dict) -> dict:
             return {"content": [{"type": "text", "text": "\n\n".join(parts)}]}
 
         elif name == "cami_memory_save":
+            content = arguments.get("content")
+            if not isinstance(content, str) or not content.strip():
+                return {"content": [{"type": "text", "text": "Error: 'content' must be a non-empty string"}], "isError": True}
+            content = content[:_MAX_CONTENT_LEN]
             metadata = {}
             if arguments.get("tags"):
                 metadata["tags"] = arguments["tags"]
             agent = arguments.get("agent") or os.environ.get("CORTEX_AGENT_NAME", "main")
             metadata["agent"] = agent
-            mem_id = retriever.save_memory(arguments["content"], metadata)
+            mem_id = retriever.save_memory(content, metadata)
             return {
                 "content": [
                     {"type": "text", "text": f"Memory saved with ID: {mem_id}"}
@@ -529,12 +569,22 @@ def handle_tool_call(name: str, arguments: dict) -> dict:
             }
 
         elif name == "cami_memory_graph_search":
+            query = arguments.get("query")
+            if not isinstance(query, str) or not query.strip():
+                return {"content": [{"type": "text", "text": "Error: 'query' must be a non-empty string"}], "isError": True}
+            limit = _int_arg(arguments, "limit", 15, lo=1, hi=_MAX_LIMIT)
+            try:
+                graph_depth = int(arguments.get("graph_depth", 1))
+            except (TypeError, ValueError):
+                graph_depth = -1
+            if graph_depth not in (1, 2):
+                return {"content": [{"type": "text", "text": "Error: 'graph_depth' must be 1 or 2"}], "isError": True}
             results = retriever.search_with_context(
-                query=arguments["query"],
-                limit=arguments.get("limit", 15),
-                graph_depth=arguments.get("graph_depth", 1),
+                query=query,
+                limit=limit,
+                graph_depth=graph_depth,
             )
-            lines = [f"Graph search: '{arguments['query']}' — {len(results)} results\n"]
+            lines = [f"Graph search: '{query}' — {len(results)} results\n"]
             for r in results:
                 tool_info = f" [{r.get('tool', r.get('collection', '?'))}]" if r.get('tool') or r.get('collection') else ""
                 obs_id = r.get('obs_id', '')
@@ -564,11 +614,22 @@ def handle_tool_call(name: str, arguments: dict) -> dict:
             import time as _time
             from datetime import datetime
 
-            query = arguments["query"]
+            query = arguments.get("query")
+            if not isinstance(query, str) or not query.strip():
+                return {"content": [{"type": "text", "text": "Error: 'query' must be a non-empty string"}], "isError": True}
             source_filter = arguments.get("source")  # "imessage", "discord", or None
             contact_filter = arguments.get("contact")
-            days_back = arguments.get("days_back")
-            limit = arguments.get("limit", 5)
+            # days_back: explicit None means no filter; 0 or negative means no filter too
+            _raw_days = arguments.get("days_back")
+            days_back = None
+            if _raw_days is not None:
+                try:
+                    _days_int = int(_raw_days)
+                    if _days_int > 0:
+                        days_back = _days_int
+                except (TypeError, ValueError):
+                    pass
+            limit = _int_arg(arguments, "limit", 5, lo=1, hi=_MAX_LIMIT)
             SIMILARITY_THRESHOLD = 0.30
 
             IMESSAGE_DB = Path.home() / "clawd/data/imessage-embeddings.db"
@@ -830,16 +891,20 @@ def handle_tool_call(name: str, arguments: dict) -> dict:
             return {"content": [{"type": "text", "text": "\n".join(lines)}]}
 
         elif name == "cami_contact_search":
+            contact_query = arguments.get("query")
+            if not isinstance(contact_query, str) or not contact_query.strip():
+                return {"content": [{"type": "text", "text": "Error: 'query' must be a non-empty string"}], "isError": True}
+            contact_limit = _int_arg(arguments, "limit", 10, lo=1, hi=_MAX_LIMIT)
             result_text = search_contacts(
-                query=arguments["query"],
+                query=contact_query,
                 relationship_type=arguments.get("relationship_type"),
-                limit=arguments.get("limit", 10),
+                limit=contact_limit,
             )
             return {"content": [{"type": "text", "text": result_text}]}
 
         elif name == "session_bootstrap":
             import subprocess
-            hours = arguments.get("hours", 48)
+            hours = _int_arg(arguments, "hours", 48, lo=1, hi=720)
             script = Path(__file__).parent / "context_loader.py"
             try:
                 result = subprocess.run(
