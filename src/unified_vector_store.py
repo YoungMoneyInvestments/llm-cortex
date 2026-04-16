@@ -305,6 +305,20 @@ class UnifiedVectorStore:
         except Exception:
             pass  # Column may not exist if migration failed
 
+        # Partial index for unembedded documents.
+        # backfill_embeddings() and embed_pending() query WHERE has_embedding=0 in a
+        # tight loop.  Without this index SQLite performs a full table scan on every
+        # iteration, making the backfill loop O(n^2).  A partial index stays small
+        # as rows are embedded and is automatically excluded from the planner for
+        # queries that don't match the partial condition.
+        try:
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_docs_unembedded "
+                "ON documents(id) WHERE has_embedding = 0"
+            )
+        except Exception:
+            pass  # Silently skip if SQLite version doesn't support partial indexes
+
         # Create vector table if sqlite_vec is available
         if self.vec_available:
             try:
@@ -633,14 +647,95 @@ class UnifiedVectorStore:
         texts: list[str],
         metadatas: Optional[list[dict]] = None,
     ):
-        """Batch insert documents."""
+        """Batch insert documents.
+
+        Inserts all documents in a single transaction, then batch-embeds them in
+        one model call.  The previous per-doc approach called embed_document()
+        inside _upsert() for each item, which issued N separate encode() calls
+        and N commits -- O(N) model round-trips instead of 1.
+        """
         prefix = {"observations": "obs-", "conversations": "conv-", "knowledge": "kg-"}.get(
             collection, ""
         )
+
+        # --- Step 1: insert all docs (without triggering per-doc embedding) ---
+        # We temporarily disconnect per-doc embedding by calling the raw SQL path
+        # rather than _upsert(), then batch-embed below.
+        inserted_ids: list[str] = []
         for i, (doc_id, text) in enumerate(zip(ids, texts)):
             meta = metadatas[i] if metadatas and i < len(metadatas) else {}
             full_id = f"{prefix}{doc_id}"
-            self._upsert(full_id, collection, text, meta)
+            text_hash = _compute_text_hash(text)
+
+            # Dedup check (same as _upsert)
+            try:
+                existing = self._safe_execute(
+                    "SELECT id FROM documents WHERE text_hash = ? AND collection = ? AND id != ?",
+                    (text_hash, collection, full_id),
+                ).fetchone()
+                if existing:
+                    logger.debug(
+                        f"add_batch: skipping duplicate {full_id} (same hash as {existing['id']})"
+                    )
+                    continue
+            except Exception as e:
+                logger.warning(f"add_batch: dedup check failed for {full_id}, proceeding: {e}")
+
+            meta_json = json.dumps(meta)
+            try:
+                self._safe_execute(
+                    "INSERT INTO documents (id, collection, text, metadata, text_hash) "
+                    "VALUES (?, ?, ?, ?, ?) "
+                    "ON CONFLICT(id) DO UPDATE SET "
+                    "text=excluded.text, metadata=excluded.metadata, text_hash=excluded.text_hash",
+                    (full_id, collection, text, meta_json, text_hash),
+                )
+                inserted_ids.append(full_id)
+            except Exception as e:
+                logger.error(f"add_batch: failed to insert {full_id}: {e}")
+
+        if inserted_ids:
+            self.conn.commit()
+
+        # --- Step 2: batch-embed all inserted docs in a single model call ---
+        if not self.vec_available or not inserted_ids:
+            return
+
+        try:
+            # Fetch texts in insertion order
+            placeholders = ",".join("?" for _ in inserted_ids)
+            rows = self._safe_execute(
+                f"SELECT id, text FROM documents WHERE id IN ({placeholders})",
+                inserted_ids,
+            ).fetchall()
+            if not rows:
+                return
+
+            batch_ids = [r["id"] for r in rows]
+            batch_texts = [r["text"] for r in rows]
+            embeddings = self._get_embeddings_batch(batch_texts)
+
+            for doc_id, embedding in zip(batch_ids, embeddings):
+                if embedding is None:
+                    continue
+                try:
+                    blob = _float_list_to_blob(embedding)
+                    self._safe_execute(
+                        "DELETE FROM document_embeddings WHERE doc_id = ?", (doc_id,)
+                    )
+                    self._safe_execute(
+                        "INSERT INTO document_embeddings (doc_id, embedding) VALUES (?, ?)",
+                        (doc_id, blob),
+                    )
+                    self._safe_execute(
+                        "UPDATE documents SET has_embedding = 1 WHERE id = ?", (doc_id,)
+                    )
+                except Exception as e:
+                    logger.warning(f"add_batch: failed to store embedding for {doc_id}: {e}")
+
+            self.conn.commit()
+        except Exception as e:
+            logger.warning(f"add_batch: batch embed failed, documents stored without embeddings: {e}")
 
     # -- Embedding management ------------------------------------------------
 
@@ -1111,9 +1206,10 @@ class UnifiedVectorStore:
 
             if collection:
                 # vec0 MATCH can't be combined with JOINs in a single query.
-                # Strategy: get more vec results, then filter by collection in Python.
+                # Strategy: get more vec results, then resolve docs in one IN() query.
+                # Previously this issued one SELECT per row (N+1). Now it batches.
                 vec_limit = limit * 3
-                rows = self._safe_execute(
+                vec_rows = self._safe_execute(
                     "SELECT doc_id, distance "
                     "FROM document_embeddings "
                     "WHERE embedding MATCH ? "
@@ -1122,29 +1218,36 @@ class UnifiedVectorStore:
                     (query_blob, vec_limit),
                 ).fetchall()
 
-                # Filter by collection using document metadata
-                filtered = []
-                for r in rows:
-                    doc = self._safe_execute(
-                        "SELECT id, text, metadata, collection, created_at "
-                        "FROM documents WHERE id = ? AND collection = ?",
-                        (r["doc_id"], collection),
-                    ).fetchone()
-                    if doc:
-                        filtered.append({
-                            "id": doc["id"],
-                            "text": doc["text"],
-                            "metadata": json.loads(doc["metadata"]) if doc["metadata"] else {},
-                            "collection": doc["collection"],
-                            "created_at": doc["created_at"],
-                            "distance": r["distance"],
-                        })
-                    if len(filtered) >= limit:
-                        break
+                if vec_rows:
+                    # Resolve all docs in one IN() query, then filter by collection
+                    vec_ids = [r["doc_id"] for r in vec_rows]
+                    placeholders = ",".join("?" for _ in vec_ids)
+                    doc_rows = self._safe_execute(
+                        f"SELECT id, text, metadata, collection, created_at "
+                        f"FROM documents WHERE id IN ({placeholders}) AND collection = ?",
+                        vec_ids + [collection],
+                    ).fetchall()
+                    doc_map = {r["id"]: r for r in doc_rows}
 
-                results = filtered
+                    filtered = []
+                    for r in vec_rows:
+                        doc = doc_map.get(r["doc_id"])
+                        if doc:
+                            filtered.append({
+                                "id": doc["id"],
+                                "text": doc["text"],
+                                "metadata": json.loads(doc["metadata"]) if doc["metadata"] else {},
+                                "collection": doc["collection"],
+                                "created_at": doc["created_at"],
+                                "distance": r["distance"],
+                            })
+                            if len(filtered) >= limit:
+                                break
+                    results = filtered
+                else:
+                    results = []
             else:
-                rows = self._safe_execute(
+                vec_rows = self._safe_execute(
                     "SELECT doc_id, distance "
                     "FROM document_embeddings "
                     "WHERE embedding MATCH ? "
@@ -1153,22 +1256,30 @@ class UnifiedVectorStore:
                     (query_blob, limit * 3),
                 ).fetchall()
 
-                results = []
-                for r in rows:
-                    doc = self._safe_execute(
-                        "SELECT id, text, metadata, collection, created_at "
-                        "FROM documents WHERE id = ?",
-                        (r["doc_id"],),
-                    ).fetchone()
-                    if doc:
-                        results.append({
-                            "id": doc["id"],
-                            "text": doc["text"],
-                            "metadata": json.loads(doc["metadata"]) if doc["metadata"] else {},
-                            "collection": doc["collection"],
-                            "created_at": doc["created_at"],
-                            "distance": r["distance"],
-                        })
+                if vec_rows:
+                    vec_ids = [r["doc_id"] for r in vec_rows]
+                    placeholders = ",".join("?" for _ in vec_ids)
+                    doc_rows = self._safe_execute(
+                        f"SELECT id, text, metadata, collection, created_at "
+                        f"FROM documents WHERE id IN ({placeholders})",
+                        vec_ids,
+                    ).fetchall()
+                    doc_map = {r["id"]: r for r in doc_rows}
+
+                    results = []
+                    for r in vec_rows:
+                        doc = doc_map.get(r["doc_id"])
+                        if doc:
+                            results.append({
+                                "id": doc["id"],
+                                "text": doc["text"],
+                                "metadata": json.loads(doc["metadata"]) if doc["metadata"] else {},
+                                "collection": doc["collection"],
+                                "created_at": doc["created_at"],
+                                "distance": r["distance"],
+                            })
+                else:
+                    results = []
 
             return self._deduplicate_chunks(results)[:limit]
 
@@ -1567,12 +1678,31 @@ class UnifiedVectorStore:
             raise
 
     def close(self):
-        """Close database connection."""
+        """Close database connection and evict from the singleton registry.
+
+        Also issues a WAL checkpoint before closing so the WAL file is folded
+        back into the main DB.  Without this the WAL can accumulate across
+        repeated open/close cycles and force readers to replay it on every open.
+
+        After close() the instance is removed from _store_instances so a
+        subsequent get_vector_store() call opens a fresh connection rather than
+        returning a dead handle.
+        """
         try:
             if self.conn:
+                try:
+                    self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                except Exception:
+                    pass  # Best-effort; don't prevent close
                 self.conn.close()
+                self.conn = None
         except Exception:
             pass
+
+        # Evict from the singleton registry under the module-level lock so
+        # callers aren't handed a closed instance.
+        with _store_lock:
+            _store_instances.pop(self.db_path.resolve(), None)
 
 
 # -- CLI for testing ---------------------------------------------------------
