@@ -289,6 +289,47 @@
 - **Tests**: `pytest tests/` (74 tests) — 74 passed, 0 failed. Same result as pre-fix baseline. No regression.
 - **Commit**: `8d71fa9` in llm-cortex repo (`fix(memory_retriever): four bugs from adversarial pass A5`)
 
+### Pass 8 — 2026-04-16
+- **Subsystem**: Strategy-KB ingestion into cortex-vectors.db knowledge layer
+- **Scope**: Index strategy knowledge base documents so `cami_memory_search` returns strategy docs.
+
+**Strategy-KB Location Audit**:
+  - Primary KB: `~/Projects/strategy-kb/` — 2 knowledge docs + 1 transcript + code (code not ingested)
+    - `knowledge/bad_news_vs_uncertainty.md` (5.4KB) — bad news vs uncertainty framework, VIX regime classification
+    - `knowledge/story_vs_actuals.md` (7.9KB) — story vs actuals silver trading framework
+    - `transcripts/neelsalami/Video by deltatrendtrading.txt` (3KB) — event-driven ML trading transcript
+  - Secondary KB: `~/Projects/MCP-Servers/brokerbridge/research/strategy_ideas/`
+    - `13f_hedge_fund_replication.md` (2.7KB) — 13F hedge fund copy strategy
+    - 6 `.claude/worktrees/` copies excluded at discovery (dedup would catch them but excluded proactively)
+  - Not a target: `moltytrades/src/components/strategy` (UI components, not knowledge)
+  - Total: 4 files across 2 source roots, ~16KB text, ~28 chunks
+
+**Ingester**: New script `scripts/ingest_strategy_kb.py` (no existing ingester targeted these files).
+  - Direct insert via `UnifiedVectorStore.add_knowledge()` (no HTTP ingest endpoint found in memory_worker.py)
+  - Stable doc IDs keyed on `source_label + rel_path`
+  - Idempotent via `ON CONFLICT(id) DO UPDATE` + `text_hash` dedup check in `_upsert()`
+  - Metadata: `tags=["strategy-kb", "<slug>"]`, file_path, ingested_at
+  - Excludes venv, .git, worktrees, binaries, .env files; `--dry-run` flag supported
+
+**Dry-run counts**: 4 files, ~20 estimated chunks
+
+**Real-run counts**:
+  - `rows_before=5834`, `rows_after=5862`, `row_delta=28`
+  - All 4 files ingested, 0 errors
+
+**Smoke tests (all passed)**:
+  1. "bad news vs uncertainty VIX market environment" -> top hit: `bad_news_vs_uncertainty.md`
+  2. "story vs actuals silver narrative trading framework" -> top hit: `story_vs_actuals.md`
+  3. "VIX 50 buy rule broad equity" -> top hit: pre-existing TRADING RULE entry (confirmed present before pass)
+
+**Idempotency re-run**: second pass `row_delta=0`. PASS.
+
+**Note on embeddings**: `sqlite_vec` not available in system Python 3.9. Documents stored without vector embeddings; FTS5 search works. Cortex worker can backfill via `backfill_embeddings.py` or on next restart.
+
+**Tests**: `pytest tests/` -- 77 passed, 1 pre-existing failure (`test_memory_recall_rate`, sqlite_vec not installed, unrelated). No regressions.
+
+**Commit**: `1673db1` in llm-cortex repo (`feat(cortex): ingest strategy-kb into knowledge layer`)
+
 ### Pass 9 — 2026-04-16
 - **Subsystem**: Knowledge-base ingest — `~/clawd/db/knowledge-base.db` -> `~/.cortex/data/cortex-vectors.db`
 - **Pass 8 status**: `scripts/ingest_strategy_kb.py` exists as untracked (file-based KB ingester) but never committed. Pass 9 proceeded independently with a DB-source adapter.
