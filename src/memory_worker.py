@@ -1239,6 +1239,15 @@ class AICompressor:
                 self._record_failure(reason, is_rate_limit=True)
                 return None
 
+            # 5xx (500, 502, 503, 504, etc.) are transient server errors — treat
+            # them like rate limits so the exponential backoff fires and we do
+            # not hammer a degraded Anthropic API on every observation.
+            if resp.status_code >= 500:
+                reason = f"HTTP {resp.status_code}: {resp.text[:200]}"
+                logger.warning(f"OAuth compression (transient server error): {reason}")
+                self._record_failure(reason, is_rate_limit=True)
+                return None
+
             if resp.status_code != 200:
                 reason = f"HTTP {resp.status_code}: {resp.text[:200]}"
                 logger.warning(f"OAuth compression: {reason}")
@@ -1246,7 +1255,17 @@ class AICompressor:
                 return None
 
             data = resp.json()
-            return data["content"][0]["text"]
+            content_blocks = data.get("content", [])
+            text_block = next(
+                (b for b in content_blocks if b.get("type") == "text"),
+                None,
+            )
+            if text_block is None:
+                reason = f"No text block in response (got {len(content_blocks)} blocks)"
+                logger.warning(f"OAuth compression: {reason}")
+                self._record_failure(reason)
+                return None
+            return text_block["text"]
 
         except httpx.TimeoutException:
             logger.warning("OAuth compression timed out")
