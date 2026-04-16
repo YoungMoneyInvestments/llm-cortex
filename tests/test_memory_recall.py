@@ -58,8 +58,8 @@ CANONICAL_QA = [
         "expected_keywords": ["httpx"],
     },
     {
-        "q": "What is the CamiRouter port?",
-        "expected_keywords": ["8317"],
+        "q": "What is the Cortex memory worker port?",
+        "expected_keywords": ["37778"],
     },
     {
         "q": "What trading education brand does Cameron run?",

@@ -1,0 +1,98 @@
+# Adversarial Improvement Log — LLM Cortex Memory System
+# Started: 2026-04-14
+
+## MISSION CLASSIFICATION
+**Both**: Bug-hunt (specific known defects) + Quality improvement (consolidation, resilience)
+
+## PRIMARY TARGETS
+1. conversation-memory MCP at ~/clawd/mcp-servers/conversation-memory/
+2. llm-cortex memory worker at ~/Projects/llm-cortex/
+
+## SUBSYSTEMS IDENTIFIED
+- memory_worker.py (117KB) — observation pipeline, AICompressor, EntityExtractor
+- mcp_memory_server.py (39KB) — MCP tools for cortex search, message search, session bootstrap
+- unified_vector_store.py (67KB) — SQLite FTS5 + sqlite_vec unified vector store
+- knowledge_graph.py (40KB) — entity relationship graph
+- memory_retriever.py (41KB) — 3-layer progressive retrieval
+- subscription.py (5KB) — tier management
+- air/ — Adaptive Inference Routing module
+- conversation-memory/server.py (630 lines) — iMessage/Discord MCP server
+- conversation-memory/embedding_client.py — OpenAI wrapper
+- conversation-memory/search/discord.py — Discord vector search
+- conversation-memory/search/imessage.py — iMessage vector search
+- conversation-memory/identity_resolver.py — person name → platform ID
+
+## BRANCH AUDIT (llm-cortex)
+- main (current, 2026-04-13) — active
+- fix/ci-tests-workflow (2026-03-30) — EVALUATE FOR MERGE/DELETE
+- claude/practical-mendeleev (2026-03-29) — EVALUATE FOR MERGE/DELETE
+- fix/ci-llm-cortex (2026-03-25) — EVALUATE FOR MERGE/DELETE
+- preserve/air-module-archaeology (2026-03-22) — archival, keep
+- REMOTE ONLY: retrieval-ranking, schema-safety, tests-ci — NEED EVALUATION
+
+## BRANCH AUDIT (clawd)
+- master (current) — active
+- claude/clever-kare, claude/nervous-shaw, claude/silly-matsumoto — worktree branches, evaluate
+- github-clean (remote) — public/private separation, keep
+- master-local-backup-20260313-a525165f — checkpoint backup, keep
+- runtime-live-state-20260313* — old state snapshots, likely stale
+
+## P0 BUGS FOUND IN PHASE 0
+
+### BUG-001: Discord DB 99.8% noise
+- unusual-whales-alert-relay: 1,721,308/1,724,952 chunks
+- DB is 12GB because it indexed an alert relay bot channel
+- STATUS: OPEN
+
+### BUG-002: Critical dimension mismatch
+- config.py: EMBEDDING_DIM = 1536 (OpenAI text-embedding-3-small)
+- discord-embeddings.db: float[384] (local sentence-transformers)
+- Vector search on Discord broken silently — queries return empty
+- STATUS: OPEN
+
+### BUG-003: OpenAI API zero quota
+- conversation-memory/embedding_client.py uses OpenAI API
+- OpenAI Pro subscription ≠ API credits — key has zero quota
+- New message indexing fails silently
+- STATUS: OPEN
+
+### BUG-004: AICompressor CamiRouter primary path dead
+- memory_worker.py AICompressor uses CamiRouter as primary
+- CamiRouter removed 2026-04-14
+- Observation compression failing (falls through to Anthropic OAuth fallback — may work)
+- STATUS: FIXED (Pass 2, 2026-04-16)
+
+## P1 BUGS
+
+### BUG-005: Facebook/Instagram not in conversation-memory MCP
+- facebook-embeddings.db (23MB) and instagram-embeddings.db (37MB) exist
+- conversation-memory/server.py only serves iMessage + Discord
+- Most recent llm-cortex commit (cda4912) added Facebook/Instagram to mcp_memory_server.py
+- conversation-memory MCP not updated
+- STATUS: OPEN
+
+### BUG-006: Duplicate cortex-vectors.db
+- ~/.cortex/data/cortex-vectors.db (11MB)
+- ~/clawd/data/cortex-vectors.db (34MB)
+- unified_vector_store.py hardcodes ~/.cortex/data/ as DATA_DIR
+- Two diverging indexes
+- STATUS: OPEN
+
+### BUG-007: VPS connector SSH fragility
+- vps_connector.py uses `ssh storage-vps` hostname
+- Tailscale hostname resolution not guaranteed
+- Should use explicit IP 100.67.112.3
+- STATUS: OPEN
+
+## PASS LOG
+
+### Pass 2 — 2026-04-16
+- **Subsystem**: AICompressor / llm-cortex memory_worker.py
+- **Bug**: BUG-004 — AICompressor had a dual-path routing structure where it tried CamiRouter (localhost:8317) first before falling through to Anthropic OAuth. CamiRouter was fully removed 2026-04-14. The dead probe caused a wasted connection attempt on every compression call (ConnectError, then fallback to OAuth). Compression itself was not totally broken (OAuth fallback worked), but every call paid a probe penalty and `_router_available` would flip to False permanently after first failure, preventing future router checks from being attempted cleanly.
+- **Files changed**:
+  - `src/memory_worker.py`: Removed CAMIROUTER_URL/API_KEY/MODEL constants (lines 94-97), removed `_ensure_router_client()` method, removed `_compress_via_router()` method, removed `_router_client`/`_using_router`/`_router_available` state from `__init__`, simplified `compress()` to call `_compress_via_oauth()` directly, simplified `_call_ai_for_summary()` to OAuth-only path, updated `/api/compression/status` endpoint to remove dead `active_path`/`router_available` fields, updated docstrings.
+  - `tests/test_memory_recall.py`: Replaced dead knowledge probe ("What is the CamiRouter port?" expecting "8317") with current fact ("What is the Cortex memory worker port?" expecting "37778").
+- **Verification**: `python3 -m py_compile` clean on both files. `pytest tests/` — 74 passed, 4 skipped (live-worker tests). No previously-passing tests broken.
+- **Remaining CamiRouter reference**: `NERExtractor.KNOWN_SYSTEMS` set in memory_worker.py still contains "CamiRouter" as a recognized entity name — this is intentional (enables correct NER on historical observations that mention CamiRouter). Not a routing call.
+- **Clawd scope**: Live clawd scripts contain only comments/docstrings referencing CamiRouter (no localhost:8317 calls). No active code paths remain. Deferred to a separate clawd cleanup pass if desired.
+- **BUG-004 STATUS**: FIXED
