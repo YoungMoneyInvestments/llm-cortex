@@ -48,13 +48,13 @@
 - config.py: EMBEDDING_DIM = 1536 (OpenAI text-embedding-3-small)
 - discord-embeddings.db: float[384] (local sentence-transformers)
 - Vector search on Discord broken silently — queries return empty
-- STATUS: OPEN
+- STATUS: FIXED (Pass 3, 2026-04-16)
 
 ### BUG-003: OpenAI API zero quota
 - conversation-memory/embedding_client.py uses OpenAI API
 - OpenAI Pro subscription ≠ API credits — key has zero quota
 - New message indexing fails silently
-- STATUS: OPEN
+- STATUS: FIXED (Pass 3, 2026-04-16)
 
 ### BUG-004: AICompressor CamiRouter primary path dead
 - memory_worker.py AICompressor uses CamiRouter as primary
@@ -82,9 +82,29 @@
 - vps_connector.py uses `ssh storage-vps` hostname
 - Tailscale hostname resolution not guaranteed
 - Should use explicit IP 100.67.112.3
-- STATUS: OPEN
+- STATUS: FIXED (Pass 6, 2026-04-16)
 
 ## PASS LOG
+
+### Pass 1 — 2026-04-16
+- **Subsystem**: Discord embeddings DB (~/clawd/data/discord-embeddings.db)
+- **Bug**: BUG-001 — unusual-whales-alert-relay bot channel indexed 1,805,904 of 1,809,595 total chunks (99.8% noise). The pipeline had no channel blocklist, so every run re-ingested alert relay messages. DB bloated from useful ~100MB to 13GB. Note: spec said 1,721,308/1,724,952; actual count at time of fix was 1,805,904/1,809,595 (pipeline ran ~85k more rows in the interim).
+- **Files changed**:
+  - `~/clawd/config/discord-embed-blocklist.json` (created): Persistent blocklist keyed on channel_id (not name). Contains `1482611303708360835` (unusual-whales-alert-relay). Blocking by channel_id avoids emoji name fragility.
+  - `~/clawd/scripts/discord_embed_pipeline.py`: Added `load_blocklist()` function reading from BLOCKLIST_FILE, `BLOCKED_CHANNEL_IDS` module-level constant, and blocklist filter in `process_guild()` applied before any channel processing (before the existing `channel_ids` allowlist check at line 350).
+- **Deletion details**:
+  - Backup: `discord-embeddings.db.bak-pass1.gz` (803MB gzip, integrity verified)
+  - Added `idx_chunk_messages_chunk_id` index on `chunk_messages(chunk_id)` to prevent O(n) scans
+  - Deletion order: chunk_embeddings (vec0, 63s) → chunk_messages in 100k batches (52,879,537 rows, 824s) → chunks (1,805,904 rows, 78s)
+  - VACUUM: 36s
+- **Before**: 13GB DB, 1,809,595 chunks, 52,918,183 chunk_messages, 1,809,595 chunk_embeddings
+- **After**: 120MB DB, 3,691 chunks, 38,646 chunk_messages, 3,691 chunk_embeddings
+- **Verification**: Smoke test via direct sqlite_vec + sentence-transformers all-MiniLM-L6-v2 (dim=384). Query "trading plan for today" returned 5 results from daily-trade-plan and pnl-and-trade-review channels with distances 0.37-0.43. MCP search path unbroken.
+- **Deferred**:
+  - BUG-002 (dim mismatch in config.py: 1536 vs actual 384) still open — Pass 2 should fix config.py EMBEDDING_DIM
+  - discord-embed-state.json may still have a checkpoint entry for the blocked channel_id; harmless but could be stripped to keep state clean
+  - The `com.clawd.discord-embed` launchd job was unloaded during this pass and needs to be reloaded: `launchctl load ~/Library/LaunchAgents/com.clawd.discord-embed.plist`
+- **BUG-001 STATUS**: FIXED
 
 ### Pass 2 — 2026-04-16
 - **Subsystem**: AICompressor / llm-cortex memory_worker.py
@@ -96,3 +116,69 @@
 - **Remaining CamiRouter reference**: `NERExtractor.KNOWN_SYSTEMS` set in memory_worker.py still contains "CamiRouter" as a recognized entity name — this is intentional (enables correct NER on historical observations that mention CamiRouter). Not a routing call.
 - **Clawd scope**: Live clawd scripts contain only comments/docstrings referencing CamiRouter (no localhost:8317 calls). No active code paths remain. Deferred to a separate clawd cleanup pass if desired.
 - **BUG-004 STATUS**: FIXED
+
+### Pass 3 — 2026-04-16
+- **Subsystem**: conversation-memory embedding provider (~/clawd/mcp-servers/conversation-memory/)
+- **Bugs**: BUG-002 + BUG-003 — two faces of the same root cause. config.py declared `EMBEDDING_DIM = 1536` (OpenAI text-embedding-3-small) but all stored vectors (Discord, iMessage) are 384-dim (sentence-transformers/all-MiniLM-L6-v2). OpenAI Pro subscription provides no API credits, so every embedding call failed at runtime. Vector search returned empty results silently.
+- **Files changed**:
+  - `mcp-servers/conversation-memory/embedding_client.py`: Full rewrite. Removed all OpenAI code (API key reading, httpx client, OpenAI() instantiation, retry logic). Replaced with lazy-loaded sentence-transformers pattern copied from `unified_vector_store.py:370-419`. Model: `sentence-transformers/all-MiniLM-L6-v2`. Instance attrs `_local_model = None`, `_local_model_load_failed = False`. `_get_model()` lazy-loader with ImportError + generic Exception branches. `embed()` truncates to `text[:2000]`, calls `model.encode(..., show_progress_bar=False).tolist()`. `embed_batch()` batch-encodes. Public surface (signature of `embed()`, `embed_batch()`, `get_embedding_client()`) preserved.
+  - `mcp-servers/conversation-memory/config.py`: `EMBEDDING_MODEL` updated to `"sentence-transformers/all-MiniLM-L6-v2"`, `EMBEDDING_DIM` corrected from 1536 to 384. Removed `ENV_FILE`, `load_env()`, and `get_openai_api_key()` (no callers outside old embedding_client). `import os` removed.
+  - `mcp-servers/conversation-memory/requirements.txt`: Replaced `openai>=1.0.0` with `sentence-transformers>=5.0.0` (installed: 5.3.0, already in venv as transitive dep from cortex worker).
+- **Verification**:
+  - `python -m py_compile`: clean on all 3 changed files + server.py
+  - `pytest tests/ -x`: 2 passed (MCP stdio framing tests)
+  - Smoke test: `embed("Cameron's trading setup for ES futures")` → 384-dim list[float] confirmed
+  - End-to-end: `DiscordSearcher.search(embedding, limit=5)` on "trading plan for today" → 5 results, distances 0.3665-0.4347, channels daily-trade-plan and pnl-and-trade-review — matches Pass 1 baseline (0.37-0.43)
+- **Commit**: `7cca483` in clawd repo (`fix(conversation-memory): swap OpenAI embeddings for local sentence-transformers (384-dim)`)
+- **Note**: Running MCP server process (if any) must be restarted to pick up new embedding_client.py
+- **BUG-002 STATUS**: FIXED
+- **BUG-003 STATUS**: FIXED
+
+### Pass 4 — 2026-04-16
+- **Subsystem**: conversation-memory MCP (~/clawd/mcp-servers/conversation-memory/)
+- **Bug**: BUG-005 — Facebook and Instagram embedding DBs (10,726 and 17,196 chunks respectively) existed on disk but were completely invisible to the conversation-memory MCP. The server only served iMessage + Discord. llm-cortex commit cda4912 had added FB/IG to mcp_memory_server.py but this MCP was never updated.
+- **Schema audit**: Both DBs have identical schema — `chunks(id, conversation_id, conversation_name, participants TEXT JSON, is_group, start_time, end_time, message_count, chunk_text)` + `chunk_embeddings USING vec0(chunk_id, embedding FLOAT[384])`. Participants stores display names ("Kodi Bennion") not slugs.
+- **Design decisions**:
+  - Both platforms handled by one `MetaSearcher(db_path, platform)` class in `search/meta.py` (instantiated twice). Schemas are byte-identical, no forced unification with discord/imessage (discord has VPS author-lookup complexity). Deferred: base-class for discord/imessage/meta shared logic.
+  - Tool surface: extended existing `platform` enum on all 4 existing tools rather than adding new `search_facebook_messages` / `search_instagram_messages` tools. This matches what cortex chose (enum expansion) and is consistent with the MCP's existing idiom.
+  - Identity filtering: uses LIKE match on participants + conversation_name (display names stored as strings, not slug IDs).
+- **Files added**:
+  - `mcp-servers/conversation-memory/search/meta.py` (272 lines): MetaSearcher class; `_build_name_filter()` with table_alias param (needed because get_recent queries without JOIN alias); `_row_to_result()` maps participants JSON to contact_name; `get_facebook_searcher()` / `get_instagram_searcher()` singletons.
+- **Files changed**:
+  - `config.py`: Added `FACEBOOK_DB` and `INSTAGRAM_DB` path constants.
+  - `identity_resolver.py`: Extended `_identity_to_resolution()` to extract `facebook_names` and `instagram_names` from PlatformIdentifier entries (display_name field); added `has_facebook` / `has_instagram` flags.
+  - `search/__init__.py`: Export MetaSearcher and singleton getters.
+  - `server.py`: Added `ALL_PLATFORMS` constant; wired FB/IG into all three search functions; expanded all four TOOLS platform enum arrays.
+- **Bug found during implementation**: `_build_name_filter` originally used `c.` prefix unconditionally; `get_recent` queries `FROM chunks` without alias, causing `no such column: c.conversation_name`. Fixed with `table_alias` parameter.
+- **Verification**:
+  - `python -m py_compile`: clean on all 5 files
+  - `pytest tests/ -x`: 2 passed (existing MCP stdio framing tests)
+  - Smoke tests (direct function call):
+    - Facebook: 10,726 chunks, semantic search "investing" → 3 hits, top similarity 0.5767 (Taylor Baird, 2020-09-07)
+    - Instagram: 17,196 chunks, semantic search "investing" → 3 hits, top similarity 0.5789 (Brigham Castillow, 2020-05-20)
+    - search_all_conversations(all platforms) → sources include facebook + instagram in merged ranked results
+    - get_person_recent("Quanah", platform="facebook") → 3 hits (Quanah Gardner)
+    - search_person_conversations("Kodi Bennion", platform="instagram") → 3 hits (Kodi Bennion)
+- **Commit**: `be6ce57` in clawd repo (`feat(conversation-memory): add Facebook + Instagram search adapters`)
+- **Deferred**:
+  - Base-class extraction for discord/imessage/meta adapter shared code (discord VPS lookup is non-trivial to unify).
+  - BUG-006 (duplicate cortex-vectors.db) and BUG-007 (VPS connector SSH fragility) remain open.
+- **BUG-005 STATUS**: FIXED
+
+### Pass 5 — 2026-04-16
+- (Pass 5 entry not recorded in this log — owned by unified_vector_store.py work per mission brief. BUG-006 remains open.)
+
+### Pass 6 — 2026-04-16
+- **Subsystem**: VPS connector SSH — `~/clawd/mcp-servers/conversation-memory/`
+- **Bug**: BUG-007 — `vps_connector.py` used `["ssh", VPS_HOST, ...]` where `VPS_HOST = "storage-vps"` (Tailscale hostname). Tailscale MagicDNS can break or drift. All infra in this project uses explicit IPs. Additionally the old call omitted `-p` and the SSH username, relying on the local SSH config having a `Host storage-vps` entry with `User Administrator` and `Port 47822`. This means the connector silently breaks on any machine without that SSH config entry.
+- **Root cause clarification**: Bug log said `vps_connector.py` lives in `llm-cortex/src/` — it does not. The actual file is `~/clawd/mcp-servers/conversation-memory/vps_connector.py`. The bug description was correct; the path was wrong. The commit is therefore in the clawd repo, not llm-cortex.
+- **Files changed** (in `~/clawd/mcp-servers/conversation-memory/`):
+  - `config.py`: Added `import os`. Replaced 4 hardcoded VPS constants with `os.getenv()` calls with correct defaults. Added `VPS_SSH_PORT = int(os.getenv("STORAGE_VPS_SSH_PORT", "47822"))` and `VPS_SSH_USER = os.getenv("STORAGE_VPS_SSH_USER", "Administrator")`. VPS_HOST default changed from `"storage-vps"` to `"104.237.203.117"` (public IP). No credentials hardcoded.
+  - `vps_connector.py`: Updated import to include `VPS_SSH_PORT, VPS_SSH_USER`. Changed `["ssh", VPS_HOST, ...]` to `["ssh", "-p", str(VPS_SSH_PORT), f"{VPS_SSH_USER}@{VPS_HOST}", ...]`.
+- **Verification**:
+  - `python3 -m py_compile config.py vps_connector.py` — clean
+  - `pytest tests/ -v` — 2 passed (unchanged)
+  - Smoke test: `VPSConnector().check_connection()` → `True` (SELECT 1 via SSH through public IP + port 47822 as Administrator)
+- **Commit**: `8a04df1` in clawd repo (`fix(vps_connector): use explicit IPs + port for Tailscale/SSH reliability`)
+- **Deferred**: Worktrees (nervous-shaw, clever-kare, silly-matsumoto) still have the old `config.py` — they are working branches and should be updated when rebased or merged.
+- **BUG-007 STATUS**: FIXED
