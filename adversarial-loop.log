@@ -1689,3 +1689,84 @@ See below for SHAs after commit.
 - **unified_vector_store.py compaction/backfill** (~300 lines): heavy fixtures needed. Deferred to a dedicated backfill-coverage pass.
 - **knowledge_graph.py export_to_dot, import_from_json, get_subgraph** (lines 816-884): require pydot and file I/O fixtures. Deferred.
 
+---
+
+## Pass Q -- Entity Merge / Alias (2026-04-16)
+
+**Goal:** Implement entity merge/alias for the `unknown`-type entity mass in the knowledge graph (9,974 entities total, 3,739 tagged `unknown` at start of pass). Prevent future duplicate creation via NER type-downgrade.
+
+### Investigation Findings
+
+**Normalization invariant discovery (critical):**
+`_normalize_id()` lowercases and converts spaces to underscores on the way in, and `id` is PRIMARY KEY. This means two entities can NEVER share the same normalized name -- the strict-rule merge condition ("unknown entity whose display_name matches a typed entity case-insensitively") is structurally impossible to trigger.
+
+Verification queries confirmed:
+- `SELECT COUNT(*) FROM entities WHERE id != lower(id)` -> 0 (all IDs already lowercase)
+- Case-duplicate query (group by lower(display_name), HAVING COUNT > 1) -> 0 results
+- Strict-rule merge query (JOIN on lower(trim(display_name))) -> 0 candidates
+
+**Self-referential aliases (Pass A2 regression):**
+230 aliases exist where `alias = canonical_id`. Pass A2 was supposed to clean these. They are functionally harmless -- `resolve_entity()` short-circuits on exact id match before alias lookup. Filed as regression note; cleanup deferred to Pass A2 owner.
+
+**Root cause of ongoing `unknown` inflation:**
+`kg.add_entity()` uses `ON CONFLICT(id) DO UPDATE SET entity_type = excluded.entity_type`, which overwrites entity_type unconditionally. When NER processes observations that mention typed entities in fragment context, calling add_entity with type='unknown' DOWNGRADES them. This is the real source of unknown accumulation.
+
+**Sample of unknowns:** Majority are sentence-fragment artifacts (e.g., "being committed to the repo", "the sidelines") -- NLP noise. No merge target exists for these.
+
+**Prefix-match false positives:** Spec rule 4(c) correctly excludes all prefix-match pairs (e.g., `postgresql_instead_of_direct_nt8` is a phrase fragment, not a duplicate of `postgresql`).
+
+**Retype candidates (curated, 10 entities):**
+`github`, `openai`, `ninjatrader`, `nt8`, `imessage`, `visionclaw`, `pypi`, `oauth`, `nssm`, `json`
+
+### Changes Made
+
+**`scripts/merge_duplicate_entities.py` (new, 274 lines):**
+- Idempotent deduplication script with `--dry-run` default, `--no-dry-run` opt-in, `--retype` flag.
+- `find_strict_merge_candidates()`: runs spec-defined merge query, documents expected-0 result.
+- `execute_merge()`: atomic per-pair transaction (UPDATE relationships, INSERT alias, DELETE entity).
+- `execute_retype()`: applies curated RETYPE_CANDIDATES -- changes entity_type only, no merge needed.
+- Safety gates enforced: >100 edges, <7 days old, display_name differs by more than case/whitespace.
+- Full deferral report for all excluded classes.
+
+**`src/memory_worker.py` -- `_extract_and_link_entities()` (forward-fix):**
+- Added `resolve_entity()` check before `add_entity()` call.
+- If existing entity has non-'unknown' type AND incoming type is 'unknown': skip `add_entity()`.
+- Prevents future type downgrades. Does NOT block: unknown->typed upgrades, new entity creation.
+
+**`tests/test_ner_entity_extractor.py` -- `TestTypePreservationGuard` (5 new tests):**
+- Documents the underlying hazard (add_entity overwrites type).
+- Verifies guard prevents system->unknown downgrade.
+- Verifies unknown->tool upgrade still works.
+- Verifies new unknown entities are still created.
+
+### Dedup Query Results
+
+| Query | Result |
+|-------|--------|
+| Strict-rule merge candidates | 0 |
+| Actionable merges | 0 |
+| Retype candidates (curated) | 10 |
+| Self-referential aliases (Pass A2 regression) | 230 |
+
+### Real-Run Results
+
+Before: unknown=3739, tool=3623, file=1260, person=662, system=529, ticker=80, company=62, project=19, TOTAL=9974
+After: unknown=3729, tool=3626, file=1260, person=662, system=535, ticker=80, company=63, project=19, TOTAL=9974
+Merges executed: 0 (strict rules found 0 candidates -- normalization invariant confirmed)
+Retypes applied: 10
+
+### Test Results
+
+- Baseline (pre-Q, excl. slow recall test): 228 passed
+- Post-Q: 232 passed (+4 net; 5 new tests added, 1 pre-existing import count change)
+- Pre-existing failure: test_memory_recall_rate (sqlite_vec extension -- not related)
+
+### Deferrals
+
+- **Strict-rule merges**: 0 candidates. Normalization invariant makes same-display-name duplication impossible. Deferred indefinitely.
+- **Singular/plural pairs**: spec forbids auto-merge. Deferred.
+- **Levenshtein-1/2 near-duplicates**: spec forbids auto-merge. Deferred.
+- **Sentence-fragment unknowns**: ~3,729 remain. NLP extraction noise -- separate cleanup pass needed.
+- **Self-referential aliases** (230): regression from Pass A2. Functionally harmless. Deferred to Pass A2 owner.
+- **Add GitHub/OpenAI to KNOWN_SYSTEMS**: domain decision deferred -- classification as system vs tool vs company requires Cameron input.
+
