@@ -250,3 +250,41 @@
 
 - **Tests**: `pytest tests/test_knowledge_graph.py` -- 1 passed. Full suite 77 passed, 1 pre-existing failure (`test_memory_recall_rate` -- sqlite_vec not installed, unrelated).
 - **Commit**: `6cef09f` in llm-cortex repo (`fix(knowledge_graph): four confirmed bugs in graph traversal and alias table`)
+
+### Pass A5 — 2026-04-16
+- **Subsystem**: `memory_retriever.py` (~41KB, 3-layer progressive retrieval, main MCP query path into Cortex)
+- **Scope**: Full file read, all callers grepped (`mcp_memory_server.py`, `memory_worker.py`, all test files). No changes to `unified_vector_store.py` (Pass 5 owns it).
+- **Bug candidates investigated**: 10 categories checked (silent failures, off-by-one/pagination, unbounded queries, input validation, encoding/unicode, race/cache, dead imports, error-message leaks, SQL injection, type confusion)
+
+**BUG-A5-01 (FIXED, P2): FTS empty-term bypass — pure-emoji/punctuation queries skip LIKE fallback**
+- Root cause: Each query term is sanitized (keep only `[a-z0-9_-]` equivalents). A term containing only emoji or punctuation sanitizes to `""`. The term was included in the join, producing FTS phrase literals like `"" OR ""`. The `if not fts_query` guard on line 450 was bypassed because `'""'` (a two-char string) is truthy. FTS5 MATCH with `""` returns 0 rows silently — the LIKE fallback never fired even for mixed queries like `🚀 gamma` that would have matched via LIKE.
+- Reproduction: Confirmed by inspection + direct FTS5 test; verified `bool('""')` is True, verified `'🚀 gamma'` with fix applied returns 1 LIKE result.
+- Fix: Filter `cleaned_terms` to non-empty before joining. If all terms sanitize to empty, return None so LIKE fallback fires.
+- Lines changed: 442-451 in `src/memory_retriever.py`.
+
+**BUG-A5-02 (FIXED, P3): Silent `except Exception: pass` in `_search_observations`**
+- Root cause: FTS exceptions were silently discarded (bare `pass`), making FTS failures completely invisible in logs. Operators had no way to know FTS was broken and LIKE was being used as fallback.
+- Fix: Changed to `except Exception as e: logger.debug("FTS5 search failed, falling back to LIKE: %s", e)`. Kept as debug (not warning) to avoid spam on malformed queries.
+- Lines changed: 418-419 in `src/memory_retriever.py`.
+
+**BUG-A5-03 (FIXED, P3): Dead imports `json` and `time`**
+- Root cause: Both modules were imported at lines 28 and 34 but never referenced anywhere in the ~1100-line file (confirmed via AST walk).
+- Fix: Removed both import lines.
+
+**BUG-A5-04 (FIXED, P2): Unbounded graph expansion fan-out in `search_with_context`**
+- Root cause: The graph expansion loop called `self.search()` once per entry in `expanded_entity_names` with no cap. `get_neighbors(hops=2)` on a dense KG (e.g. 9,731 entities, 37,721 edges) can return hundreds of neighbors. Each iteration fires a full 3-source search (observations FTS, vector store, session summaries). O(|neighbors|) searches with no bound.
+- Reproduction: Code review confirms no cap exists; KG node count documented in Pass A2 (9,731 entities). With `hops=2` on the `strat` node (4,160 edges), expansion could exceed 1,000 entities.
+- Fix: Cap at 20 entities (`_MAX_EXPANSION_ENTITIES = 20`) before the loop; log at debug level when truncation occurs.
+- Lines changed: 990-1015 in `src/memory_retriever.py`.
+
+- **Deferred bugs (could not fix this pass)**:
+
+  **BUG-A5-05 (DEFERRED, P1): `get_vector_store()` singleton ignores `db_path` after first call**
+  - In `unified_vector_store.py` lines 83-88: `_store_instance` is created from the first caller's `db_path` and returned unchanged on all subsequent calls regardless of `db_path`. If `MemoryRetriever(vec_db_path=custom_path)` is constructed after the default singleton is established, `_search_vector_store` will query the wrong database silently.
+  - Deferred: `unified_vector_store.py` is owned by Pass 5 this session. Log as BUG-A5-05 STATUS: OPEN for next pass on that file.
+
+  **BUG-A5-06 (DEFERRED, P3): `recent_observations` uses f-string SQL interpolation for `hours`**
+  - `f"AND timestamp > datetime('now', '-{hours} hours')"` — `hours` is not parameterized. Not exploitable via current callers (CLI coerces with `int()`, memory_worker uses its own query), but is a code hygiene issue if the method gains new callers. STATUS: OPEN.
+
+- **Tests**: `pytest tests/` (74 tests) — 74 passed, 0 failed. Same result as pre-fix baseline. No regression.
+- **Commit**: `8d71fa9` in llm-cortex repo (`fix(memory_retriever): four bugs from adversarial pass A5`)
