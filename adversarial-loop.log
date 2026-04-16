@@ -2131,3 +2131,71 @@ Timeline:
 - `src/memory_worker.py` (17 lines added in lifespan())
 
 **STATUS: COMPLETE -- restart script live-tested (PID changed, health 200), git hash visible in logs, two focused commits.**
+
+---
+
+## Pass CC — NER fragment cleanup (unknown entity noise)
+**Date:** 2026-04-16
+**Scope:** `scripts/cleanup_ner_false_positives.py`, production DB `~/clawd/data/cortex-knowledge-graph.db`
+
+### Problem
+3,729 entities with `entity_type='unknown'` existed in the graph. Most were NLP extraction
+artifacts -- sentence fragments auto-created when the NER pipeline extracted noun phrases from
+observation text (e.g. "the end of every day", "result is unknown", "approach that could").
+Pass Q (forward-fix) prevents new unknowns but legacy noise remained.
+
+### Investigation
+Sampled 50 unknowns by SQL; confirmed nearly all were sentence fragments. Counted by pattern:
+
+| Category | Count |
+|---|---|
+| all_lowercase_with_space | 1,567 |
+| stoplist_prefix_with_space | 862 |
+| mixed_case_with_space | 741 |
+| empty_display_name | 457 |
+| stoplist_prefix_no_space | 2 |
+| **Total fragment candidates** | **3,629** |
+
+Key finding: ALL 3,729 unknown entities had >= 1 edge (zero 0-edge orphans). So:
+- edge_count = 1 -> DELETE (single weak link, clearly noise)
+- edge_count >= 2 -> RECLASSIFY to `unknown_noisy` (preserve referential integrity)
+
+### Fix Applied
+Extended `cleanup_ner_false_positives.py` with `--clean-fragments` flag:
+- Fragment detection: display_name contains space OR starts with stoplist word (50-word list)
+- Empty display_name also qualifies as fragment
+- Heuristic applied only to entity_type='unknown' (never touches typed entities)
+- New type `unknown_noisy` documented in module docstring
+- Backup created at `~/clawd/data/cortex-knowledge-graph.db.bak-passCC`
+- Idempotent: re-run scanned 100 remaining unknowns, found 0 fragment candidates
+
+### Dry-Run Sample (30 entities, all confirmed noise)
+```
+the sidelines / the bell / app root / index 0 / that version / compile time /
+the global npm installation / one magic strategy / priority list not marked done /
+vps tradingcore database / PostgreSQL instead of direct NT8 / structured gate validation /
+your prompt / max 5 shares / signal generation to order placement / ...
+```
+All clearly sentence fragments, not real named entities.
+
+### Real Run Results
+- Deleted: **2,942** (edge_count = 1 fragments)
+- Reclassified to unknown_noisy: **687** (edge_count >= 2 fragments)
+- Post-run unknown count: **100** (from 3,729 -- 97.3% reduction)
+- Post-run total entities: **7,032** (from 9,974)
+- No typed entities (person/tool/company/project/etc.) touched
+
+### Idempotency Verified
+Re-ran `--dry-run` after real run: 0 fragment candidates found in remaining 100 unknowns.
+
+### Test Results
+- `python3 -m py_compile scripts/cleanup_ner_false_positives.py` -- PASS
+- `pytest tests/` -- **263 passed, 2 skipped** (matches baseline)
+
+### Commits
+- `9c520c7 feat(knowledge_graph): --clean-fragments flag for NER noise cleanup (Pass CC)`
+
+### Files Changed
+- `scripts/cleanup_ner_false_positives.py` (230 lines added: Pass CC docstring, FRAGMENT_STOPLIST, _is_fragment, _categorize_fragment, clean_fragments, _verify_idempotent_fragments, updated argparse)
+
+**STATUS: COMPLETE -- 2,942 deleted, 687 reclassified, unknown count 3,729 -> 100 (97.3% reduction), 263 tests pass.**
