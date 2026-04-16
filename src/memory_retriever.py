@@ -564,24 +564,40 @@ class MemoryRetriever:
             return []
 
     def _search_vector_store(self, query: str, limit: int) -> list[dict]:
-        """Search vector store using FTS5."""
+        """Search vector store using hybrid (FTS5 + vector) when available, FTS5 only otherwise."""
         try:
             # Import the vector store module
             sys.path.insert(0, str(Path(__file__).parent))
             from unified_vector_store import get_vector_store
             store = get_vector_store(self.vec_db_path)
-            results = store.search(query, limit=limit)
-            return [
-                {
-                    "id": r["id"],
-                    "summary": self._truncate_summary(r["text"]),
-                    "collection": r.get("collection", "unknown"),
-                    "timestamp": r.get("created_at"),
-                    "score": r.get("score", 0),
-                    "origin": "vector_store",
-                }
-                for r in results
-            ]
+            if store.vec_available:
+                results = store.search_hybrid(query, limit=limit)
+                # hybrid_score is 0-1 (higher = better); normalise into the score field
+                # so downstream _normalize_scores sees a positive value in [0,1]
+                return [
+                    {
+                        "id": r["id"],
+                        "summary": self._truncate_summary(r["text"]),
+                        "collection": r.get("collection", "unknown"),
+                        "timestamp": r.get("created_at"),
+                        "score": r.get("hybrid_score", r.get("score", 0)),
+                        "origin": "vector_store",
+                    }
+                    for r in results
+                ]
+            else:
+                results = store.search(query, limit=limit)
+                return [
+                    {
+                        "id": r["id"],
+                        "summary": self._truncate_summary(r["text"]),
+                        "collection": r.get("collection", "unknown"),
+                        "timestamp": r.get("created_at"),
+                        "score": r.get("score", 0),
+                        "origin": "vector_store",
+                    }
+                    for r in results
+                ]
         except Exception:
             return []
 
