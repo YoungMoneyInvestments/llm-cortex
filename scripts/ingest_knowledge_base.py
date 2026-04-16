@@ -143,8 +143,18 @@ def dry_run(conn: sqlite3.Connection) -> tuple[list, list]:
     return post_docs, mention_docs
 
 
-def ingest(conn: sqlite3.Connection, dry: bool = False) -> dict:
-    """Run ingestion. Returns summary dict."""
+def ingest(conn: sqlite3.Connection, dry: bool = False, force_replace: bool = True) -> dict:
+    """Run ingestion. Returns summary dict.
+
+    Args:
+        conn: Open read-only connection to knowledge-base.db.
+        dry: If True, estimate rows without writing.
+        force_replace: If True (default), call delete_document_and_chunks before
+            each add_knowledge so stale chunks from a previously-larger row are
+            removed.  The doc IDs for this source are stable PKs
+            (``kb-content_posts-{id}``, ``kb-twitter_mentions-{id}``) so
+            force_replace is safe and idempotent.
+    """
     post_docs, mention_docs = dry_run(conn)
 
     if dry:
@@ -158,14 +168,25 @@ def ingest(conn: sqlite3.Connection, dry: bool = False) -> dict:
     store = get_vector_store()
     pre_count = store.conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
 
+    replaced_count = 0
+
     inserted_posts = 0
     for doc_id, text, metadata in post_docs:
+        if force_replace:
+            # Internal ID in documents has the kg- prefix added by add_knowledge
+            n = store.delete_document_and_chunks(f"kg-{doc_id}")
+            if n:
+                replaced_count += 1
         store.add_knowledge(doc_id, text, metadata)
         inserted_posts += 1
         logger.debug("Upserted %s", doc_id)
 
     inserted_mentions = 0
     for doc_id, text, metadata in mention_docs:
+        if force_replace:
+            n = store.delete_document_and_chunks(f"kg-{doc_id}")
+            if n:
+                replaced_count += 1
         store.add_knowledge(doc_id, text, metadata)
         inserted_mentions += 1
         logger.debug("Upserted %s", doc_id)
@@ -176,6 +197,7 @@ def ingest(conn: sqlite3.Connection, dry: bool = False) -> dict:
     logger.info("--- REAL RUN ---")
     logger.info("content_posts upserted:   %d", inserted_posts)
     logger.info("twitter_mentions upserted: %d", inserted_mentions)
+    logger.info("Replaced (had stale chunks): %d", replaced_count)
     logger.info("DB rows before: %d  after: %d  delta: %d", pre_count, post_count, delta)
 
     return {
@@ -183,6 +205,7 @@ def ingest(conn: sqlite3.Connection, dry: bool = False) -> dict:
         "content_posts": inserted_posts,
         "twitter_mentions": inserted_mentions,
         "total_upserted": inserted_posts + inserted_mentions,
+        "replaced": replaced_count,
         "rows_before": pre_count,
         "rows_after": post_count,
         "delta": delta,
@@ -211,9 +234,13 @@ def main():
     parser = argparse.ArgumentParser(description="Ingest clawd knowledge-base.db into cortex")
     parser.add_argument("--dry-run", action="store_true", help="Estimate rows without inserting")
     parser.add_argument("--no-smoke", action="store_true", help="Skip smoke test")
+    parser.add_argument("--no-force-replace", action="store_true",
+                        help="Disable delete-before-insert (may leave orphaned chunks)")
     parser.add_argument("--idempotency-check", action="store_true",
                         help="Run a second pass to verify 0-delta re-run")
     args = parser.parse_args()
+
+    force_replace = not args.no_force_replace
 
     _check_paths()
     conn = _open_kb()
@@ -222,7 +249,7 @@ def main():
         counts = _row_counts(conn)
         logger.info("knowledge-base.db table row counts: %s", counts)
 
-        result = ingest(conn, dry=args.dry_run)
+        result = ingest(conn, dry=args.dry_run, force_replace=force_replace)
         logger.info("Ingestion result: %s", result)
 
         if not args.dry_run and not args.no_smoke:
@@ -234,8 +261,8 @@ def main():
             logger.info("--- IDEMPOTENCY CHECK (second pass) ---")
             store = get_vector_store()
             pre2 = store.conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
-            # Re-run ingest
-            ingest(conn, dry=False)
+            # Re-run ingest with force_replace (second pass must also be clean)
+            ingest(conn, dry=False, force_replace=force_replace)
             post2 = store.conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
             delta2 = post2 - pre2
             logger.info("Second pass delta: %d (must be 0)", delta2)
