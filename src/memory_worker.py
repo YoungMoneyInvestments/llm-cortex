@@ -2800,6 +2800,18 @@ async def receive_observation(req: ObservationRequest):
                     ),
                 )
 
+        # Auto-create a session row if it doesn't exist yet.
+        # Happens when start_session was never called (e.g. hooks that fire
+        # PostToolUse before any SessionStart hook reaches the worker).
+        # Uses the same upsert pattern as start_session so a later explicit
+        # start_session call can still update user_prompt / tier.
+        db.execute(
+            "INSERT INTO sessions (id, agent, started_at, subscription_tier) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(id) DO NOTHING",
+            (req.session_id, req.agent, now, tier_value),
+        )
+
         db.execute(
             "INSERT INTO observations (session_id, timestamp, source, tool_name, "
             "agent, raw_input, raw_output, subscription_tier) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
