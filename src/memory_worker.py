@@ -2576,13 +2576,14 @@ async def get_recent_observations(
         where += " AND status = ?"
         params.append(status)
 
-    # Get total count
-    total = db.execute(f"SELECT COUNT(*) as c FROM observations {where}", params).fetchone()["c"]
+    async with db_lock:
+        # Get total count
+        total = db.execute(f"SELECT COUNT(*) as c FROM observations {where}", params).fetchone()["c"]
 
-    # Fetch page
-    query = f"SELECT * FROM observations {where} ORDER BY id DESC LIMIT ? OFFSET ?"
-    params.extend([limit, offset])
-    rows = db.execute(query, params).fetchall()
+        # Fetch page
+        query = f"SELECT * FROM observations {where} ORDER BY id DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+        rows = db.execute(query, params).fetchall()
 
     return {
         "observations": [dict(r) for r in rows],
@@ -2598,12 +2599,12 @@ async def get_recent_sessions(limit: int = 10, offset: int = 0):
     if db is None:
         raise HTTPException(status_code=503, detail="Database not initialized")
 
-    total = db.execute("SELECT COUNT(*) as c FROM sessions").fetchone()["c"]
-
-    rows = db.execute(
-        "SELECT * FROM sessions ORDER BY started_at DESC LIMIT ? OFFSET ?",
-        (limit, offset),
-    ).fetchall()
+    async with db_lock:
+        total = db.execute("SELECT COUNT(*) as c FROM sessions").fetchone()["c"]
+        rows = db.execute(
+            "SELECT * FROM sessions ORDER BY started_at DESC LIMIT ? OFFSET ?",
+            (limit, offset),
+        ).fetchall()
     return {
         "sessions": [dict(r) for r in rows],
         "total": total,
@@ -2749,36 +2750,37 @@ async def get_stats():
         raise HTTPException(status_code=503, detail="Database not initialized")
 
     stats = {}
-    stats["total_observations"] = db.execute(
-        "SELECT COUNT(*) as c FROM observations"
-    ).fetchone()["c"]
-    stats["pending_observations"] = db.execute(
-        "SELECT COUNT(*) as c FROM observations WHERE status = 'pending'"
-    ).fetchone()["c"]
-    stats["processed_observations"] = db.execute(
-        "SELECT COUNT(*) as c FROM observations WHERE status = 'processed'"
-    ).fetchone()["c"]
-    stats["failed_observations"] = db.execute(
-        "SELECT COUNT(*) as c FROM observations WHERE status = 'failed'"
-    ).fetchone()["c"]
-    stats["vector_synced"] = db.execute(
-        "SELECT COUNT(*) as c FROM observations WHERE vector_synced = 1"
-    ).fetchone()["c"]
-    stats["total_sessions"] = db.execute(
-        "SELECT COUNT(*) as c FROM sessions"
-    ).fetchone()["c"]
-    stats["active_sessions"] = db.execute(
-        "SELECT COUNT(*) as c FROM sessions WHERE status = 'active'"
-    ).fetchone()["c"]
+    async with db_lock:
+        stats["total_observations"] = db.execute(
+            "SELECT COUNT(*) as c FROM observations"
+        ).fetchone()["c"]
+        stats["pending_observations"] = db.execute(
+            "SELECT COUNT(*) as c FROM observations WHERE status = 'pending'"
+        ).fetchone()["c"]
+        stats["processed_observations"] = db.execute(
+            "SELECT COUNT(*) as c FROM observations WHERE status = 'processed'"
+        ).fetchone()["c"]
+        stats["failed_observations"] = db.execute(
+            "SELECT COUNT(*) as c FROM observations WHERE status = 'failed'"
+        ).fetchone()["c"]
+        stats["vector_synced"] = db.execute(
+            "SELECT COUNT(*) as c FROM observations WHERE vector_synced = 1"
+        ).fetchone()["c"]
+        stats["total_sessions"] = db.execute(
+            "SELECT COUNT(*) as c FROM sessions"
+        ).fetchone()["c"]
+        stats["active_sessions"] = db.execute(
+            "SELECT COUNT(*) as c FROM sessions WHERE status = 'active'"
+        ).fetchone()["c"]
 
-    # Top tools
-    tool_rows = db.execute(
-        "SELECT tool_name, COUNT(*) as c FROM observations "
-        "WHERE tool_name IS NOT NULL GROUP BY tool_name ORDER BY c DESC LIMIT 10"
-    ).fetchall()
-    stats["top_tools"] = {r["tool_name"]: r["c"] for r in tool_rows}
+        # Top tools
+        tool_rows = db.execute(
+            "SELECT tool_name, COUNT(*) as c FROM observations "
+            "WHERE tool_name IS NOT NULL GROUP BY tool_name ORDER BY c DESC LIMIT 10"
+        ).fetchall()
+        stats["top_tools"] = {r["tool_name"]: r["c"] for r in tool_rows}
 
-    # AI compression stats
+    # AI compression stats (in-memory, no lock needed)
     if ai_compressor:
         stats["ai_compressed"] = ai_compressor._ai_count
         stats["ai_fallbacks"] = ai_compressor._fallback_count
@@ -2845,10 +2847,11 @@ async def get_profile():
     if db is None:
         raise HTTPException(status_code=503, detail="Database not initialized")
 
-    rows = db.execute(
-        "SELECT category, key, value, confidence, updated_at "
-        "FROM profile ORDER BY category ASC, confidence DESC"
-    ).fetchall()
+    async with db_lock:
+        rows = db.execute(
+            "SELECT category, key, value, confidence, updated_at "
+            "FROM profile ORDER BY category ASC, confidence DESC"
+        ).fetchall()
 
     grouped: dict[str, list[dict]] = {}
     for r in rows:
