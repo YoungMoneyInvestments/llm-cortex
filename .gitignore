@@ -49,3 +49,14 @@ htmlcov/
 src/air
 scripts/air_cli.py
 .gitnexus
+
+# Claude Code + agent runtime artifacts
+.claude/ralph-loop.log
+.claude/ralph-loop.pid
+.claude/ralph-progress.md
+.claude/ralph-state.json
+.agent/
+adversarial-loop.log
+
+# Local context runtime
+context/
