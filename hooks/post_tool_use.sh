@@ -14,6 +14,10 @@ PYTHON="${CORTEX_PYTHON:-python3}"
 WORKER_PORT="${CORTEX_WORKER_PORT:-37778}"
 WORKER_URL="http://127.0.0.1:$WORKER_PORT"
 AUTH_KEY="${CORTEX_WORKER_API_KEY:-}"
+# Fall back to generated key file if env var is absent (DEF-6 compatibility)
+if [ -z "$AUTH_KEY" ] && [ -f "$HOME/.cortex/data/.worker_api_key" ]; then
+    AUTH_KEY="$(cat "$HOME/.cortex/data/.worker_api_key" 2>/dev/null)"
+fi
 
 # Read stdin (Claude Code sends JSON)
 INPUT_JSON=$(cat)
