@@ -2734,3 +2734,73 @@ See `docs/META_IMPORT_STATUS.md` -- full instructions for requesting fresh expor
 - `787e76d feat(ops): FB/IG staleness monitor (Pass MM)` (includes check_meta_staleness.py + META_IMPORT_STATUS.md)
 
 **STATUS: COMPLETE -- root cause identified (manual export pipeline), staleness monitor deployed and verified firing, manual recovery instructions documented.**
+
+---
+
+## Pass 7 — pgvector Backfill for messaging_messages
+**Date**: 2026-04-16
+**Status**: COMPLETE
+
+### Scope
+Add `embedding vector(384)` column to `public.messaging_messages` on Storage VPS and
+backfill all rows with non-empty content using sentence-transformers/all-MiniLM-L6-v2
+(384 dims, matching `core.discord_messages.embedding` shape).
+
+### Findings
+- Table had 730,999 rows total (task estimate was 601K — row count grew).
+- 122,357 rows have non-empty `content` and were eligible for embedding.
+- 608,642 rows have NULL or empty content — skipped per spec.
+- `trading_user` lacks ALTER TABLE privilege on `messaging_messages`; postgres
+  superuser was used for DDL only. Backfill reads/writes as `trading_user` (normal).
+- Existing `vps_embed_pipeline.py` in clawd uses 1536-dim Gemini chunks into
+  `vec.embeddings` (separate table) — NOT a template for this task.
+- MPS (Apple Silicon GPU) accelerates encode to ~230 rows/s (batch_size=64).
+  Total time for 122K rows: ~9.5 minutes, well under the 90-minute budget.
+
+### Changes Applied
+1. **DDL**: `ALTER TABLE public.messaging_messages ADD COLUMN IF NOT EXISTS embedding vector(384)`
+   Applied as `postgres` superuser; non-blocking (NULLABLE add, no table rewrite).
+2. **Index**: `CREATE INDEX messaging_messages_embedding_ivfflat_idx USING ivfflat
+   (embedding vector_cosine_ops) WITH (lists=200)` — applied after full backfill.
+3. **Migration SQL**: `scripts/migrations/add_embedding_to_messaging_messages.sql`
+4. **Backfill script**: `scripts/backfill_messaging_vps.py`
+   - `--dry-run`, `--max-rows`, `--create-index`, `--smoke-test`, `--coverage` flags
+   - Checkpoint-resumable (WHERE embedding IS NULL + id cursor)
+   - Batch commit every 500 rows, encode sub-batch 64 rows per forward pass
+
+### Backfill Stats
+- Run 1: 100,000 embedded in 432.8s (231.0 rows/s), 1 skipped, 0 failed
+- Run 2 (completion): 22,356 embedded in 97.0s (230.5 rows/s), 1 skipped, 0 failed
+- Total: 122,356/122,357 eligible rows embedded (1 row had content trimming to empty)
+- Coverage: 122,356/730,999 total rows (16.74%)
+
+### Smoke Test — Top 5 nearest to "trading plan for today"
+1. id=645932  dist=0.2848  "What's his trading plan?"
+2. id=646330  dist=0.3528  "Trading*"
+3. id=701273  dist=0.3883  "I will sign up this weekend..."
+4. id=645840  dist=0.3896  "Super good day trading."
+5. id=617901  dist=0.4043  "I'm intrigued, I'd love to see how you dissect a trade..."
+(Results are semantically appropriate.)
+
+### Test Results
+- 270 passed, 2 skipped, 0 failures (unchanged from pre-pass baseline)
+
+### Continuation Plan (new rows from upstream)
+All 122,357 existing eligible rows are now embedded.
+For rows added by the FB/IG import pipeline (once Pass MM restores it):
+```bash
+# Daily cron — runs on Mac, picks up whatever new rows landed
+PGPASSWORD='...' python3 ~/Projects/llm-cortex/scripts/backfill_messaging_vps.py --max-rows 0
+```
+Idempotent: WHERE embedding IS NULL means only unembedded rows are touched.
+Suggested launchd label: `com.cameronbennion.messaging-embed-backfill` (daily at 03:00).
+
+### Files Changed
+- `scripts/migrations/add_embedding_to_messaging_messages.sql` (new)
+- `scripts/backfill_messaging_vps.py` (new)
+- `adversarial-loop.log` (this entry)
+
+### Commits
+- (see below after git commit)
+
+**STATUS: COMPLETE — 122,356 rows embedded, ivfflat index created, smoke test valid, tests green.**
