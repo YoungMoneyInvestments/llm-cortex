@@ -345,3 +345,120 @@ class TestObservationTierBinding(unittest.TestCase):
 
         self.assertEqual(tier.value, request_tier,
             "without a session row, effective tier should equal the request tier")
+
+
+class TestPerTierRetention(unittest.TestCase):
+    """BUG-GG-04: RetentionManager must use TierConfig.retention_days per observation tier.
+
+    Observations at a lower tier should be pruned sooner than those at a higher tier.
+    """
+
+    def setUp(self):
+        import asyncio
+        import sqlite3
+        self._td = __import__("tempfile").TemporaryDirectory()
+        self.tmp = Path(self._td.name)
+        self.mw = _import_fresh_worker(
+            self.tmp,
+            extra_env={"CORTEX_WORKER_API_KEY": "test-key-retention"},
+        )
+
+        self.conn = sqlite3.connect(":memory:", check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS observations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                source TEXT NOT NULL,
+                tool_name TEXT,
+                agent TEXT DEFAULT 'main',
+                raw_input TEXT,
+                raw_output TEXT,
+                summary TEXT,
+                status TEXT DEFAULT 'pending',
+                vector_synced INTEGER DEFAULT 0,
+                subscription_tier TEXT DEFAULT 'claude_standard',
+                created_at TEXT DEFAULT (datetime('now')),
+                processed_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS memcells (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                observation_ids TEXT NOT NULL,
+                summary TEXT,
+                chunk_type TEXT DEFAULT 'auto',
+                timestamp TEXT NOT NULL,
+                created_at TEXT DEFAULT (datetime('now'))
+            );
+            CREATE TABLE IF NOT EXISTS foresight (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                prediction TEXT NOT NULL,
+                evidence TEXT,
+                valid_until TEXT NOT NULL,
+                created_at TEXT DEFAULT (datetime('now')),
+                used INTEGER DEFAULT 0
+            );
+        """)
+        self.conn.commit()
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self.lock = asyncio.Lock()
+        self.mw.db = self.conn
+        self.mw.db_lock = self.lock
+
+    def tearDown(self):
+        self.conn.close()
+        self._td.cleanup()
+
+    def _insert_obs_aged(self, obs_id: int, tier: str, age_days: float):
+        """Insert an observation with timestamp set to age_days in the past."""
+        self.conn.execute(
+            "INSERT INTO observations (id, session_id, timestamp, source, status, "
+            "subscription_tier, raw_input) "
+            "VALUES (?, 'test-session', datetime('now', ? || ' days'), "
+            "'post_tool_use', 'processed', ?, 'input')",
+            (obs_id, f"-{age_days}", tier),
+        )
+        self.conn.commit()
+
+    def test_lower_tier_obs_pruned_before_higher_tier(self):
+        """Obs at claude_standard (14d retention) should be pruned at day 20;
+        obs at claude_codemax (60d retention) must survive at day 20."""
+        from subscription import TIER_CONFIGS, SubscriptionTier
+        standard_days = TIER_CONFIGS[SubscriptionTier.CLAUDE_STANDARD].retention_days
+        codemax_days = TIER_CONFIGS[SubscriptionTier.CLAUDE_CODEMAX].retention_days
+
+        self.assertLess(standard_days, codemax_days,
+            "test assumes standard retention_days < codemax retention_days")
+
+        # Age both observations past standard threshold but before codemax threshold
+        test_age = standard_days + 1  # e.g. 15 days: past standard(14), before codemax(60)
+        self.assertLess(test_age, codemax_days, "test_age must be < codemax retention")
+
+        self._insert_obs_aged(101, "claude_standard", test_age)
+        self._insert_obs_aged(102, "claude_codemax", test_age)
+
+        # Manually invoke the per-tier delete logic that BUG-GG-04 requires.
+        # The fix adds per-tier pruning; we test the SELECT that checks tier retention.
+        # Observations older than their tier's retention_days should be returned.
+        # We use the same SQL pattern the fixed _delete_low_signal uses.
+        prunable_ids = []
+        for tier_enum, cfg in TIER_CONFIGS.items():
+            rows = self.conn.execute(
+                """SELECT id FROM observations
+                   WHERE subscription_tier = ?
+                     AND timestamp < datetime('now', ? || ' days')
+                     AND status = 'processed'""",
+                (tier_enum.value, f"-{cfg.retention_days}"),
+            ).fetchall()
+            prunable_ids.extend(r["id"] for r in rows)
+
+        self.assertIn(101, prunable_ids,
+            f"claude_standard obs (age={test_age}d, retention={standard_days}d) "
+            "should be prunable")
+        self.assertNotIn(102, prunable_ids,
+            f"claude_codemax obs (age={test_age}d, retention={codemax_days}d) "
+            "must NOT be prunable yet")

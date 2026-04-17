@@ -45,7 +45,10 @@ import uvicorn
 # Ensure scripts dir is on path for memory_retriever
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from memory_retriever import MemoryRetriever
-from subscription import DEFAULT_TIER, SubscriptionTier, clamp_tier, get_tier_config, parse_tier
+from subscription import (
+    DEFAULT_TIER, TIER_CONFIGS, SubscriptionTier,
+    clamp_tier, get_tier_config, parse_tier,
+)
 
 # ── Config ──────────────────────────────────────────────────────────────────
 
@@ -1996,23 +1999,54 @@ class RetentionManager:
         return stats
 
     async def _delete_low_signal(self, dry_run: bool = False) -> tuple[int, int]:
-        """Delete low-signal observations older than RETENTION_FULL_DAYS."""
+        """Delete low-signal observations using per-tier retention_days (BUG-GG-04).
+
+        Each tier has its own retention window from TierConfig.retention_days.
+        RETENTION_FULL_DAYS is the global minimum floor for observations whose
+        tier is absent or unrecognised.
+        """
         if db is None or db_lock is None:
             return 0, 0
 
+        all_ids: list[int] = []
         async with db_lock:
+            for tier_enum, cfg in TIER_CONFIGS.items():
+                # Use the higher of the tier's retention_days and the global floor
+                days = max(cfg.retention_days, RETENTION_FULL_DAYS)
+                rows = db.execute(
+                    """SELECT id FROM observations
+                       WHERE subscription_tier = ?
+                         AND timestamp < datetime('now', ? || ' days')
+                         AND status = 'processed'
+                         AND (
+                           (tool_name IS NULL AND source = 'post_tool_use')
+                           OR tool_name IN ('Read','Glob','Grep','Bash','TaskOutput')
+                           OR (source = 'user_prompt' AND raw_input LIKE '<task-notification>%')
+                         )""",
+                    (tier_enum.value, f"-{days}"),
+                ).fetchall()
+                all_ids.extend(r["id"] for r in rows)
+
+            # Floor pass: catch observations with NULL/unknown tier using global default
             rows = db.execute(
                 """SELECT id FROM observations
-                   WHERE timestamp < datetime('now', ? || ' days')
+                   WHERE (subscription_tier IS NULL
+                          OR subscription_tier NOT IN ({placeholders}))
+                     AND timestamp < datetime('now', ? || ' days')
                      AND status = 'processed'
                      AND (
                        (tool_name IS NULL AND source = 'post_tool_use')
                        OR tool_name IN ('Read','Glob','Grep','Bash','TaskOutput')
                        OR (source = 'user_prompt' AND raw_input LIKE '<task-notification>%')
-                     )""",
-                (f"-{RETENTION_FULL_DAYS}",),
+                     )""".format(
+                    placeholders=",".join("?" for _ in TIER_CONFIGS)
+                ),
+                [t.value for t in TIER_CONFIGS] + [f"-{RETENTION_FULL_DAYS}"],
             ).fetchall()
-            all_ids = [r["id"] for r in rows]
+            all_ids.extend(r["id"] for r in rows)
+
+        # Deduplicate (shouldn't happen, but defensive)
+        all_ids = list(dict.fromkeys(all_ids))
 
         if not all_ids:
             return 0, 0
@@ -2025,19 +2059,43 @@ class RetentionManager:
         return deleted, vec_deleted
 
     async def _trim_high_signal(self, dry_run: bool = False) -> int:
-        """NULL raw_input/raw_output on high-signal observations older than RETENTION_TRIM_DAYS."""
+        """NULL raw_input/raw_output on high-signal observations using per-tier windows (BUG-GG-04).
+
+        Each tier's trim threshold equals its TierConfig.retention_days.
+        RETENTION_TRIM_DAYS is the global floor for observations with missing/unknown tier.
+        """
         if db is None or db_lock is None:
             return 0
 
+        all_ids: list[int] = []
         async with db_lock:
+            for tier_enum, cfg in TIER_CONFIGS.items():
+                days = max(cfg.retention_days, RETENTION_TRIM_DAYS)
+                rows = db.execute(
+                    """SELECT id FROM observations
+                       WHERE subscription_tier = ?
+                         AND timestamp < datetime('now', ? || ' days')
+                         AND status = 'processed'
+                         AND (raw_input IS NOT NULL OR raw_output IS NOT NULL)""",
+                    (tier_enum.value, f"-{days}"),
+                ).fetchall()
+                all_ids.extend(r["id"] for r in rows)
+
+            # Floor pass: unknown/NULL tier uses RETENTION_TRIM_DAYS
             rows = db.execute(
                 """SELECT id FROM observations
-                   WHERE timestamp < datetime('now', ? || ' days')
+                   WHERE (subscription_tier IS NULL
+                          OR subscription_tier NOT IN ({placeholders}))
+                     AND timestamp < datetime('now', ? || ' days')
                      AND status = 'processed'
-                     AND (raw_input IS NOT NULL OR raw_output IS NOT NULL)""",
-                (f"-{RETENTION_TRIM_DAYS}",),
+                     AND (raw_input IS NOT NULL OR raw_output IS NOT NULL)""".format(
+                    placeholders=",".join("?" for _ in TIER_CONFIGS)
+                ),
+                [t.value for t in TIER_CONFIGS] + [f"-{RETENTION_TRIM_DAYS}"],
             ).fetchall()
-            all_ids = [r["id"] for r in rows]
+            all_ids.extend(r["id"] for r in rows)
+
+        all_ids = list(dict.fromkeys(all_ids))
 
         if not all_ids or dry_run:
             return len(all_ids)
