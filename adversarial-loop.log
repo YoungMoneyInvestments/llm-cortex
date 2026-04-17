@@ -2804,3 +2804,54 @@ Suggested launchd label: `com.cameronbennion.messaging-embed-backfill` (daily at
 - (see below after git commit)
 
 **STATUS: COMPLETE — 122,356 rows embedded, ivfflat index created, smoke test valid, tests green.**
+
+### Pass II -- 2026-04-16
+- **Mission**: Targeted bug-fix pass closing 4 approved defects: BUG-GG-02, BUG-GG-03, BUG-GG-04, DEF-6.
+- **Files changed (in-repo)**: `src/memory_worker.py`, `tests/test_memory_worker_helpers.py`, `hooks/session_end.sh`, `hooks/session-end.sh`, `hooks/post_tool_use.sh`, `docs/04-OPERATIONS.md`
+- **Files changed (out-of-repo)**: `~/Library/LaunchAgents/com.cortex.memory-worker.plist`, `~/.claude/settings.json`
+
+**BUG-GG-02 (FIXED): SessionEnd hook wired; session-end.sh and post_tool_use.sh gain key-file fallback**
+- `~/.claude/settings.json` `SessionEnd` was `[]`. Changed to invoke `/Users/cameronbennion/Projects/llm-cortex/hooks/session_end.sh` (type: command, timeout: 5000, async: true). Worker now receives `/api/sessions/end` calls on session close, preventing zombie sessions.
+- Both `session_end.sh` / `session-end.sh` and `post_tool_use.sh` gained key-file fallback before DEF-6 plist cleanup:
+  ```bash
+  if [ -z "$AUTH_KEY" ] && [ -f "$HOME/.cortex/data/.worker_api_key" ]; then
+      AUTH_KEY="$(cat "$HOME/.cortex/data/.worker_api_key" 2>/dev/null)"
+  fi
+  ```
+- Commit: `9b5e0e1` -- `fix(settings): wire SessionEnd + SessionStart hooks (BUG-GG-02)`
+
+**BUG-GG-03 (FIXED): Observation tier bound to session row, not request payload**
+- Root cause: `receive_observation` called `parse_tier(req.subscription_tier).value` directly. A caller who created a session at `claude_standard` could later POST observations claiming `claude_codemax`, bypassing rate limits and quotas.
+- Fix: Before the auto-upsert, SELECT `subscription_tier` from the sessions table. If the session row exists, use its stored tier (still clamped by `SERVER_TIER_CAP`). If no row yet (first observation before SessionStart), fall back to request tier + warning log.
+- Live smoke test: session created at `claude_standard`, observation POSTed claiming `claude_codemax` -- stored tier confirmed `claude_standard` in SQLite.
+- Tests added: `TestObservationTierBinding` (2 tests in `test_memory_worker_helpers.py`)
+- Commit: `019ddc0` -- `fix(memory_worker): bind observation tier to session row (BUG-GG-03)`
+
+**BUG-GG-04 (FIXED): Per-tier retention windows applied in RetentionManager**
+- Root cause: `_delete_low_signal` and `_trim_high_signal` used global `RETENTION_FULL_DAYS=7` and `RETENTION_TRIM_DAYS=30`, ignoring `TierConfig.retention_days` (14/30/45/60 per tier). All users' observations were pruned at the same 7-day cutoff regardless of paid tier.
+- Fix: Both methods now iterate `TIER_CONFIGS`, applying `max(cfg.retention_days, global_floor)` per tier. A floor pass after the loop catches observations with NULL or unknown `subscription_tier` using the global default. Results deduplicated with `dict.fromkeys` before deletion.
+- Import updated: added `TIER_CONFIGS` to `from subscription import (...)`.
+- Tests added: `TestPerTierRetention` (1 case -- `claude_standard` obs aged 15 days is prunable; `claude_codemax` obs aged 15 days is not).
+- Commit: `b17a228` -- `fix(memory_worker): apply per-tier retention_days (BUG-GG-04)`
+
+**DEF-6 (FIXED): Hardcoded CORTEX_WORKER_API_KEY=cortex-local-2026 removed**
+- Removed `EnvironmentVariables` block from `~/Library/LaunchAgents/com.cortex.memory-worker.plist` containing `CORTEX_WORKER_API_KEY=cortex-local-2026`.
+- Removed `env CORTEX_WORKER_API_KEY=cortex-local-2026` prefix from PostToolUse hook command in `~/.claude/settings.json`.
+- Key resolution now uses the 3-step auto-manage chain: env var -> `~/.cortex/data/.worker_api_key` file -> auto-generate on first start.
+- Plist reload (`launchctl unload` + `load`) required to clear cached EnvironmentVariables -- `kickstart -k` alone was insufficient as launchd cached the old env from the loaded job. Verified: old key `cortex-local-2026` now rejected (401), file key accepted.
+- `docs/04-OPERATIONS.md`: Updated `CORTEX_WORKER_API_KEY` from "required" to "no (auto-managed)" and added key resolution section.
+- Commit: `fa16e2f` -- `fix(ops): unify worker API key to auto-generated file (DEF-6)`
+
+**Test results**:
+- `tests/test_memory_worker_helpers.py` + `tests/test_retention_cascade.py`: 22/22 passing.
+- Baseline maintained (245 passing across full suite, pre-existing `test_ai_compressor_edge_cases.py` failures unchanged).
+
+**Worker restart**: Confirmed via `scripts/restart_worker.sh`; new PID 49511 healthy at `/api/health`. Plist reloaded to flush old EnvironmentVariables.
+
+**Commits (llm-cortex repo, all on main)**:
+- `9b5e0e1` -- `fix(settings): wire SessionEnd + SessionStart hooks (BUG-GG-02)`
+- `019ddc0` -- `fix(memory_worker): bind observation tier to session row (BUG-GG-03)`
+- `b17a228` -- `fix(memory_worker): apply per-tier retention_days (BUG-GG-04)`
+- `fa16e2f` -- `fix(ops): unify worker API key to auto-generated file (DEF-6)`
+
+**Status**: BUG-GG-02 CLOSED. BUG-GG-03 CLOSED. BUG-GG-04 CLOSED. DEF-6 CLOSED.
