@@ -45,11 +45,23 @@ The public repo defaults to a generic local runtime under `~/.cortex`. Override 
 
 | Variable | Required | Purpose |
 |----------|----------|---------|
-| `CORTEX_WORKER_API_KEY` | yes for hooks/POST endpoints | shared bearer token between the worker and hook environment |
+| `CORTEX_WORKER_API_KEY` | no (auto-managed) | shared bearer token between the worker and hook environment |
 | `CORTEX_WORKER_PORT` | no | worker port, defaults to `37778` |
 | `CORTEX_DATA_DIR` | no | runtime data directory |
 | `CORTEX_LOG_DIR` | no | runtime log directory |
 | `CORTEX_PID_FILE` | no | PID file path |
+
+### API Key Resolution (DEF-6)
+
+The worker and hook scripts resolve `CORTEX_WORKER_API_KEY` in this order:
+
+1. `CORTEX_WORKER_API_KEY` environment variable (if set and non-empty)
+2. Key file at `~/.cortex/data/.worker_api_key` (auto-read by hooks)
+3. Auto-generate a new 32-char hex key, write it to the key file, and use it (worker startup only)
+
+**You do not need to set `CORTEX_WORKER_API_KEY` in your shell profile, launchd plist, or supervisor config.** The worker generates and persists the key on first start. Hook scripts read the same file. As long as both the worker and the hooks share the same `CORTEX_DATA_DIR`, the key stays in sync automatically.
+
+Only set `CORTEX_WORKER_API_KEY` explicitly when you need a specific value (e.g., shared with a remote client over a trusted tunnel).
 
 Optional AI compression settings:
 
@@ -61,14 +73,13 @@ Optional AI compression settings:
 | `OPENAI_API_KEY` | optional | OpenAI embeddings |
 | `CORTEX_ENV_FILE` | optional | env file containing `OPENAI_API_KEY=...` |
 
-Generate a safe worker key with:
+To override with a specific key (optional), generate one with:
 
 ```bash
-python3 - <<'PY'
-import secrets
-print(secrets.token_hex(16))
-PY
+python3 -c "import secrets; print(secrets.token_hex(16))"
 ```
+
+Then set `CORTEX_WORKER_API_KEY=<value>` in your environment before starting the worker.
 
 ---
 
