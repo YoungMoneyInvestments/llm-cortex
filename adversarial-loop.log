@@ -2695,3 +2695,42 @@ Observation_ids JSON array max size: 5. Confirmed from DB: max=5, avg=1.55.
 **STATUS: COMPLETE -- 0 orphans in all tables, auto-upsert deployed, 78 sessions backfilled.**
 
 **STATUS: COMPLETE -- 742-line script, 4 scenarios run, worker healthy post-stress, no HIGH bugs found.**
+
+---
+
+## Pass MM: FB/IG Messaging Data Staleness (DEF-5)
+**Date:** 2026-04-16
+**Mission:** Diagnose why FB/IG data in messaging_messages has been stale since 2026-01-28 (78 days). Find writer, root cause, fix if possible, deploy staleness monitor.
+
+### Finding: Pipeline Type
+There is NO continuous importer for FB/IG. The data was loaded once via one-shot manual migration scripts:
+- `~/Projects/messaging-migration/scripts/03_migrate_facebook.py`
+- `~/Projects/messaging-migration/scripts/04_migrate_instagram.py`
+
+Source files were Meta "Download your information" JSON exports downloaded 2026-01-28. No launchd job or cron ingests new FB/IG messages. The 6h `cron_social_embed.sh` only embeds rows already in PostgreSQL -- correctly reports "0 new messages" every run.
+
+### Root Cause
+Manual pipeline. Meta does not offer a real-time personal message API. The last export was 2026-01-28; no subsequent export has been requested or downloaded. The IG zip file (`instagram-youngmoneyinvestments-2026-01-28-3IlR0and.zip`) is missing from disk. The FB directory export still exists.
+
+### Automatic Fix Applied
+None applicable. Meta's export pipeline is user-initiated and cannot be automated.
+
+### Manual Steps Documented
+See `docs/META_IMPORT_STATUS.md` -- full instructions for requesting fresh export from Meta Accounts Center, updating IG zip path constant, re-running migration scripts.
+
+### Staleness Monitor Deployed
+**Script:** `scripts/check_meta_staleness.py`
+- Queries `MAX(sent_at)` per platform with explicit enum cast (messaging_platform is a custom PostgreSQL enum)
+- Threshold: 14 days (configurable via --stale-days)
+- On detection: writes alert observation to cortex worker via `POST /api/memory/save` with `X-Cortex-Api-Key` auth
+- Fallback: prints to stderr if worker unreachable (does not crash maintenance cron)
+- First-run verified: both platforms correctly detected as STALE (78 days), alert written to cortex (id: kg-manual-20260417-011030)
+- Exit 0 always -- stale state is an alert, not a fatal error for the maintenance cron
+
+### Test Results
+- 268 passed, 2 skipped (baseline preserved -- no regressions)
+
+### Commits
+- `787e76d feat(ops): FB/IG staleness monitor (Pass MM)` (includes check_meta_staleness.py + META_IMPORT_STATUS.md)
+
+**STATUS: COMPLETE -- root cause identified (manual export pipeline), staleness monitor deployed and verified firing, manual recovery instructions documented.**
