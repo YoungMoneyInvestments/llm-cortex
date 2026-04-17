@@ -350,6 +350,59 @@ def cortex_recall(cwd: Optional[str] = None) -> str:
     return "\n".join(lines) if len(lines) > 1 else ""
 
 
+MEMORY_INDEX_PATH = Path.home() / ".claude" / "projects" / "-Users-cameronbennion" / "memory" / "MEMORY.md"
+
+
+def memory_topic_index() -> str:
+    """Emit curated topic pointers from MEMORY.md so agents know what's indexed before querying.
+
+    Extracts bullet lines under '## Topic Files' and similar sections. Keeps the agent from
+    firing blind kitchen-sink queries that return 0 hits.
+    """
+    if not MEMORY_INDEX_PATH.exists():
+        return ""
+    try:
+        raw = MEMORY_INDEX_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+    topics: List[str] = []
+    capture = False
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            heading = stripped[3:].lower()
+            capture = any(
+                k in heading
+                for k in ("topic", "projects", "feedback", "reference", "trading rule")
+            )
+            continue
+        if capture and stripped.startswith("- ["):
+            # "- [Title](file.md) — one-line hook"
+            # Keep just "Title — hook" to stay compact.
+            try:
+                title_end = stripped.index("]")
+                title = stripped[3:title_end]
+                hook_idx = stripped.find("—")
+                if hook_idx == -1:
+                    hook_idx = stripped.find("--")
+                hook = stripped[hook_idx:].lstrip("-— ").strip() if hook_idx != -1 else ""
+                if hook:
+                    topics.append(f"{title} — {hook[:90]}")
+                else:
+                    topics.append(title)
+            except ValueError:
+                continue
+
+    if not topics:
+        return ""
+
+    lines = ["## Memory Topic Index", "(Query these topics via cami_memory_search, one concept per call.)"]
+    for t in topics[:80]:
+        lines.append(f"  - {t}")
+    return "\n".join(lines)
+
+
 OBSIDIAN_VAULT = Path.home() / "Library" / "Mobile Documents" / "iCloud~md~obsidian" / "Documents" / "Cameron"
 
 # Maps project directory name (or path fragment) to vault folder name.
@@ -439,6 +492,12 @@ def main():
     if recall:
         print("")
         print(recall)
+
+    # Append curated memory topic index so agent knows what to query
+    topics = memory_topic_index()
+    if topics:
+        print("")
+        print(topics)
 
     # Append Obsidian vault context
     vault = obsidian_context()
