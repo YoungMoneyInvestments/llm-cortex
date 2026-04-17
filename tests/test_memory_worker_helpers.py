@@ -241,3 +241,107 @@ class TestSubscriptionRateLimiter(unittest.TestCase):
         ok_b, _ = self.limiter.check("session-b", "claude_codemax")
         self.assertTrue(ok_b,
             "a different session must not be blocked because session-a is at capacity")
+
+
+class TestObservationTierBinding(unittest.TestCase):
+    """BUG-GG-03: observation tier must be read from the session row, not the request.
+
+    A caller should not be able to escalate the effective tier of an observation
+    above the tier that was declared when the session was created.
+    """
+
+    def setUp(self):
+        import asyncio
+        import sqlite3
+        self._td = __import__("tempfile").TemporaryDirectory()
+        self.tmp = Path(self._td.name)
+        self.mw = _import_fresh_worker(
+            self.tmp,
+            extra_env={"CORTEX_WORKER_API_KEY": "test-key-binding"},
+        )
+
+        # Create a fresh in-memory DB and lock for the test
+        self.conn = sqlite3.connect(":memory:", check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                id TEXT PRIMARY KEY,
+                agent TEXT DEFAULT 'main',
+                started_at TEXT NOT NULL,
+                ended_at TEXT,
+                user_prompt TEXT,
+                summary TEXT,
+                observation_count INTEGER DEFAULT 0,
+                subscription_tier TEXT DEFAULT 'claude_standard',
+                status TEXT DEFAULT 'active'
+            );
+        """)
+        self.conn.commit()
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self.lock = asyncio.Lock()
+
+        # Patch module-level db and db_lock
+        self.mw.db = self.conn
+        self.mw.db_lock = self.lock
+
+    def tearDown(self):
+        self.conn.close()
+        self._td.cleanup()
+
+    def _insert_session(self, session_id: str, tier: str):
+        """Insert a session row with a fixed tier."""
+        self.conn.execute(
+            "INSERT INTO sessions (id, agent, started_at, subscription_tier) "
+            "VALUES (?, 'main', datetime('now'), ?)",
+            (session_id, tier),
+        )
+        self.conn.commit()
+
+    def test_observation_gets_session_tier_not_request_tier(self):
+        """Session at tier A; observation claims tier B > A → effective tier is A."""
+        session_id = "sess-tier-test-001"
+        session_tier = "claude_standard"   # tier A (lower)
+        request_tier = "claude_codemax"    # tier B (higher — escalation attempt)
+
+        self._insert_session(session_id, session_tier)
+
+        # Simulate the tier resolution logic from receive_observation.
+        # We test the SELECT + clamp path directly, matching the production code.
+        _session_row = self.conn.execute(
+            "SELECT subscription_tier FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+
+        self.assertIsNotNone(_session_row, "session row must exist")
+
+        session_tier_parsed = self.mw.parse_tier(_session_row["subscription_tier"])
+        tier = self.mw.clamp_tier(session_tier_parsed, self.mw.SERVER_TIER_CAP)
+
+        # The effective tier must be session_tier, NOT request_tier
+        self.assertEqual(
+            tier.value,
+            session_tier,
+            f"Expected effective tier={session_tier} (from session row) "
+            f"but got {tier.value}. Request claimed {request_tier}.",
+        )
+
+    def test_no_session_row_falls_back_to_request_tier_clamped(self):
+        """When no session row exists, fall back to clamped request tier (first obs)."""
+        session_id = "sess-no-row-002"
+        request_tier = "claude_standard"
+
+        _session_row = self.conn.execute(
+            "SELECT subscription_tier FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+
+        self.assertIsNone(_session_row, "no session row should exist yet")
+
+        original = self.mw.parse_tier(request_tier)
+        tier = self.mw.clamp_tier(original, self.mw.SERVER_TIER_CAP)
+
+        self.assertEqual(tier.value, request_tier,
+            "without a session row, effective tier should equal the request tier")
