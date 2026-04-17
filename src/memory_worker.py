@@ -2764,16 +2764,45 @@ async def receive_observation(req: ObservationRequest):
     if db is None or db_lock is None:
         raise HTTPException(status_code=503, detail="Database not initialized")
 
+    # BUG-GG-03: bind tier to the session row, not the request.
+    # Look up the session's declared tier first (inside a brief lock-free read;
+    # the sessions table is only written under db_lock, so a dirty read here is
+    # safe enough for tier enforcement — worst case is we fall back to the
+    # request tier on a race that creates the row a moment later).
     original_tier = parse_tier(req.subscription_tier)
-    tier = clamp_tier(original_tier, SERVER_TIER_CAP)
-    if tier != original_tier:
-        logger.warning(
-            "tier_clamped session=%s agent=%s declared=%s served=%s",
-            req.session_id[:8],
-            req.agent,
-            original_tier.value,
-            tier.value,
-        )
+    if db is not None:
+        _session_row = db.execute(
+            "SELECT subscription_tier FROM sessions WHERE id = ?",
+            (req.session_id,),
+        ).fetchone()
+    else:
+        _session_row = None
+
+    if _session_row is not None:
+        # Session already exists: use its stored tier (still clamp to server cap).
+        session_tier = parse_tier(_session_row["subscription_tier"])
+        tier = clamp_tier(session_tier, SERVER_TIER_CAP)
+        if tier != original_tier:
+            logger.debug(
+                "tier_bound_to_session session=%s declared=%s session_tier=%s served=%s",
+                req.session_id[:8],
+                original_tier.value,
+                session_tier.value,
+                tier.value,
+            )
+    else:
+        # No session row yet (first observation before SessionStart fires).
+        # Fall back to request tier clamped by server cap — GG-01 auto-upsert
+        # will create the row with this tier momentarily.
+        tier = clamp_tier(original_tier, SERVER_TIER_CAP)
+        if tier != original_tier:
+            logger.warning(
+                "tier_clamped session=%s agent=%s declared=%s served=%s",
+                req.session_id[:8],
+                req.agent,
+                original_tier.value,
+                tier.value,
+            )
     tier_value = tier.value
 
     # Rate limit check
