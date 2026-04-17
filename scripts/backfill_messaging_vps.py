@@ -48,7 +48,7 @@ log = logging.getLogger("backfill_messaging_vps")
 
 DB_HOST = os.environ.get("PGHOST", "100.67.112.3")
 DB_PORT = int(os.environ.get("PGPORT", "5432"))
-DB_NAME = os.environ.get("PGDATABASE", "tradingcore")
+DB_NAME = os.environ.get("PGDATABASE", "cami_memory")
 DB_USER = os.environ.get("PGUSER", "trading_user")
 # PGPASSWORD is picked up automatically by psycopg2 / libpq
 
