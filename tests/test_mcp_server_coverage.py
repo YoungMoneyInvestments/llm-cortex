@@ -15,6 +15,7 @@ Targets (uncovered or poorly-covered paths):
 No network calls, no live worker, no FastAPI TestClient.
 """
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
@@ -134,6 +135,57 @@ class TestToolsListIntegrity(unittest.TestCase):
         }
         actual = {t["name"] for t in mcp_memory_server.TOOLS}
         self.assertEqual(actual, expected)
+
+
+class TestSessionBootstrapScriptResolution(unittest.TestCase):
+    def test_prefers_sibling_context_loader_in_installed_layout(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            scripts_dir = root / "scripts"
+            scripts_dir.mkdir()
+            sibling = scripts_dir / "context_loader.py"
+            sibling.write_text("# test\n", encoding="utf-8")
+            fake_server = scripts_dir / "mcp_memory_server.py"
+            fake_server.write_text("# test\n", encoding="utf-8")
+
+            with patch.object(mcp_memory_server, "__file__", str(fake_server)):
+                resolved = mcp_memory_server._resolve_context_loader_script()
+
+            self.assertEqual(resolved.resolve(), sibling.resolve())
+
+    def test_falls_back_to_repo_scripts_layout_from_src(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            src_dir = root / "src"
+            src_dir.mkdir()
+            fake_server = src_dir / "mcp_memory_server.py"
+            fake_server.write_text("# test\n", encoding="utf-8")
+            scripts_dir = root / "scripts"
+            scripts_dir.mkdir()
+            expected = scripts_dir / "context_loader.py"
+            expected.write_text("# test\n", encoding="utf-8")
+
+            with patch.object(mcp_memory_server, "__file__", str(fake_server)):
+                resolved = mcp_memory_server._resolve_context_loader_script()
+
+            self.assertEqual(resolved.resolve(), expected.resolve())
+
+    def test_session_bootstrap_invokes_resolved_script_path(self):
+        fake_result = MagicMock(returncode=0, stdout="bootstrap ok\n", stderr="")
+
+        class _FakeRetriever:
+            def close(self):
+                pass
+
+        resolved_script = Path("/tmp/context_loader.py")
+        with patch.object(mcp_memory_server, "MemoryRetriever", return_value=_FakeRetriever()):
+            with patch.object(mcp_memory_server, "_resolve_context_loader_script", return_value=resolved_script):
+                with patch("subprocess.run", return_value=fake_result) as mock_run:
+                    response = mcp_memory_server.handle_tool_call("session_bootstrap", {"hours": 48})
+
+        self.assertFalse(response.get("isError"))
+        self.assertEqual(response["content"][0]["text"], "bootstrap ok")
+        self.assertEqual(mock_run.call_args.args[0][1], str(resolved_script))
 
 
 class TestContentTruncation(unittest.TestCase):
