@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 sys.path.insert(0, str(Path(__file__).parent))
+from obsidian_bridge import read_text_with_timeout, resolve_vault_folder
 from working_memory import WorkingMemory
 
 # ── Config ──────────────────────────────────────────────────────────────────
@@ -403,35 +404,6 @@ def memory_topic_index() -> str:
     return "\n".join(lines)
 
 
-OBSIDIAN_VAULT = Path.home() / "Library" / "Mobile Documents" / "iCloud~md~obsidian" / "Documents" / "Cameron"
-
-# Maps project directory name (or path fragment) to vault folder name.
-# Checked in order — first match wins. More-specific patterns must come before
-# broader fallbacks (e.g. brokerbridge-retail-hermes before bare brokerbridge).
-_PROJECT_VAULT_MAP: list[tuple[str, str]] = [
-    ("brokerbridge-retail-hermes", "BrokerBridge"),  # unified retail product (2026-04-14+)
-    ("broker-bridge-retail", "BrokerBridge"),         # legacy name (still exists on disk)
-    ("MCP-Servers/brokerbridge", "BrokerBridgeMCP"),
-    ("brokerbridge", "BrokerBridgeMCP"),              # fallback for bare name
-    ("openclaw", "OpenClaw"),
-    ("matrix-lstm", "MatrixLSTM"),
-    ("moltytrades", "MoltyTrades"),
-    ("CLIProxyAPI", "CLIProxyAPI"),
-    ("ymi-website", "YMIWebsite"),
-    ("llm-cortex", "LLMCortex"),
-]
-
-
-def _resolve_vault_folder(project_dir: str) -> Optional[Path]:
-    """Return the Obsidian vault subfolder for the given project directory, or None."""
-    for pattern, vault_name in _PROJECT_VAULT_MAP:
-        if pattern.lower() in project_dir.lower():
-            folder = OBSIDIAN_VAULT / vault_name
-            if folder.exists():
-                return folder
-    return None
-
-
 def obsidian_context(cwd: Optional[str] = None) -> str:
     """Read project-specific Obsidian vault files and return a formatted context block.
 
@@ -439,7 +411,7 @@ def obsidian_context(cwd: Optional[str] = None) -> str:
     session note from the vault folder matching the current project.
     """
     project_dir = cwd or os.environ.get("CORTEX_PROJECT_DIR") or os.getcwd()
-    vault_folder = _resolve_vault_folder(project_dir)
+    vault_folder = resolve_vault_folder(project_dir)
     if vault_folder is None:
         return ""
 
@@ -451,7 +423,7 @@ def obsidian_context(cwd: Optional[str] = None) -> str:
         fpath = vault_folder / fname
         if fpath.exists():
             try:
-                content = fpath.read_text(encoding="utf-8").strip()
+                content = (read_text_with_timeout(fpath) or "").strip()
                 if content:
                     lines.append(f"\n### {fname}")
                     if len(content) > 1500:
@@ -464,16 +436,20 @@ def obsidian_context(cwd: Optional[str] = None) -> str:
     sessions_dir = vault_folder / "sessions"
     if sessions_dir.exists():
         session_files = sorted(sessions_dir.glob("*.md"), reverse=True)
-        if session_files:
+        for session_file in session_files:
             try:
-                content = session_files[0].read_text(encoding="utf-8").strip()
-                if content:
-                    lines.append(f"\n### Last session ({session_files[0].stem})")
-                    if len(content) > 800:
-                        content = content[:797] + "..."
-                    lines.append(content)
+                content = (read_text_with_timeout(session_file) or "").strip()
+                if not content:
+                    continue
+                if "source: llm-cortex" not in content or "note_type: promoted-session-summary" not in content:
+                    continue
+                lines.append(f"\n### Last session ({session_file.stem})")
+                if len(content) > 800:
+                    content = content[:797] + "..."
+                lines.append(content)
+                break
             except Exception:
-                pass
+                continue
 
     return "\n".join(lines) if len(lines) > 1 else ""
 
