@@ -72,6 +72,22 @@ def _int_arg(arguments: dict, key: str, default: int, *, lo: int = 1, hi: int) -
     return max(lo, min(hi, val))
 
 
+def _resolve_context_loader_script() -> Path:
+    """Locate context_loader.py across supported source/install layouts."""
+    here = Path(__file__).resolve().parent
+    candidates = [
+        here / "context_loader.py",
+        here.parent / "scripts" / "context_loader.py",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(
+        "Unable to locate context_loader.py. Checked: "
+        + ", ".join(str(candidate) for candidate in candidates)
+    )
+
+
 # Lazy-loaded sentence-transformer model for message search (384-dim, all-MiniLM-L6-v2)
 _ST_MODEL = None
 
@@ -927,7 +943,7 @@ def handle_tool_call(name: str, arguments: dict) -> dict:
         elif name == "session_bootstrap":
             import subprocess
             hours = _int_arg(arguments, "hours", 48, lo=1, hi=720)
-            script = Path(__file__).parent / "context_loader.py"
+            script = _resolve_context_loader_script()
             try:
                 result = subprocess.run(
                     [sys.executable, str(script), "--hours", str(hours)],

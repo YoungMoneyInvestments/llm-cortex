@@ -1139,17 +1139,40 @@ class AICompressor:
             logger.warning(f"Failed to send alert notification: {e}")
 
     async def _ensure_client(self) -> bool:
-        """Load or refresh the OAuth token from auth-profiles (fallback path)."""
+        """Load or refresh the OAuth token from auth-profiles (fallback path).
+
+        Auto-refreshes using the stored refresh_token when the access token is
+        expired or within 5 minutes of expiry.  Writes the new tokens back to
+        auth-profiles so subsequent processes pick them up.
+        """
         try:
             if not AUTH_PROFILES_PATH.exists():
                 logger.warning(f"Auth profiles not found: {AUTH_PROFILES_PATH}")
                 return False
 
             data = json.loads(AUTH_PROFILES_PATH.read_text())
-            token = data.get("profiles", {}).get("anthropic:default", {}).get("token")
+            profile = data.get("profiles", {}).get("anthropic:default", {})
+            token = profile.get("token")
             if not token:
                 logger.warning("No anthropic:default token in auth-profiles")
                 return False
+
+            # Auto-refresh if within 5 min of expiry or already expired
+            expires_at = profile.get("expires_at", 0)
+            if expires_at and time.time() > expires_at - 300:
+                refresh_token = profile.get("refresh_token")
+                client_id = profile.get("client_id", "9d1c250a-e61b-44d9-88ed-5944d1962f5e")
+                if refresh_token:
+                    refreshed = await self._refresh_oauth_token(refresh_token, client_id)
+                    if refreshed:
+                        token, new_refresh, new_expires = refreshed
+                        profile["token"] = token
+                        profile["refresh_token"] = new_refresh
+                        profile["expires_at"] = new_expires
+                        AUTH_PROFILES_PATH.write_text(json.dumps(data, indent=2))
+                        logger.info("AI compressor OAuth token auto-refreshed")
+                    else:
+                        logger.warning("OAuth auto-refresh failed — using existing token")
 
             if token != self._token:
                 self._token = token
@@ -1168,6 +1191,39 @@ class AICompressor:
         except Exception as e:
             logger.warning(f"Failed to load auth profile: {e}")
             return False
+
+    async def _refresh_oauth_token(
+        self, refresh_token: str, client_id: str
+    ) -> Optional[tuple[str, str, int]]:
+        """Exchange a refresh token for a new (access_token, refresh_token, expires_at).
+
+        Returns None on failure.
+        """
+        try:
+            import httpx as _httpx
+            payload = {
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "client_id": client_id,
+            }
+            async with _httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(
+                    "https://api.anthropic.com/v1/oauth/token",
+                    json=payload,
+                    headers={"Content-Type": "application/json"},
+                )
+            if resp.status_code == 200:
+                result = resp.json()
+                new_access = result["access_token"]
+                new_refresh = result.get("refresh_token", refresh_token)
+                expires_in = result.get("expires_in", 28800)
+                return (new_access, new_refresh, int(time.time()) + expires_in)
+            else:
+                logger.warning(f"OAuth refresh HTTP {resp.status_code}: {resp.text[:200]}")
+                return None
+        except Exception as e:
+            logger.warning(f"OAuth refresh exception: {e}")
+            return None
 
     async def compress(
         self,

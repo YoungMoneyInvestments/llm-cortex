@@ -69,6 +69,24 @@ See [Multi-LLM Setup](docs/05-MULTI-LLM-SETUP.md) for full configuration example
 | [Implementation Guide](docs/02-IMPLEMENTATION-GUIDE.md) | Step-by-step code for every layer |
 | [Multi-LLM Setup](docs/05-MULTI-LLM-SETUP.md) | Claude Code, Codex, Cursor, Gemini — one shared brain |
 
+## Obsidian Bridge
+
+LLM Cortex can selectively promote curated artifacts into Obsidian without mirroring the full memory database.
+
+Current flow:
+- Cortex remains the raw system of record (`~/.cortex`)
+- Obsidian stores curated project context (`architecture.md`, `decisions.md`, `open-questions.md`, promoted session notes, checked-in `HEAD` markdown reports)
+- `context_loader.py` reads curated vault notes and the newest promoted session summary back into bootstrap
+- Promoted `research/*.md` notes are mirrored for human review today; they are not auto-loaded into bootstrap yet
+
+Promote recent project-relevant summaries and checked-in `HEAD` reports:
+
+```bash
+python3 scripts/promote_to_obsidian.py --project-dir "$PWD"
+```
+
+Use `--dry-run` first if you want to confirm the selected vault plus matched/changed counts before writing.
+
 ---
 
 ## Requirements
