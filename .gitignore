@@ -57,6 +57,7 @@ htmlcov/
 .claude/ralph-state.json
 .agent/
 adversarial-loop.log
+.playwright-cli/
 
 # Local context runtime
 context/
