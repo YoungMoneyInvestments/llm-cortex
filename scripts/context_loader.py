@@ -35,6 +35,7 @@ MEMORY_DIR = WORKSPACE / "memory"
 PLANNING_DIR = WORKSPACE / ".planning"
 HANDOFF_DIR = PLANNING_DIR / "handoffs"
 WORKING_MEMORY_DIR = PLANNING_DIR / "working-memory"
+CORTEX_RECALL_TIMEOUT = float(os.environ.get("CORTEX_RECALL_TIMEOUT", "20"))
 
 # Patterns that indicate ongoing technical work
 TECHNICAL_PATTERNS = [
@@ -191,11 +192,10 @@ class MemoryBootstrap:
         lines.append("=" * 60)
         lines.append("")
 
-        # === USER PROFILE (from Cortex DB) ===
-        profile_section = self._load_profile()
-        if profile_section:
-            lines.append(profile_section)
-            lines.append("")
+        # === USER PROFILE — moved to ~/.claude/CLAUDE.md (auto-injected every turn).
+        # Emitting it here was a duplicate that pushed total output past 2KB and spilled
+        # to file, where the model never saw it. Keeping bootstrap lean preserves TIME
+        # + working memory inline.
 
         # === WORKING MEMORY ===
         if self.working_memory:
@@ -286,17 +286,16 @@ def cortex_recall(cwd: Optional[str] = None) -> str:
 
     Returns an empty string if the worker is unreachable or no results are found.
     """
-    worker_url = os.environ.get("CORTEX_WORKER_URL", "http://localhost:37778")
-    # Key resolution: env var → generated key file → empty (will 401, fast fail)
+    worker_url = os.environ.get("CORTEX_WORKER_URL", "http://127.0.0.1:37778")
+    # Key resolution: generated worker key first, then env override.
+    # The env value can go stale when the worker regenerates its local key.
     _env_key = os.environ.get("CORTEX_WORKER_API_KEY", "").strip()
-    if _env_key:
-        api_key = _env_key
-    else:
-        _key_file = Path.home() / ".cortex" / "data" / ".worker_api_key"
-        try:
-            api_key = _key_file.read_text().strip() if _key_file.exists() else ""
-        except OSError:
-            api_key = ""
+    _key_file = Path.home() / ".cortex" / "data" / ".worker_api_key"
+    try:
+        file_key = _key_file.read_text().strip() if _key_file.exists() else ""
+    except OSError:
+        file_key = ""
+    api_key = file_key or _env_key
 
     # Determine project name from CWD
     project_dir = cwd or os.environ.get("CORTEX_PROJECT_DIR") or os.getcwd()
@@ -319,7 +318,7 @@ def cortex_recall(cwd: Optional[str] = None) -> str:
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=2) as resp:
+        with urllib.request.urlopen(req, timeout=CORTEX_RECALL_TIMEOUT) as resp:
             body = json.loads(resp.read().decode("utf-8"))
     except (urllib.error.URLError, OSError, json.JSONDecodeError, TimeoutError):
         return "(cortex worker unreachable)"
@@ -398,8 +397,11 @@ def memory_topic_index() -> str:
     if not topics:
         return ""
 
-    lines = ["## Memory Topic Index", "(Query these topics via cami_memory_search, one concept per call.)"]
-    for t in topics[:80]:
+    # Cap at 12 topics. Prior 80-cap pushed bootstrap output past the inline budget,
+    # forcing spillover to a file the model could not read. The full topic list is
+    # already in ~/.claude/projects/-Users-cameronbennion/memory/MEMORY.md (auto-loaded).
+    lines = ["## Memory Topic Index (top 12 — full index in MEMORY.md)"]
+    for t in topics[:12]:
         lines.append(f"  - {t}")
     return "\n".join(lines)
 
