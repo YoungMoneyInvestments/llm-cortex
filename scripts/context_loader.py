@@ -350,7 +350,7 @@ def cortex_recall(cwd: Optional[str] = None) -> str:
     return "\n".join(lines) if len(lines) > 1 else ""
 
 
-MEMORY_INDEX_PATH = Path.home() / ".claude" / "projects" / "-Users-cameronbennion" / "memory" / "MEMORY.md"
+MEMORY_INDEX_PATH = Path.home() / "Knowledge" / "claude-memory" / "MEMORY.md"
 
 
 def memory_topic_index() -> str:
