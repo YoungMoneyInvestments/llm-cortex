@@ -83,19 +83,38 @@ def check_databases() -> None:
         except sqlite3.Error as exc:
             status(False, "observation agent counts", str(exc))
 
+    if VECTOR_DB.exists():
+        try:
+            conn = sqlite3.connect(str(VECTOR_DB))
+            total, embedded = conn.execute(
+                "SELECT COUNT(*), COALESCE(SUM(has_embedding), 0) FROM documents"
+            ).fetchone()
+            missing = total - embedded
+            status(missing == 0, "vector embeddings", f"embedded={embedded}, missing={missing}, total={total}")
+            conn.close()
+        except sqlite3.Error as exc:
+            status(False, "vector embeddings", str(exc))
+
     candidates = [
         DATA_DIR / "cortex-vectors.db",
         HOME / "clawd" / "data" / "cortex-vectors.db",
         HOME / "Projects" / "llm-cortex" / "data" / "cortex-vectors.db",
     ]
-    existing = []
+    real_paths: dict[Path, list[str]] = {}
     for path in candidates:
-        if path.exists():
+        if path.exists() or path.is_symlink():
+            real = path.resolve()
             size_mb = path.stat().st_size / 1024 / 1024
             wal = path.with_name(path.name + "-wal")
             wal_mb = wal.stat().st_size / 1024 / 1024 if wal.exists() else 0
-            existing.append(f"{path} ({size_mb:.1f}MB, wal={wal_mb:.1f}MB)")
-    status(len(existing) <= 1, "extra vector DB copies", "; ".join(existing) if existing else "none")
+            real_paths.setdefault(real, []).append(f"{path} ({size_mb:.1f}MB, wal={wal_mb:.1f}MB)")
+    existing = []
+    for real, aliases in real_paths.items():
+        if len(aliases) == 1:
+            existing.append(aliases[0])
+        else:
+            existing.append(f"{real} aliases: {', '.join(aliases)}")
+    status(len(real_paths) <= 1, "extra vector DB copies", "; ".join(existing) if existing else "none")
 
 
 def check_configs() -> None:

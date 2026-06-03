@@ -2550,12 +2550,23 @@ async def _generate_session_summary(session_id: str):
                 (session_id,),
             ).fetchone()
 
-        if not rows:
-            logger.info(f"Session {session_id[:8]}... has no processed observations, skipping summary")
-            return
-
         user_prompt = session_row["user_prompt"] if session_row else None
         agent = session_row["agent"] if session_row else "main"
+        if not rows:
+            overall_summary = f"[{agent}] Session ended with no processed observations."
+            async with db_lock:
+                db.execute(
+                    "INSERT INTO session_summaries (session_id, summary, key_decisions, entities_mentioned) "
+                    "VALUES (?, ?, ?, ?)",
+                    (session_id, overall_summary, "[]", "[]"),
+                )
+                db.execute(
+                    "UPDATE sessions SET summary = ?, status = 'summarized' WHERE id = ?",
+                    (overall_summary, session_id),
+                )
+                db.commit()
+            logger.info(f"Session {session_id[:8]}... summarized (empty, 0 observations)")
+            return
 
         # Try AI summarization
         ai_summary = None
