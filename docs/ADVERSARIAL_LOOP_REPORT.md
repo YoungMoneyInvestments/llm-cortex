@@ -675,20 +675,12 @@ issue over long horizons.
 
 ---
 
-### Priority 6 — Run `npx gitnexus analyze` to refresh the code index
+### Priority 6 — Deprecated legacy graph-memory index refresh
 
-**Effort:** 5 minutes  
-**Why:** 85+ commits were added to llm-cortex and clawd during this loop. The GitNexus index
-is stale. The CLAUDE.md in this repo notes that if any GitNexus tool warns the index is stale,
-run `npx gitnexus analyze` in terminal first.
-
-```bash
-cd ~/Projects/llm-cortex
-npx gitnexus analyze
-```
-
-If the index previously included embeddings (check `.gitnexus/meta.json`
-`stats.embeddings` > 0), add `--embeddings` to preserve them.
+**Status:** Superseded
+**Why:** legacy graph-memory is no longer part of the standard agent workflow. Do not refresh or consult
+legacy graph-memory as a required coding step. Use Obsidian/Markdown notes for tracking and recording
+work, decisions, evidence, and handoffs; use direct repo inspection and tests for code work.
 
 ---
 

@@ -48,7 +48,6 @@ htmlcov/
 # AIR symlinks (private repo, never commit)
 src/air
 scripts/air_cli.py
-.gitnexus
 
 # Claude Code + agent runtime artifacts
 .claude/ralph-loop.log
