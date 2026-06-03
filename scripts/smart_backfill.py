@@ -28,9 +28,9 @@ from datetime import datetime, timedelta, date, timezone
 from pathlib import Path
 import logging
 
-# ArcticDB dual-write — loads arcticdb_store.py by path to avoid pulling in the full
+# ArcticDB dual-write - loads arcticdb_store.py by path to avoid pulling in the full
 # brokerbridge package (which requires workspace deps not present in this env).
-def _load_arctic_append():
+def _load_arctic_store():
     import importlib.util
     _store_path = os.path.expanduser(
         "~/Projects/MCP-Servers/brokerbridge/src/brokerbridge/persistence/storage/arcticdb_store.py"
@@ -40,13 +40,15 @@ def _load_arctic_append():
     spec = importlib.util.spec_from_file_location("arcticdb_store", _store_path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    return mod.append_bars
+    if not hasattr(mod, "write_bars") or not hasattr(mod, "read_bars"):
+        return None
+    return mod
 
 try:
-    _arctic_append = _load_arctic_append()
-    _ARCTICDB_AVAILABLE = _arctic_append is not None
+    _arctic_store = _load_arctic_store()
+    _ARCTICDB_AVAILABLE = _arctic_store is not None and _arctic_store.is_enabled()
 except Exception:
-    _arctic_append = None
+    _arctic_store = None
     _ARCTICDB_AVAILABLE = False
 
 # ── Config ──────────────────────────────────────────────────────────────────
@@ -100,7 +102,7 @@ log = logging.getLogger("smart_backfill")
 if _ARCTICDB_AVAILABLE:
     log.info("ArcticDB dual-write: ENABLED (path=%s)", os.getenv("ARCTICDB_PATH", "default"))
 else:
-    log.info("ArcticDB dual-write: DISABLED (arcticdb_store.py not found or arcticdb not installed)")
+    log.info("ArcticDB dual-write: DISABLED (store missing, incompatible, or arcticdb not installed)")
 
 # ── NT8 Socket ──────────────────────────────────────────────────────────────
 def nt8_request(payload: dict, timeout=SOCKET_TIMEOUT) -> dict:
@@ -244,7 +246,7 @@ def insert_bars(bars: list, symbol: str, bar_size: str) -> int:
         conn.commit()
 
     # Dual-write to ArcticDB (non-blocking; USE_ARCTICDB=true required)
-    if _ARCTICDB_AVAILABLE and _arctic_append is not None:
+    if _ARCTICDB_AVAILABLE and _arctic_store is not None:
         try:
             import pandas as pd
             df = pd.DataFrame(rows, columns=[
@@ -256,7 +258,15 @@ def insert_bars(bars: list, symbol: str, bar_size: str) -> int:
             for sym, grp in df.groupby("symbol"):
                 for bsize, bgrp in grp.groupby("bar_size"):
                     tf = _TF_MAP.get(bsize, bsize.replace(" ", "").lower())
-                    _arctic_append(str(sym), bgrp.drop(columns=["symbol", "bar_size"]), timeframe=tf)
+                    new_bars = bgrp.drop(columns=["symbol", "bar_size"])
+                    existing = _arctic_store.read_bars(str(sym), timeframe=tf)
+                    if existing is not None and not existing.empty:
+                        merged = pd.concat([existing, new_bars])
+                        merged = merged[~merged.index.duplicated(keep="last")].sort_index()
+                    else:
+                        merged = new_bars.sort_index()
+                    if not _arctic_store.write_bars(str(sym), merged, timeframe=tf):
+                        log.warning("ArcticDB dual-write skipped for %s/%s", sym, tf)
         except Exception as _exc:
             log.warning("ArcticDB dual-write failed: %s", _exc)
 
