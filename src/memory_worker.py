@@ -1252,7 +1252,7 @@ class AICompressor:
 
             # Auto-refresh if within 5 min of expiry or already expired
             expires_at = profile.get("expires_at", 0)
-            if expires_at and time.time() > expires_at - 300:
+            if expires_at and time.time() >= expires_at - 300:
                 refresh_token = profile.get("refresh_token")
                 client_id = profile.get("client_id", "9d1c250a-e61b-44d9-88ed-5944d1962f5e")
                 if refresh_token:

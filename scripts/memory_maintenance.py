@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import shutil
@@ -372,6 +373,141 @@ def summarize_ended_sessions(args: argparse.Namespace) -> int:
     return 0
 
 
+def _retag_vector_documents(obs_ids: list[int], target_agent: str) -> int:
+    if not VECTOR_DB.exists() or not obs_ids:
+        return 0
+    conn = connect(VECTOR_DB)
+    updated = 0
+    try:
+        for i in range(0, len(obs_ids), 500):
+            batch = obs_ids[i:i + 500]
+            placeholders = ",".join("?" for _ in batch)
+            rows = conn.execute(
+                f"SELECT id, text, metadata FROM documents WHERE id IN ({placeholders})",
+                [f"obs-{obs_id}" for obs_id in batch],
+            ).fetchall()
+            for row in rows:
+                try:
+                    metadata = json.loads(row["metadata"] or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    metadata = {}
+                metadata["agent"] = target_agent
+                text = (row["text"] or "").replace("[main]", f"[{target_agent}]", 1)
+                text_hash = hashlib.md5(text.encode("utf-8")).hexdigest()
+                conn.execute(
+                    "UPDATE documents SET text = ?, metadata = ?, text_hash = ? WHERE id = ?",
+                    (text, json.dumps(metadata), text_hash, row["id"]),
+                )
+                updated += 1
+        conn.commit()
+    finally:
+        conn.close()
+    return updated
+
+
+def _retag_main_vector_documents(target_agent: str) -> int:
+    if not VECTOR_DB.exists():
+        return 0
+    conn = connect(VECTOR_DB)
+    rows = conn.execute(
+        "SELECT id, text, metadata FROM documents "
+        "WHERE collection = 'observations' "
+        "AND (text LIKE '[main]%' OR metadata LIKE '%\"agent\": \"main\"%' OR metadata LIKE '%\"agent\":\"main\"%')"
+    ).fetchall()
+    updated = 0
+    try:
+        for row in rows:
+            try:
+                metadata = json.loads(row["metadata"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                metadata = {}
+            metadata["agent"] = target_agent
+            text = (row["text"] or "").replace("[main]", f"[{target_agent}]", 1)
+            text_hash = hashlib.md5(text.encode("utf-8")).hexdigest()
+            conn.execute(
+                "UPDATE documents SET text = ?, metadata = ?, text_hash = ? WHERE id = ?",
+                (text, json.dumps(metadata), text_hash, row["id"]),
+            )
+            updated += 1
+        conn.commit()
+    finally:
+        conn.close()
+    return updated
+
+
+def backfill_main_agent(args: argparse.Namespace) -> int:
+    target_agent = args.target_agent
+    conn = connect(OBS_DB)
+    obs_rows = conn.execute(
+        """
+        SELECT id FROM observations
+        WHERE agent = 'main'
+          AND source IN ('post_tool_use', 'user_prompt', 'session_end')
+        ORDER BY id
+        LIMIT ?
+        """,
+        (args.limit,),
+    ).fetchall()
+    session_rows = conn.execute(
+        """
+        SELECT id FROM sessions
+        WHERE agent = 'main'
+          AND id IN (
+              SELECT DISTINCT session_id FROM observations
+              WHERE agent = 'main'
+                AND source IN ('post_tool_use', 'user_prompt', 'session_end')
+          )
+        ORDER BY id
+        LIMIT ?
+        """,
+        (args.limit,),
+    ).fetchall()
+
+    print(f"observations eligible for main->{target_agent}: {len(obs_rows)}")
+    print(f"sessions eligible for main->{target_agent}: {len(session_rows)}")
+    if args.dry_run:
+        conn.close()
+        return 0
+
+    obs_bak = backup(OBS_DB)
+    vec_bak = backup(VECTOR_DB) if VECTOR_DB.exists() else None
+    obs_ids = [row["id"] for row in obs_rows]
+    session_ids = [row["id"] for row in session_rows]
+
+    if obs_ids:
+        placeholders = ",".join("?" for _ in obs_ids)
+        conn.execute(
+            f"UPDATE observations SET agent = ?, summary = replace(summary, '[main]', ?) "
+            f"WHERE id IN ({placeholders})",
+            [target_agent, f"[{target_agent}]"] + obs_ids,
+        )
+    if session_ids:
+        sess_placeholders = ",".join("?" for _ in session_ids)
+        conn.execute(
+            f"UPDATE sessions SET agent = ?, summary = replace(summary, '[main]', ?) "
+            f"WHERE id IN ({sess_placeholders})",
+            [target_agent, f"[{target_agent}]"] + session_ids,
+        )
+        conn.execute(
+            f"UPDATE session_summaries SET summary = replace(summary, '[main]', ?) "
+            f"WHERE session_id IN ({sess_placeholders})",
+            [f"[{target_agent}]"] + session_ids,
+        )
+    conn.commit()
+    conn.close()
+
+    vector_docs = _retag_vector_documents(obs_ids, target_agent)
+    vector_main_docs = _retag_main_vector_documents(target_agent)
+    print(f"observations backup: {obs_bak}")
+    if vec_bak:
+        print(f"vector backup: {vec_bak}")
+    print(f"observations retagged: {len(obs_ids)}")
+    print(f"sessions retagged: {len(session_ids)}")
+    print(f"vector documents retagged: {vector_docs}")
+    print(f"residual main vector documents retagged: {vector_main_docs}")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Cortex memory maintenance")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -403,6 +539,12 @@ def main() -> int:
     p.add_argument("--limit", type=int, default=1000)
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(func=summarize_ended_sessions)
+
+    p = sub.add_parser("backfill-main-agent")
+    p.add_argument("--target-agent", default="claude-code")
+    p.add_argument("--limit", type=int, default=50000)
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(func=backfill_main_agent)
 
     args = parser.parse_args()
     return args.func(args)
