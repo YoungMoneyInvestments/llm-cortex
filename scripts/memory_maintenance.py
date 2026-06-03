@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import json
+import re
 import shutil
 import sqlite3
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -158,6 +161,217 @@ def checkpoint_vector(_: argparse.Namespace) -> int:
     return 0
 
 
+def resync_vectors(args: argparse.Namespace) -> int:
+    conn = connect(OBS_DB)
+    rows = conn.execute(
+        """
+        SELECT id, source, tool_name, agent, summary
+        FROM observations
+        WHERE status = 'processed'
+          AND vector_synced = 0
+          AND COALESCE(memory_type, 'episodic') = 'episodic'
+          AND COALESCE(summary, '') != ''
+        ORDER BY id
+        LIMIT ?
+        """,
+        (args.limit,),
+    ).fetchall()
+    print(f"episodic rows pending vector sync: {len(rows)}")
+    if args.dry_run or not rows:
+        conn.close()
+        return 0
+
+    obs_bak = backup(OBS_DB)
+    vec_bak = backup(VECTOR_DB) if VECTOR_DB.exists() else None
+
+    sys.path.insert(0, str((Path(__file__).resolve().parent.parent / "src")))
+    from unified_vector_store import get_vector_store  # noqa: PLC0415
+
+    store = get_vector_store()
+    synced = 0
+    failed: list[tuple[int, str]] = []
+    for row in rows:
+        try:
+            store.add_observation(
+                obs_id=str(row["id"]),
+                text=row["summary"],
+                metadata={
+                    "source": row["source"],
+                    "tool_name": row["tool_name"] or "",
+                    "agent": row["agent"] or "main",
+                },
+            )
+            conn.execute("UPDATE observations SET vector_synced = 1 WHERE id = ?", (row["id"],))
+            synced += 1
+        except Exception as exc:  # noqa: BLE001 - maintenance should report and continue.
+            failed.append((row["id"], str(exc)))
+    conn.commit()
+    conn.close()
+
+    print(f"observations backup: {obs_bak}")
+    if vec_bak:
+        print(f"vector backup: {vec_bak}")
+    print(f"vector synced: {synced}")
+    if failed:
+        print(f"vector sync failures: {len(failed)}")
+        for obs_id, error in failed[:10]:
+            print(f"- {obs_id}: {error}")
+        return 1
+    return 0
+
+
+def _parse_dt(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def close_stale_sessions(args: argparse.Namespace) -> int:
+    now = datetime.now(timezone.utc)
+    cutoff_seconds = args.older_than_hours * 3600
+    conn = connect(OBS_DB)
+    rows = conn.execute(
+        """
+        SELECT s.id, s.started_at, s.observation_count, MAX(o.timestamp) AS last_observation_at
+        FROM sessions s
+        LEFT JOIN observations o ON o.session_id = s.id
+        WHERE s.status = 'active'
+        GROUP BY s.id
+        """
+    ).fetchall()
+
+    stale: list[sqlite3.Row] = []
+    skipped_unparseable: list[str] = []
+    for row in rows:
+        last_seen = _parse_dt(row["last_observation_at"]) or _parse_dt(row["started_at"])
+        if last_seen is None:
+            skipped_unparseable.append(row["id"])
+            continue
+        age_seconds = (now - last_seen).total_seconds()
+        if age_seconds >= cutoff_seconds:
+            stale.append(row)
+
+    print(f"active sessions: {len(rows)}")
+    print(f"stale sessions older than {args.older_than_hours}h: {len(stale)}")
+    if skipped_unparseable:
+        print(f"skipped unparseable sessions: {len(skipped_unparseable)}")
+    if args.preview:
+        preview = [
+            {
+                "id": row["id"],
+                "started_at": row["started_at"],
+                "last_observation_at": row["last_observation_at"],
+                "observation_count": row["observation_count"],
+            }
+            for row in stale[: args.preview]
+        ]
+        print(json.dumps(preview, indent=2))
+    if args.dry_run or not stale:
+        conn.close()
+        return 0
+
+    bak = backup(OBS_DB)
+    ended_at = now.isoformat()
+    conn.executemany(
+        "UPDATE sessions SET status = 'ended', ended_at = ? WHERE id = ? AND status = 'active'",
+        [(ended_at, row["id"]) for row in stale],
+    )
+    conn.commit()
+    conn.close()
+    print(f"backup: {bak}")
+    print(f"closed stale sessions: {len(stale)}")
+    return 0
+
+
+def _row_value(row: sqlite3.Row, key: str, default: str = "") -> str:
+    value = row[key] if key in row.keys() else default
+    return value or default
+
+
+def _session_summary_rule_based(rows: list[sqlite3.Row], user_prompt: str | None, agent: str) -> dict:
+    tool_counts: dict[str, int] = {}
+    file_paths: set[str] = set()
+    decisions: list[str] = []
+
+    for row in rows:
+        tool = _row_value(row, "tool_name")
+        if tool:
+            tool_counts[tool] = tool_counts.get(tool, 0) + 1
+        summary = _row_value(row, "summary")
+        raw_input = _row_value(row, "raw_input")
+        for text in (summary, raw_input):
+            file_paths.update(p for p in re.findall(r"(?:/[\w./-]+\.[\w]+)", text) if len(p) > 5)
+        if tool in {"Write", "Edit"} and summary:
+            decisions.append(summary[:150])
+
+    top_tools = sorted(tool_counts.items(), key=lambda item: -item[1])[:5]
+    parts = [f"[{agent}] Session with {len(rows)} observations."]
+    if user_prompt:
+        parts.append(f"Task: {user_prompt[:200]}")
+    if top_tools:
+        parts.append("Tools: " + ", ".join(f"{tool}({count})" for tool, count in top_tools))
+    if file_paths:
+        parts.append("Files: " + ", ".join(sorted(file_paths)[:10]))
+    return {
+        "summary": " | ".join(parts),
+        "key_decisions": decisions[:10],
+        "entities_mentioned": sorted(file_paths)[:20],
+    }
+
+
+def summarize_ended_sessions(args: argparse.Namespace) -> int:
+    conn = connect(OBS_DB)
+    sessions = conn.execute(
+        "SELECT id, agent, user_prompt FROM sessions WHERE status = 'ended' ORDER BY ended_at ASC LIMIT ?",
+        (args.limit,),
+    ).fetchall()
+    print(f"ended sessions pending summary: {len(sessions)}")
+    if args.dry_run or not sessions:
+        conn.close()
+        return 0
+
+    bak = backup(OBS_DB)
+    summarized = 0
+    for session in sessions:
+        rows = conn.execute(
+            "SELECT id, source, tool_name, agent, summary, raw_input, raw_output "
+            "FROM observations WHERE session_id = ? AND status = 'processed' ORDER BY id ASC",
+            (session["id"],),
+        ).fetchall()
+        agent = session["agent"] or "main"
+        if rows:
+            rb = _session_summary_rule_based(rows, session["user_prompt"], agent)
+            summary = rb["summary"]
+            key_decisions = json.dumps(rb["key_decisions"])
+            entities = json.dumps(rb["entities_mentioned"])
+        else:
+            summary = f"[{agent}] Session ended with no processed observations."
+            key_decisions = "[]"
+            entities = "[]"
+
+        conn.execute(
+            "INSERT INTO session_summaries (session_id, summary, key_decisions, entities_mentioned) "
+            "VALUES (?, ?, ?, ?)",
+            (session["id"], summary, key_decisions, entities),
+        )
+        conn.execute(
+            "UPDATE sessions SET summary = ?, status = 'summarized' WHERE id = ?",
+            (summary, session["id"]),
+        )
+        summarized += 1
+    conn.commit()
+    conn.close()
+    print(f"backup: {bak}")
+    print(f"summarized sessions: {summarized}")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Cortex memory maintenance")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -173,6 +387,22 @@ def main() -> int:
     p.set_defaults(func=sanitize_legacy_gitnexus)
 
     sub.add_parser("checkpoint-vector").set_defaults(func=checkpoint_vector)
+
+    p = sub.add_parser("resync-vectors")
+    p.add_argument("--limit", type=int, default=500)
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(func=resync_vectors)
+
+    p = sub.add_parser("close-stale-sessions")
+    p.add_argument("--older-than-hours", type=float, default=24)
+    p.add_argument("--preview", type=int, default=5)
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(func=close_stale_sessions)
+
+    p = sub.add_parser("summarize-ended-sessions")
+    p.add_argument("--limit", type=int, default=1000)
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(func=summarize_ended_sessions)
 
     args = parser.parse_args()
     return args.func(args)
