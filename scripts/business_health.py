@@ -116,14 +116,20 @@ def check_moltytrades() -> dict:
 
 def check_trading_signals() -> dict:
     """Check recent trading signal activity from Storage VPS."""
-    # Try psql query on tradingcore
     psql = "/opt/homebrew/opt/libpq/bin/psql"
-    conn_str = "postgresql://trading_user@100.67.112.3:5432/tradingcore"
     query = """
-    SELECT COUNT(*) as signal_count, MAX(created_at) as last_signal
-    FROM signals WHERE created_at > NOW() - INTERVAL '7 days'
+    SELECT COUNT(*)::text || '|' || COALESCE(MAX(generated_at)::text, '')
+    FROM signals.signal_history
+    WHERE generated_at > NOW() - INTERVAL '7 days'
     """
-    output = run([psql, conn_str, "-t", "-c", query])
+    output = run([
+        psql,
+        "-h", "100.67.112.3",
+        "-U", "trading_user",
+        "-d", "tradingcore",
+        "-v", "ON_ERROR_STOP=1",
+        "-Atc", query,
+    ])
     if output and "|" in output:
         parts = output.strip().split("|")
         if len(parts) >= 2:
