@@ -243,6 +243,33 @@ class TestSubscriptionRateLimiter(unittest.TestCase):
             "a different session must not be blocked because session-a is at capacity")
 
 
+class TestMemcellTopicBoundaries(unittest.TestCase):
+    """MemCell chunks must never cross session boundaries."""
+
+    def setUp(self):
+        self._td = __import__("tempfile").TemporaryDirectory()
+        self.tmp = Path(self._td.name)
+        self.mw = _import_fresh_worker(
+            self.tmp,
+            extra_env={"CORTEX_WORKER_API_KEY": "test-key"},
+        )
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def test_session_change_forces_new_chunk(self):
+        base = "2026-06-03T18:00:00+00:00"
+        rows = [
+            {"id": 1, "session_id": "a", "timestamp": base, "tool_name": "Bash"},
+            {"id": 2, "session_id": "b", "timestamp": base, "tool_name": "Bash"},
+            {"id": 3, "session_id": "a", "timestamp": base, "tool_name": "Bash"},
+        ]
+
+        chunks = self.mw._detect_topic_boundaries(rows)
+
+        self.assertEqual([[obs["id"] for obs in chunk] for chunk in chunks], [[1], [2], [3]])
+
+
 class TestObservationTierBinding(unittest.TestCase):
     """BUG-GG-03: observation tier must be read from the session row, not the request.
 

@@ -39,6 +39,23 @@ The public repo defaults to a generic local runtime under `~/.cortex`. Override 
 | Worker log | `${CORTEX_LOG_DIR:-$HOME/.cortex/logs}/memory-worker.log` | worker application log |
 | PID file | `${CORTEX_PID_FILE:-$HOME/.cortex/worker.pid}` | optional worker PID location |
 
+### Canonical Vector DB Path
+
+The canonical vector store is:
+
+```text
+${CORTEX_DATA_DIR:-$HOME/.cortex/data}/cortex-vectors.db
+```
+
+The observations DB stores raw text, summaries, sessions, and profile rows. The vector DB stores embeddings used for semantic recall. All workers, MCP servers, and maintenance scripts should read/write the same vector DB path. Extra `cortex-vectors.db` copies under older project or runtime directories are drift risks: one process may write embeddings to one file while another searches a different file.
+
+Safe cleanup order:
+
+1. Run `python3 scripts/memory_health.py` and confirm which path is canonical.
+2. Confirm worker/MCP configs share the same `CORTEX_DATA_DIR`.
+3. Checkpoint WAL on the canonical DB if needed.
+4. Replace old duplicate paths with symlinks only after verifying no active process writes them.
+
 ---
 
 ## Required Configuration
@@ -62,6 +79,35 @@ The worker and hook scripts resolve `CORTEX_WORKER_API_KEY` in this order:
 **You do not need to set `CORTEX_WORKER_API_KEY` in your shell profile, launchd plist, or supervisor config.** The worker generates and persists the key on first start. Hook scripts read the same file. As long as both the worker and the hooks share the same `CORTEX_DATA_DIR`, the key stays in sync automatically.
 
 Only set `CORTEX_WORKER_API_KEY` explicitly when you need a specific value (e.g., shared with a remote client over a trusted tunnel).
+
+Health check:
+
+```bash
+python3 scripts/memory_health.py
+```
+
+The health checker reports worker status, authenticated stats, canonical DB paths, agent attribution counts, hook key fallback, and Obsidian index presence. It never prints the API key.
+
+Maintenance:
+
+```bash
+python3 scripts/memory_maintenance.py audit
+python3 scripts/memory_maintenance.py repair-session-counts --dry-run
+python3 scripts/memory_maintenance.py sanitize-legacy-gitnexus --dry-run
+python3 scripts/memory_maintenance.py checkpoint-vector
+```
+
+`repair-session-counts` and `sanitize-legacy-gitnexus` create timestamped backups under `~/.cortex/backups/` before mutating the observation DB. `checkpoint-vector` backs up and truncates the canonical vector WAL.
+
+### Observation Routing
+
+The worker classifies incoming observations before storage:
+
+- `episodic` — user prompts, edits/writes, agents, web calls, and important Bash/test/git/health output. These are processed and vector-synced.
+- `breadcrumb` — routine low-signal calls such as Read/Grep/Glob/LS and unimportant Bash. These keep a compact summary but skip vector sync.
+- `noise` — repeated selector ToolSearch calls, screenshots/waits, task notifications, and context-mode plumbing. These keep a compact local row but skip vector sync.
+
+All hook inputs/outputs and manual `cami_memory_save` content are redacted for common token/key/password/bearer patterns before storage.
 
 Optional AI compression settings:
 

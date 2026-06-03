@@ -11,9 +11,16 @@
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PYTHON="${CORTEX_PYTHON:-python3}"
+CURL="${CORTEX_CURL:-/usr/bin/curl}"
+HEAD="${CORTEX_HEAD:-/usr/bin/head}"
+JQ="${CORTEX_JQ:-$(command -v jq || true)}"
+if [ -z "$JQ" ]; then
+    JQ="/opt/homebrew/bin/jq"
+fi
 WORKER_PORT="${CORTEX_WORKER_PORT:-37778}"
 WORKER_URL="http://127.0.0.1:$WORKER_PORT"
 AUTH_KEY="${CORTEX_WORKER_API_KEY:-}"
+AGENT_NAME="${CORTEX_AGENT_NAME:-claude-code}"
 # Fall back to generated key file if env var is absent (DEF-6 compatibility)
 if [ -z "$AUTH_KEY" ] && [ -f "$HOME/.cortex/data/.worker_api_key" ]; then
     AUTH_KEY="$(cat "$HOME/.cortex/data/.worker_api_key" 2>/dev/null)"
@@ -23,13 +30,13 @@ fi
 INPUT_JSON=$(cat)
 
 # Skip if worker isn't running
-if ! curl -s --connect-timeout 1 "$WORKER_URL/api/health" > /dev/null 2>&1; then
+if ! "$CURL" -s --connect-timeout 1 "$WORKER_URL/api/health" > /dev/null 2>&1; then
     exit 0
 fi
 
 # Extract fields from stdin JSON
-TOOL_NAME=$(echo "$INPUT_JSON" | jq -r '.tool_name // empty' 2>/dev/null)
-SESSION_ID=$(echo "$INPUT_JSON" | jq -r '.session_id // empty' 2>/dev/null)
+TOOL_NAME=$(echo "$INPUT_JSON" | "$JQ" -r '.tool_name // .tool.name // .name // empty' 2>/dev/null)
+SESSION_ID=$(echo "$INPUT_JSON" | "$JQ" -r '.session_id // .sessionId // .session.id // empty' 2>/dev/null)
 
 # Skip if no tool name (nothing useful to capture)
 if [ -z "$TOOL_NAME" ]; then
@@ -44,24 +51,25 @@ fi
 SID="${SESSION_ID:-$(date +%Y%m%d-%H%M%S)}"
 
 # Extract and truncate input/output
-TOOL_INPUT=$(echo "$INPUT_JSON" | jq -r '.tool_input // empty' 2>/dev/null | head -c 4000)
-TOOL_OUTPUT=$(echo "$INPUT_JSON" | jq -r '.tool_output // empty' 2>/dev/null | head -c 8000)
+TOOL_INPUT=$(echo "$INPUT_JSON" | "$JQ" -r '(.tool_input // .input // .arguments // .params // .tool.input // empty) | if type == "string" then . else tojson end' 2>/dev/null | "$HEAD" -c 4000)
+TOOL_OUTPUT=$(echo "$INPUT_JSON" | "$JQ" -r '(.tool_output // .tool_response // .tool_result // .result // .output // .response // .tool.output // .tool.result // .event.output // .event.result // empty) | if type == "string" then . else tojson end' 2>/dev/null | "$HEAD" -c 8000)
 
 # Send to worker (fire-and-forget, max 2s timeout)
-curl -s --max-time 2 \
+"$CURL" -s --max-time 2 \
     -X POST "$WORKER_URL/api/observations" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $AUTH_KEY" \
-    -d "$(jq -n \
+    -d "$("$JQ" -n \
         --arg sid "$SID" \
         --arg tool "$TOOL_NAME" \
+        --arg agent "$AGENT_NAME" \
         --arg input "$TOOL_INPUT" \
         --arg output "$TOOL_OUTPUT" \
         '{
             session_id: $sid,
             source: "post_tool_use",
             tool_name: $tool,
-            agent: "main",
+            agent: $agent,
             raw_input: $input,
             raw_output: $output
         }'
