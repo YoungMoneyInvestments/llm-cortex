@@ -2,7 +2,7 @@
 """
 Contract Roll Monitor
 =====================
-Detects stale market data in core.market_data (source='nt8', bar_size='1 min')
+Detects stale market data in core.market_data (bar_size='1 min')
 that likely indicates a missed contract roll.
 
 Checks:
@@ -98,9 +98,9 @@ def check_db_freshness() -> dict:
     return {r[0]: r[1] for r in rows}
 
 
-def post_discord(message: str) -> None:
+def post_discord(message: str) -> bool:
     if not DISCORD_WEBHOOK:
-        return
+        return True
     try:
         import urllib.request
         data = json.dumps({"content": message}).encode()
@@ -110,8 +110,10 @@ def post_discord(message: str) -> None:
             headers={"Content-Type": "application/json"},
         )
         urllib.request.urlopen(req, timeout=10)
+        return True
     except Exception as exc:
-        log.warning("Discord post failed: %s", exc)
+        log.error("Discord post failed: %s", exc)
+        return False
 
 
 def main() -> int:
@@ -169,9 +171,12 @@ def main() -> int:
             + "\n".join(f"- {a}" for a in alerts)
             + "\n\nUpdate `CONTRACT_MAP` in `smart_backfill.py` and `ROLL_SCHEDULE` in `contract_roll_monitor.py`."
         )
-        post_discord(summary)
+        discord_ok = post_discord(summary)
         for a in alerts:
             print(a, file=sys.stderr)
+        if DISCORD_WEBHOOK and not discord_ok:
+            print("ALERT DELIVERY FAILED: Discord webhook post failed", file=sys.stderr)
+            return 2
 
     return 1 if warn_count > 0 else 0
 

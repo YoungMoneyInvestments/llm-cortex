@@ -6,7 +6,7 @@ Intelligently fills historical bar data gaps in the DB by:
 1. Detecting exactly what's missing per symbol/bar_size
 2. Pulling from NT8 SocketServerMCP in date-sliced chunks
 3. Walking backward in time until target history depth is reached
-4. Idempotent — safe to re-run, ON CONFLICT DO NOTHING
+4. Idempotent - safe to re-run, ON CONFLICT DO NOTHING
 
 Usage:
     python smart_backfill.py                        # All KPL instruments, 1 year
@@ -95,7 +95,7 @@ def nt8_request(payload: dict, timeout=SOCKET_TIMEOUT) -> dict:
                 try:
                     return json.loads(stripped.decode("utf-8", errors="replace"))
                 except json.JSONDecodeError:
-                    continue  # keep reading — incomplete JSON
+                    continue  # keep reading; JSON may still be incomplete
         return json.loads(buf.strip().decode("utf-8", errors="replace"))
     finally:
         sock.close()
@@ -127,8 +127,7 @@ def fetch_bars_chunk(symbol: str, bar_size: str,
 
     resp = nt8_request(payload)
     if resp.get("status") != "OK":
-        log.error(f"NT8 error for {symbol}: {resp.get('error', resp)}")
-        return []
+        raise RuntimeError(f"NT8 error for {symbol}: {resp.get('error', resp)}")
 
     return resp.get("data", [])
 
@@ -152,7 +151,7 @@ def get_gap_info(symbol: str, bar_size: str, target_days_back: int) -> dict:
             cur.execute("""
                 SELECT MIN(time), MAX(time), COUNT(*)
                 FROM core.market_data
-                WHERE symbol = %s AND bar_size = %s AND source = 'nt8'
+                WHERE symbol = %s AND bar_size = %s
                   AND time >= %s
             """, (symbol, bar_size, target_start))
             row = cur.fetchone()
@@ -184,6 +183,7 @@ def insert_bars(bars: list, symbol: str, bar_size: str) -> int:
         return 0
 
     rows = []
+    invalid_rows = 0
     for b in bars:
         try:
             rows.append((
@@ -197,10 +197,12 @@ def insert_bars(bars: list, symbol: str, bar_size: str) -> int:
                 "nt8", "futures"
             ))
         except (KeyError, ValueError):
-            continue
+            invalid_rows += 1
 
     if not rows:
-        return 0
+        raise ValueError(f"No valid bars to insert for {symbol}/{bar_size}; invalid_rows={invalid_rows}")
+    if invalid_rows:
+        log.warning("%s/%s: skipped %d malformed bar row(s)", symbol, bar_size, invalid_rows)
 
     sql = """
         INSERT INTO core.market_data
@@ -208,18 +210,20 @@ def insert_bars(bars: list, symbol: str, bar_size: str) -> int:
              volume, vwap, trades, contract_id, source, asset_class)
         VALUES %s
         ON CONFLICT DO NOTHING
+        RETURNING 1
     """
     with get_db() as conn:
         with conn.cursor() as cur:
-            execute_values(cur, sql, rows)
+            inserted = execute_values(cur, sql, rows, fetch=True)
         conn.commit()
 
-    return len(rows)
+    return len(inserted or [])
 
 
 # ── Main backfill logic ──────────────────────────────────────────────────────
 def backfill_symbol(symbol: str, nt8_symbol: str, bar_size: str,
-                    target_days: int, dry_run: bool = False) -> dict:
+                    target_days: int, dry_run: bool = False,
+                    chunk_days: int = 10, max_bars: int = BARS_PER_CHUNK) -> dict:
     """
     Backfill a single symbol by pulling in chunks walking backward from today.
     Returns stats dict.
@@ -240,7 +244,7 @@ def backfill_symbol(symbol: str, nt8_symbol: str, bar_size: str,
 
     # Pull in time-sliced chunks working backward from today
     total_inserted = 0
-    chunk_size_days = 10  # Pull 10 days at a time to keep payloads manageable
+    chunk_size_days = chunk_days
     end_date = datetime.now()
     start_target = gap["target_start"]
 
@@ -249,42 +253,65 @@ def backfill_symbol(symbol: str, nt8_symbol: str, bar_size: str,
         end_date = gap["oldest_in_db"]
 
     current_end = end_date
+    failed_chunks = 0
+    empty_chunks = 0
+    chunks_attempted = 0
     while current_end > start_target:
         current_start = max(current_end - timedelta(days=chunk_size_days), start_target)
+        chunks_attempted += 1
 
-        log.info(f"  Fetching {symbol} {current_start.date()} → {current_end.date()}")
+        log.info(f"  Fetching {symbol} {current_start.date()} -> {current_end.date()}")
 
         try:
-            bars = fetch_bars_chunk(nt8_symbol, bar_size, current_start, current_end)
+            bars = fetch_bars_chunk(nt8_symbol, bar_size, current_start, current_end, max_bars=max_bars)
             if bars:
                 inserted = insert_bars(bars, symbol, bar_size)
                 total_inserted += inserted
                 log.info(f"    Got {len(bars)} bars, inserted {inserted} new")
             else:
                 log.warning(f"    No bars returned for {symbol} {current_start.date()}")
+                empty_chunks += 1
 
             current_end = current_start - timedelta(days=1)
             time.sleep(0.5)  # Be gentle on NT8
 
         except Exception as e:
             log.error(f"  Error fetching {symbol} chunk: {e}")
+            failed_chunks += 1
             break
 
     log.info(f"  {symbol}: total inserted = {total_inserted:,}")
-    return {"symbol": symbol, "status": "complete", "inserted": total_inserted}
+    if failed_chunks:
+        status = "error"
+    elif total_inserted == 0 and empty_chunks == chunks_attempted:
+        status = "no_data"
+    else:
+        status = "complete"
+    return {
+        "symbol": symbol,
+        "status": status,
+        "inserted": total_inserted,
+        "failed_chunks": failed_chunks,
+        "empty_chunks": empty_chunks,
+        "chunks_attempted": chunks_attempted,
+    }
 
 
 def check_gaps(symbols: list, bar_sizes: list, target_days: int):
     """Print a gap report without fetching any data."""
+    needs_fill = 0
     print(f"\n{'Symbol':<8} {'Bar Size':<8} {'Bars in DB':>12} {'Oldest':>12} {'Gap Days':>10} Status")
     print("-" * 65)
     for sym in symbols:
         for bs in bar_sizes:
             gap = get_gap_info(sym, bs, target_days)
             status = "NEEDS FILL" if gap["needs_backfill"] else "OK"
+            if gap["needs_backfill"]:
+                needs_fill += 1
             oldest = gap["oldest_in_db"].strftime("%Y-%m-%d") if gap["oldest_in_db"] else "NONE"
             print(f"{sym:<8} {bs:<8} {gap['bars_in_db']:>12,} {oldest:>12} "
                   f"{gap['gap_days']:>10} {status}")
+    return needs_fill
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
@@ -300,28 +327,45 @@ def main():
                         help="Only report gaps, don't fetch data")
     parser.add_argument("--dry-run", action="store_true",
                         help="Show what would be fetched without actually fetching")
+    parser.add_argument("--chunk-days", type=int, default=10,
+                        help="Calendar days per NT8 request (default: 10)")
+    parser.add_argument("--max-bars", type=int, default=BARS_PER_CHUNK,
+                        help=f"Max bars per NT8 request (default: {BARS_PER_CHUNK})")
     args = parser.parse_args()
 
     symbols = args.symbols or ALL_INSTRUMENTS
 
     if args.check_only:
-        check_gaps(symbols, args.bar_sizes, args.days)
-        return
+        needs_fill = check_gaps(symbols, args.bar_sizes, args.days)
+        return 1 if needs_fill else 0
 
     results = []
     for sym in symbols:
         nt8_sym = CONTRACT_MAP.get(sym, sym)
         for bs in args.bar_sizes:
-            result = backfill_symbol(sym, nt8_sym, bs, args.days, dry_run=args.dry_run)
+            result = backfill_symbol(
+                sym,
+                nt8_sym,
+                bs,
+                args.days,
+                dry_run=args.dry_run,
+                chunk_days=args.chunk_days,
+                max_bars=args.max_bars,
+            )
             results.append(result)
             time.sleep(1)
 
     print("\n=== BACKFILL SUMMARY ===")
     total = sum(r.get("inserted", 0) for r in results)
     for r in results:
-        print(f"  {r['symbol']}: {r['status']} — {r.get('inserted', 0):,} rows inserted")
+        print(f"  {r['symbol']}: {r['status']} - {r.get('inserted', 0):,} rows inserted")
     print(f"\nTotal rows inserted: {total:,}")
+    failed = [r for r in results if r.get("status") in {"error", "no_data"}]
+    if failed:
+        print("Failed/incomplete symbols: " + ", ".join(f"{r['symbol']}:{r['status']}" for r in failed), file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -111,11 +111,10 @@ def fetch_day(nt8_symbol: str, day: date) -> list:
     try:
         resp = nt8_request(payload)
         if resp.get("status") != "OK":
-            return []
+            raise RuntimeError(f"NT8 status for {nt8_symbol} on {day}: {resp.get('error', resp)}")
         return resp.get("data", [])
     except Exception as exc:
-        log.warning("  NT8 error for %s on %s: %s", nt8_symbol, day, exc)
-        return []
+        raise RuntimeError(f"NT8 error for {nt8_symbol} on {day}: {exc}") from exc
 
 
 def insert_bars(bars: list, symbol: str) -> int:
@@ -123,6 +122,7 @@ def insert_bars(bars: list, symbol: str) -> int:
     if not bars:
         return 0
     payload = []
+    invalid_rows = 0
     for b in bars:
         try:
             payload.append({
@@ -135,9 +135,11 @@ def insert_bars(bars: list, symbol: str) -> int:
                 "volume": int(b.get("volume", 0)),
             })
         except (KeyError, ValueError):
-            continue
+            invalid_rows += 1
     if not payload:
-        return 0
+        raise ValueError(f"No valid bars to insert for {symbol}; invalid_rows={invalid_rows}")
+    if invalid_rows:
+        log.warning("%s: skipped %d malformed bar row(s)", symbol, invalid_rows)
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -164,7 +166,7 @@ def get_newest_bar(symbol: str):
     return row[0] if row and row[0] else None
 
 
-def refresh_cagg() -> None:
+def refresh_cagg() -> bool:
     log.info("Refreshing market_data_5min cagg (last 90 days)...")
     conn = get_db()
     try:
@@ -176,8 +178,10 @@ def refresh_cagg() -> None:
             (start, datetime.now()),
         )
         log.info("Cagg refresh complete")
+        return True
     except Exception as exc:
-        log.warning("Cagg refresh failed: %s", exc)
+        log.error("Cagg refresh failed: %s", exc)
+        return False
     finally:
         conn.close()
 
@@ -203,7 +207,7 @@ def fill_symbol(symbol: str, nt8_symbol: str, from_date: date) -> int:
             total_inserted += inserted
             log.info("  %s %s: fetched=%d inserted=%d", symbol, current, len(bars), inserted)
         else:
-            log.debug("  %s %s: no bars (non-trading day or contract gap)", symbol, current)
+            log.info("  %s %s: no bars (non-trading day or contract gap)", symbol, current)
 
         current += timedelta(days=1)
         time.sleep(0.3)  # be gentle on NT8
@@ -221,6 +225,7 @@ def main():
     args = parser.parse_args()
 
     results = {}
+    failures = []
     for sym in args.symbols:
         nt8_sym = args.contract or CONTRACT_MAP.get(sym, sym)
 
@@ -229,7 +234,8 @@ def main():
         else:
             newest = get_newest_bar(sym)
             if newest is None:
-                log.warning("%s: no existing bars, use smart_backfill.py instead", sym)
+                log.error("%s: no existing bars, use smart_backfill.py instead", sym)
+                failures.append(f"{sym}:no_existing_bars")
                 continue
             start = newest + timedelta(days=1)
             if start > date.today():
@@ -237,9 +243,13 @@ def main():
                 continue
 
         log.info("%s (%s): filling %s -> %s", sym, nt8_sym, start, date.today())
-        inserted = fill_symbol(sym, nt8_sym, start)
-        results[sym] = inserted
-        log.info("%s: total inserted = %d", sym, inserted)
+        try:
+            inserted = fill_symbol(sym, nt8_sym, start)
+            results[sym] = inserted
+            log.info("%s: total inserted = %d", sym, inserted)
+        except Exception as exc:
+            log.error("%s: fill failed: %s", sym, exc)
+            failures.append(f"{sym}:fill_failed")
         time.sleep(1)
 
     print("\n=== FILL SUMMARY ===")
@@ -249,8 +259,12 @@ def main():
     print(f"\nTotal: {total:,} rows")
 
     if total > 0:
-        refresh_cagg()
+        if not refresh_cagg():
+            failures.append("market_data_5min_refresh_failed")
 
+    if failures:
+        print("Failed/incomplete symbols: " + ", ".join(failures), file=sys.stderr)
+        return 1
     return 0
 
 
