@@ -30,6 +30,7 @@ Usage:
 import json
 import logging
 import os
+import re
 import sqlite3
 import sys
 from pathlib import Path
@@ -60,6 +61,21 @@ _MAX_LIMIT = 100          # cami_memory_search, cami_memory_graph_search, cami_m
 _MAX_WINDOW = 50          # cami_memory_timeline window
 _MAX_OBSERVATION_IDS = 20 # cami_memory_details
 _MAX_CONTENT_LEN = 20_000 # cami_memory_save content
+
+_SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s\"']+"), r"\1[REDACTED]"),
+    (re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{16,}"), r"\1[REDACTED]"),
+    (re.compile(r"(?i)(api[_-]?key|token|secret|password|passwd|pwd|oauth[_-]?token|refresh[_-]?token)(\s*[:=]\s*)[^\s\"',}]+"), r"\1\2[REDACTED]"),
+    (re.compile(r"sk-[A-Za-z0-9_-]{12,}"), "sk-[REDACTED]"),
+    (re.compile(r"gh[pousr]_[A-Za-z0-9_]{20,}"), "gh[REDACTED]"),
+)
+
+
+def _redact_sensitive(text: str) -> str:
+    redacted = text
+    for pattern, replacement in _SECRET_PATTERNS:
+        redacted = pattern.sub(replacement, redacted)
+    return redacted
 
 
 def _int_arg(arguments: dict, key: str, default: int, *, lo: int = 1, hi: int) -> int:
@@ -345,6 +361,41 @@ TOOLS = [
         },
     },
     {
+        "name": "cami_people_search",
+        "description": (
+            "Semantic search over Cameron's 1,400+ person contact network stored in Neon. "
+            "Finds people by concept, relationship, role, or any natural language description. "
+            "Use this to answer 'who do I know that...' questions or find specific contacts. "
+            "Returns ranked matches with relationship type, subscriber status, message count, "
+            "emails, phones, and social handles. Faster and more flexible than cami_contact_search "
+            "for open-ended queries."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Natural language description of the person or concept to search for",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max results to return (default: 10, max: 50)",
+                    "default": 10,
+                },
+                "relationship_type": {
+                    "type": "string",
+                    "description": "Optional filter: friend, family, investor, collaborator, subscriber, lp, romantic, etc.",
+                },
+                "subscriber_only": {
+                    "type": "boolean",
+                    "description": "If true, only return active subscribers",
+                    "default": False,
+                },
+            },
+            "required": ["query"],
+        },
+    },
+    {
         "name": "session_bootstrap",
         "description": (
             "Bootstrap a new session with current time, user profile, recent activity, "
@@ -364,6 +415,143 @@ TOOLS = [
         },
     },
 ]
+
+
+# ── People search (Neon pgvector) ──────────────────────────────────────────
+
+_PEOPLE_MODEL = None  # cached SentenceTransformer instance
+_PEOPLE_MODEL_NAME = "BAAI/bge-large-en-v1.5"
+_NEON_DSN: str | None = None
+
+
+def _get_neon_dsn() -> str | None:
+    global _NEON_DSN
+    if _NEON_DSN:
+        return _NEON_DSN
+    dsn = os.environ.get("NEON_DSN", "").strip()
+    if not dsn:
+        env_path = Path("/Users/cameronbennion/clawd/.env")
+        if env_path.exists():
+            for line in env_path.read_text().splitlines():
+                if line.startswith("NEON_DSN="):
+                    dsn = line.split("=", 1)[1].strip().strip("\"'")
+                    break
+    _NEON_DSN = dsn or None
+    return _NEON_DSN
+
+
+def _embed_query(text: str) -> list[float]:
+    global _PEOPLE_MODEL
+    if _PEOPLE_MODEL is None:
+        try:
+            from sentence_transformers import SentenceTransformer  # type: ignore
+            _PEOPLE_MODEL = SentenceTransformer(_PEOPLE_MODEL_NAME)
+        except ImportError:
+            raise RuntimeError("sentence-transformers not installed")
+    vec = _PEOPLE_MODEL.encode(text, normalize_embeddings=True)
+    return vec.tolist()
+
+
+def search_people_neon(
+    query: str,
+    limit: int = 10,
+    relationship_type: str | None = None,
+    subscriber_only: bool = False,
+) -> str:
+    dsn = _get_neon_dsn()
+    if not dsn:
+        return "NEON_DSN not configured — cannot search people."
+
+    try:
+        import psycopg2  # type: ignore
+        from pgvector.psycopg2 import register_vector  # type: ignore
+    except ImportError:
+        return "psycopg2 or pgvector not installed in this environment."
+
+    try:
+        vec = _embed_query(query)
+    except Exception as exc:
+        return f"Embedding error: {exc}"
+
+    try:
+        conn = psycopg2.connect(dsn)
+        register_vector(conn)
+        cur = conn.cursor()
+
+        where_clauses = ["embedding IS NOT NULL"]
+        params: list = []
+        if relationship_type:
+            where_clauses.append("relationship_type = %s")
+            params.append(relationship_type)
+        if subscriber_only:
+            where_clauses.append("subscriber_status = 'active'")
+
+        where_sql = " AND ".join(where_clauses)
+        params_tuple = tuple(params) + (vec, limit)
+
+        cur.execute(f"""
+            SELECT
+                id, display_name, relationship_type, entity,
+                subscriber_status, subscriber_source,
+                total_messages, first_contact, last_contact,
+                emails, phones, instagram_handles, discord_ids,
+                1 - (embedding <=> %s::vector) AS similarity
+            FROM people
+            WHERE {where_sql}
+            ORDER BY embedding <=> %s::vector
+            LIMIT %s
+        """, tuple(params) + (vec, vec, limit))
+
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+    except Exception as exc:
+        return f"Neon query error: {exc}"
+
+    if not rows:
+        return f"No people found matching '{query}'."
+
+    import json as _json
+    lines = [f"People search: '{query}' — {len(rows)} result(s)\n"]
+    for i, r in enumerate(rows, 1):
+        (pid, name, rel, entity, sub_status, sub_source,
+         msgs, first_c, last_c, emails, phones, ig, discord, sim) = r
+
+        lines.append(f"{'─'*50}")
+        lines.append(f"#{i} {name}  (similarity: {sim:.3f})")
+        if rel:
+            lines.append(f"  Relationship : {rel}" + (f" @ {entity}" if entity else ""))
+        if sub_status:
+            lines.append(f"  Subscriber   : {sub_status} via {sub_source or '?'}")
+        if msgs:
+            lines.append(f"  Messages     : {msgs:,}" + (f"  (since {str(first_c)[:10]})" if first_c else ""))
+        try:
+            em = _json.loads(emails) if isinstance(emails, str) else (emails or [])
+            if em:
+                lines.append(f"  Emails       : {', '.join(em[:3])}")
+        except Exception:
+            pass
+        try:
+            ph = _json.loads(phones) if isinstance(phones, str) else (phones or [])
+            if ph:
+                lines.append(f"  Phones       : {', '.join(ph[:2])}")
+        except Exception:
+            pass
+        try:
+            ig_list = _json.loads(ig) if isinstance(ig, str) else (ig or [])
+            if ig_list:
+                lines.append(f"  Instagram    : {', '.join(ig_list[:2])}")
+        except Exception:
+            pass
+        try:
+            dc_list = _json.loads(discord) if isinstance(discord, str) else (discord or [])
+            if dc_list:
+                lines.append(f"  Discord      : {', '.join(dc_list[:2])}")
+        except Exception:
+            pass
+        lines.append(f"  ID           : {pid}")
+
+    return "\n".join(lines)
 
 
 # ── Contact search ─────────────────────────────────────────────────────────
@@ -584,7 +772,7 @@ def handle_tool_call(name: str, arguments: dict) -> dict:
             content = arguments.get("content")
             if not isinstance(content, str) or not content.strip():
                 return {"content": [{"type": "text", "text": "Error: 'content' must be a non-empty string"}], "isError": True}
-            content = content[:_MAX_CONTENT_LEN]
+            content = _redact_sensitive(content[:_MAX_CONTENT_LEN])
             metadata = {}
             if arguments.get("tags"):
                 metadata["tags"] = arguments["tags"]
@@ -927,6 +1115,19 @@ def handle_tool_call(name: str, arguments: dict) -> dict:
                 lines.append("")
 
             return {"content": [{"type": "text", "text": "\n".join(lines)}]}
+
+        elif name == "cami_people_search":
+            ppl_query = arguments.get("query")
+            if not isinstance(ppl_query, str) or not ppl_query.strip():
+                return {"content": [{"type": "text", "text": "Error: 'query' must be a non-empty string"}], "isError": True}
+            ppl_limit = min(_int_arg(arguments, "limit", 10, lo=1, hi=50), 50)
+            result_text = search_people_neon(
+                query=ppl_query,
+                limit=ppl_limit,
+                relationship_type=arguments.get("relationship_type"),
+                subscriber_only=bool(arguments.get("subscriber_only", False)),
+            )
+            return {"content": [{"type": "text", "text": result_text}]}
 
         elif name == "cami_contact_search":
             contact_query = arguments.get("query")

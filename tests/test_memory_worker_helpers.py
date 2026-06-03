@@ -130,6 +130,90 @@ class TestResolveApiKey(unittest.TestCase):
         self.assertEqual(key_file.read_text().strip(), mw.CORTEX_API_KEY)
 
 
+class TestSessionSummaryFallback(unittest.TestCase):
+    """Tests for session summary fallback paths."""
+
+    def setUp(self):
+        import asyncio
+        import sqlite3
+
+        self._td = __import__("tempfile").TemporaryDirectory()
+        self.tmp = Path(self._td.name)
+        self.mw = _import_fresh_worker(
+            self.tmp,
+            extra_env={"CORTEX_WORKER_API_KEY": "test-key-summary"},
+        )
+        self.conn = sqlite3.connect(":memory:", check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.executescript("""
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                agent TEXT DEFAULT 'main',
+                started_at TEXT NOT NULL,
+                ended_at TEXT,
+                user_prompt TEXT,
+                summary TEXT,
+                observation_count INTEGER DEFAULT 0,
+                subscription_tier TEXT DEFAULT 'claude_standard',
+                status TEXT DEFAULT 'active'
+            );
+            CREATE TABLE observations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                source TEXT NOT NULL,
+                tool_name TEXT,
+                agent TEXT DEFAULT 'main',
+                raw_input TEXT,
+                raw_output TEXT,
+                summary TEXT,
+                status TEXT DEFAULT 'pending',
+                vector_synced INTEGER DEFAULT 0,
+                subscription_tier TEXT DEFAULT 'claude_standard',
+                created_at TEXT DEFAULT (datetime('now')),
+                processed_at TEXT
+            );
+            CREATE TABLE session_summaries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                key_decisions TEXT,
+                entities_mentioned TEXT,
+                created_at TEXT DEFAULT (datetime('now'))
+            );
+        """)
+        self.conn.execute(
+            "INSERT INTO sessions (id, agent, started_at, ended_at, status) "
+            "VALUES ('empty-session', 'codex', '2026-06-03T00:00:00+00:00', "
+            "'2026-06-03T01:00:00+00:00', 'ended')"
+        )
+        self.conn.commit()
+        self.mw.db = self.conn
+        self.mw.db_lock = asyncio.Lock()
+        self.mw.ai_compressor = None
+
+    def tearDown(self):
+        self.conn.close()
+        self._td.cleanup()
+
+    def test_empty_ended_session_is_marked_summarized(self):
+        import asyncio
+
+        asyncio.run(self.mw._generate_session_summary("empty-session"))
+        session = self.conn.execute(
+            "SELECT status, summary FROM sessions WHERE id = 'empty-session'"
+        ).fetchone()
+        self.assertEqual(session["status"], "summarized")
+        self.assertIn("no processed observations", session["summary"])
+        row = self.conn.execute(
+            "SELECT summary, key_decisions, entities_mentioned FROM session_summaries "
+            "WHERE session_id = 'empty-session'"
+        ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["key_decisions"], "[]")
+        self.assertEqual(row["entities_mentioned"], "[]")
+
+
 class TestCheckRateLimit(unittest.TestCase):
     """Tests for _check_rate_limit() — session-level rate limiter."""
 
@@ -241,6 +325,33 @@ class TestSubscriptionRateLimiter(unittest.TestCase):
         ok_b, _ = self.limiter.check("session-b", "claude_codemax")
         self.assertTrue(ok_b,
             "a different session must not be blocked because session-a is at capacity")
+
+
+class TestMemcellTopicBoundaries(unittest.TestCase):
+    """MemCell chunks must never cross session boundaries."""
+
+    def setUp(self):
+        self._td = __import__("tempfile").TemporaryDirectory()
+        self.tmp = Path(self._td.name)
+        self.mw = _import_fresh_worker(
+            self.tmp,
+            extra_env={"CORTEX_WORKER_API_KEY": "test-key"},
+        )
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def test_session_change_forces_new_chunk(self):
+        base = "2026-06-03T18:00:00+00:00"
+        rows = [
+            {"id": 1, "session_id": "a", "timestamp": base, "tool_name": "Bash"},
+            {"id": 2, "session_id": "b", "timestamp": base, "tool_name": "Bash"},
+            {"id": 3, "session_id": "a", "timestamp": base, "tool_name": "Bash"},
+        ]
+
+        chunks = self.mw._detect_topic_boundaries(rows)
+
+        self.assertEqual([[obs["id"] for obs in chunk] for chunk in chunks], [[1], [2], [3]])
 
 
 class TestObservationTierBinding(unittest.TestCase):
