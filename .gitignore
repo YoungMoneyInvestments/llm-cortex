@@ -48,7 +48,6 @@ htmlcov/
 [removed]
 [removed]
 [removed]
-.gitnexus
 
 # Claude Code + agent runtime artifacts
 .claude/ralph-loop.log
