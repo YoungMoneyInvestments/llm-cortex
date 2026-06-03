@@ -12,19 +12,29 @@
 WORKER_PORT="${CORTEX_WORKER_PORT:-37778}"
 WORKER_URL="http://127.0.0.1:$WORKER_PORT"
 AUTH_KEY="${CORTEX_WORKER_API_KEY:-}"
+AGENT_NAME="${CORTEX_AGENT_NAME:-claude-code}"
+CURL="${CORTEX_CURL:-/usr/bin/curl}"
+JQ="${CORTEX_JQ:-$(command -v jq || true)}"
+if [ -z "$JQ" ]; then
+    JQ="/opt/homebrew/bin/jq"
+fi
+# Fall back to generated key file if env var is absent.
+if [ -z "$AUTH_KEY" ] && [ -f "$HOME/.cortex/data/.worker_api_key" ]; then
+    AUTH_KEY="$(cat "$HOME/.cortex/data/.worker_api_key" 2>/dev/null)"
+fi
 
 # Read stdin (Claude Code sends JSON)
 INPUT_JSON=$(cat)
 
 # Skip if worker isn't running
-if ! curl -s --connect-timeout 1 "$WORKER_URL/api/health" > /dev/null 2>&1; then
+if ! "$CURL" -s --connect-timeout 1 "$WORKER_URL/api/health" > /dev/null 2>&1; then
     echo "Success"
     exit 0
 fi
 
 # Extract fields from stdin JSON
-PROMPT=$(echo "$INPUT_JSON" | jq -r '.prompt // empty' 2>/dev/null)
-SESSION_ID=$(echo "$INPUT_JSON" | jq -r '.session_id // empty' 2>/dev/null)
+PROMPT=$(echo "$INPUT_JSON" | "$JQ" -r '.prompt // .user_prompt // .message // .input // empty' 2>/dev/null)
+SESSION_ID=$(echo "$INPUT_JSON" | "$JQ" -r '.session_id // .sessionId // .session.id // empty' 2>/dev/null)
 
 if [ -z "$AUTH_KEY" ]; then
     echo "Warning: CORTEX_WORKER_API_KEY is not set; skipping Cortex session capture." >&2
@@ -35,33 +45,35 @@ fi
 SID="${SESSION_ID:-$(date +%Y%m%d-%H%M%S)}"
 
 # Register/update session with user prompt
-curl -s --max-time 2 \
+"$CURL" -s --max-time 2 \
     -X POST "$WORKER_URL/api/sessions/start" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $AUTH_KEY" \
-    -d "$(jq -n \
+    -d "$("$JQ" -n \
         --arg sid "$SID" \
+        --arg agent "$AGENT_NAME" \
         --arg prompt "$PROMPT" \
         '{
             session_id: $sid,
-            agent: "main",
+            agent: $agent,
             user_prompt: $prompt
         }'
     )" > /dev/null 2>&1 &
 
 # Also log as observation for searchability
 if [ -n "$PROMPT" ]; then
-    curl -s --max-time 2 \
+    "$CURL" -s --max-time 2 \
         -X POST "$WORKER_URL/api/observations" \
         -H "Content-Type: application/json" \
         -H "Authorization: Bearer $AUTH_KEY" \
-        -d "$(jq -n \
+        -d "$("$JQ" -n \
             --arg sid "$SID" \
+            --arg agent "$AGENT_NAME" \
             --arg prompt "$PROMPT" \
             '{
                 session_id: $sid,
                 source: "user_prompt",
-                agent: "main",
+                agent: $agent,
                 raw_input: $prompt
             }'
         )" > /dev/null 2>&1 &

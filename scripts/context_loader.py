@@ -30,12 +30,16 @@ from working_memory import WorkingMemory
 
 # ── Config ──────────────────────────────────────────────────────────────────
 
-WORKSPACE = Path(os.environ.get("CORTEX_WORKSPACE", str(Path.home() / "cortex")))
+HOME = Path.home()
+WORKSPACE = Path(os.environ.get("CORTEX_WORKSPACE", str(HOME / "cortex")))
 MEMORY_DIR = WORKSPACE / "memory"
 PLANNING_DIR = WORKSPACE / ".planning"
 HANDOFF_DIR = PLANNING_DIR / "handoffs"
 WORKING_MEMORY_DIR = PLANNING_DIR / "working-memory"
 CORTEX_RECALL_TIMEOUT = float(os.environ.get("CORTEX_RECALL_TIMEOUT", "20"))
+KNOWLEDGE_ROOT = HOME / "Knowledge"
+OBSIDIAN_MEMORY_DIR = KNOWLEDGE_ROOT / "claude-memory"
+OBSIDIAN_SESSIONS_DIR = KNOWLEDGE_ROOT / "sessions"
 
 # Patterns that indicate ongoing technical work
 TECHNICAL_PATTERNS = [
@@ -86,9 +90,16 @@ class MemoryBootstrap:
     def find_recent_memory_files(self) -> List[Path]:
         """Find memory files modified within the time window."""
         files = []
-        if MEMORY_DIR.exists():
-            for f in MEMORY_DIR.rglob("*.md"):
+        roots = [MEMORY_DIR, OBSIDIAN_MEMORY_DIR, OBSIDIAN_SESSIONS_DIR]
+        seen: set[Path] = set()
+        for root in roots:
+            if not root.exists():
+                continue
+            for f in root.rglob("*.md"):
                 try:
+                    if f in seen:
+                        continue
+                    seen.add(f)
                     if "archive" in f.parts:
                         continue
                     mtime = datetime.fromtimestamp(f.stat().st_mtime)
@@ -278,6 +289,36 @@ class MemoryBootstrap:
         return "\n".join(lines)
 
 
+def resolve_project_dir(cwd: Optional[str] = None) -> Optional[Path]:
+    """Return useful project directory for recall/context, avoiding broad home paths."""
+    raw = cwd or os.environ.get("CORTEX_PROJECT_DIR") or os.getcwd()
+    project_dir = Path(raw).expanduser().resolve()
+    home = HOME.resolve()
+
+    if project_dir == home:
+        active = os.environ.get("CORTEX_ACTIVE_PROJECT", "").strip()
+        return Path(active).expanduser().resolve() if active else None
+
+    for candidate in (project_dir, *project_dir.parents):
+        if (candidate / ".git").exists():
+            return candidate
+        if candidate == home:
+            break
+
+    return project_dir if project_dir.name else None
+
+
+def project_query(cwd: Optional[str] = None) -> str:
+    """Return stable search token for active project, or empty when unknown."""
+    project_dir = resolve_project_dir(cwd)
+    if not project_dir:
+        return ""
+    name = project_dir.name.strip()
+    if not name or name in {".", "/", HOME.name}:
+        return ""
+    return name
+
+
 def cortex_recall(cwd: Optional[str] = None) -> str:
     """Query the cortex memory worker for observations relevant to the current project.
 
@@ -297,15 +338,13 @@ def cortex_recall(cwd: Optional[str] = None) -> str:
         file_key = ""
     api_key = file_key or _env_key
 
-    # Determine project name from CWD
-    project_dir = cwd or os.environ.get("CORTEX_PROJECT_DIR") or os.getcwd()
-    project_name = Path(project_dir).name
-    if not project_name or project_name in (".", "/"):
+    query = project_query(cwd)
+    if not query:
         return ""
 
     # Build the search request
     endpoint = f"{worker_url}/api/memory/search"
-    payload = json.dumps({"query": project_name, "limit": 5}).encode("utf-8")
+    payload = json.dumps({"query": query, "limit": 5}).encode("utf-8")
 
     req = urllib.request.Request(
         endpoint,
@@ -455,6 +494,84 @@ def obsidian_context(cwd: Optional[str] = None) -> str:
 
     return "\n".join(lines) if len(lines) > 1 else ""
 
+# Maps CWD path fragments → relevant Knowledge project files to inject
+PROJECT_CONTEXT_MAP: dict[str, list[str]] = {
+    "agent-monitor": ["projects/agent-monitor.md"],
+    "agent-orchestrator": ["projects/agent-orchestrator.md"],
+    "broker-bridge-retail": ["projects/broker-bridge-retail.md", "projects/brokerbridge-retail.md"],
+    "brokerbridge-retail": ["projects/brokerbridge-retail.md", "projects/broker-bridge-retail.md"],
+    "brokerbridge": ["projects/brokerbridge.md"],
+    "clawd": ["projects/openclaw.md", "projects/cami.md"],
+    "crucible": ["projects/crucible.md"],
+    "demand-index-oscillator": ["projects/money-flow-model.md", "projects/volume-regime-detector.md"],
+    "jarvis": ["projects/jarvis-interface.md"],
+    "kpl-image-recognition": ["projects/kpl-image-recognition.md"],
+    "llm-cortex": ["projects/llm-cortex.md"],
+    "moltytrades": ["projects/moltytrades.md"],
+    "magnum": ["projects/magnum-opus-capital.md"],
+    "magnum-opus": ["projects/magnum-opus-capital.md"],
+    "matrix-lstm": ["projects/matrix-lstm.md"],
+    "openclaw": ["projects/openclaw.md", "projects/cami.md"],
+    "remotion": ["projects/ymt-content-pipeline.md"],
+    "ruflo": ["projects/ruflo.md"],
+    "strategy": ["projects/strategy-kb.md"],
+    "trading-systems": ["projects/strategy-kb.md"],
+    "visionclaw": ["projects/VisionClaw.md"],
+    "x-algo": ["projects/x-algo-system.md"],
+    "ymi-signals": ["projects/ymi-signals-app.md"],
+    "ymi-website": ["projects/ymi.md"],
+    "ymi": ["projects/ymi.md"],
+    "newsletter-executor": ["projects/ymi-signals-app.md"],
+}
+
+
+def business_context(cwd: Optional[str] = None) -> str:
+    """Inject relevant Knowledge project/people files based on CWD.
+
+    Keeps the output tight (< 800 chars) — just enough to orient the agent
+    without crowding the context window.
+    """
+    project_dir = resolve_project_dir(cwd) or Path(
+        cwd or os.environ.get("CORTEX_PROJECT_DIR") or os.getcwd()
+    )
+    project_name = project_dir.name.lower()
+
+    # Find matching context files
+    files_to_load: list[Path] = []
+    for key, paths in PROJECT_CONTEXT_MAP.items():
+        if key in project_name or key in str(project_dir).lower():
+            for rel in paths:
+                fpath = KNOWLEDGE_ROOT / rel
+                if fpath.exists():
+                    files_to_load.append(fpath)
+            break
+
+    if not files_to_load:
+        return ""
+
+    lines = []
+    char_budget = 700
+    for fpath in files_to_load:
+        try:
+            raw = (read_text_with_timeout(fpath) or "").strip()
+            if not raw:
+                continue
+            # Strip frontmatter
+            if raw.startswith("---"):
+                end = raw.find("---", 3)
+                if end != -1:
+                    raw = raw[end + 3:].strip()
+            snippet = raw[:min(len(raw), char_budget)]
+            lines.append(f"## Knowledge — {fpath.stem}")
+            lines.append(snippet)
+            char_budget -= len(snippet)
+            if char_budget <= 0:
+                break
+        except Exception:
+            continue
+
+    return "\n".join(lines) if lines else ""
+
 
 def main():
     parser = argparse.ArgumentParser(description="Session memory bootstrap")
@@ -482,6 +599,12 @@ def main():
     if vault:
         print("")
         print(vault)
+
+    # Inject project-specific business context from Knowledge vault
+    biz = business_context()
+    if biz:
+        print("")
+        print(biz)
 
 
 if __name__ == "__main__":
