@@ -9,7 +9,8 @@ Supports two embedding providers:
   - "local" (default): sentence-transformers/all-MiniLM-L6-v2 (384 dims, free)
   - "openai": text-embedding-3-small (1536 dims, costs API tokens)
 
-Set CORTEX_EMBEDDING_PROVIDER=openai to use OpenAI embeddings.
+Set CORTEX_EMBEDDING_PROVIDER=openai and CORTEX_OPENAI_EMBEDDINGS_ALLOWED=1
+to use OpenAI embeddings.
 
 Replaces the fragmented discord-embeddings.db / imessage-embeddings.db
 approach with a single unified store.
@@ -126,6 +127,11 @@ def _load_openai_key() -> Optional[str]:
         if stripped.startswith("OPENAI_API_KEY="):
             return stripped.split("=", 1)[1].strip().strip('"').strip("'")
     return None
+
+
+def _openai_embeddings_allowed() -> bool:
+    """Require an explicit billing gate before OpenAI embeddings can initialize."""
+    return os.environ.get("CORTEX_OPENAI_EMBEDDINGS_ALLOWED", "").strip() == "1"
 
 
 def _float_list_to_blob(floats: list[float]) -> bytes:
@@ -383,6 +389,12 @@ class UnifiedVectorStore:
     def _get_openai(self):
         """Lazy-init OpenAI client."""
         if self._openai_client is None:
+            if not _openai_embeddings_allowed():
+                raise RuntimeError(
+                    "OpenAI embeddings are disabled. Set "
+                    "CORTEX_OPENAI_EMBEDDINGS_ALLOWED=1 with "
+                    "CORTEX_EMBEDDING_PROVIDER=openai to enable billable embeddings."
+                )
             key = _load_openai_key()
             if not key:
                 raise RuntimeError(
