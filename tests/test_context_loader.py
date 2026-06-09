@@ -7,7 +7,9 @@ from unittest import mock
 
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS_DIR))
+    # Append (don't prepend) so scripts/ never shadows src/ for shared module
+    # names (e.g. memory_worker, memory_retriever).
+    sys.path.append(str(SCRIPTS_DIR))
 
 import context_loader
 

@@ -3,13 +3,17 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime
 from unittest import mock
 from pathlib import Path
 
 
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS_DIR))
+    # Append (don't prepend) so scripts/ never shadows src/ for shared module
+    # names: scripts/memory_worker.py is a thin wrapper without the classes
+    # that src/memory_worker.py exposes to other tests.
+    sys.path.append(str(SCRIPTS_DIR))
 PROMOTE_SCRIPT = SCRIPTS_DIR / "promote_to_obsidian.py"
 
 from promote_to_obsidian import (
@@ -97,7 +101,30 @@ def commit_path(repo_dir: Path, pathspec: str, message: str = "test commit") -> 
     subprocess.run(["git", "commit", "-m", message], cwd=repo_dir, check=True, capture_output=True)
 
 
+class _FrozenDateTime(datetime):
+    """Real datetime subclass with now() pinned just after the 2026-04-18 fixtures.
+
+    The fixtures in this file hardcode created_at values around 2026-04-18, and
+    promote_sessions(hours=168) filters out rows older than 7 days from "now".
+    Freezing now() at 2026-04-19 00:00 UTC keeps every fixture inside the window
+    forever, so the tests stay deterministic instead of aging out.
+
+    A real datetime subclass (not a Mock) is required: the module under test also
+    uses datetime.fromisoformat, datetime.strptime, datetime.min, and real
+    datetime comparisons.
+    """
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls(2026, 4, 19, 0, 0, tzinfo=tz)
+
+
 class PromoteToObsidianTests(unittest.TestCase):
+    def setUp(self) -> None:
+        patcher = mock.patch("promote_to_obsidian.datetime", _FrozenDateTime)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_session_matches_project_checks_summary_prompt_and_entities(self) -> None:
         row = {
             "summary": "worked in /Users/me/Projects/llm-cortex",

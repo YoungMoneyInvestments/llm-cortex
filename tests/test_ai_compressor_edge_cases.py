@@ -83,7 +83,7 @@ def _make_compressor_with_client(mock_post_side_effect=None, mock_post_return=No
 
 def run(coro):
     """Run a coroutine synchronously in tests."""
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.run(coro)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
