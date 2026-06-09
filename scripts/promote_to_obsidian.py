@@ -23,7 +23,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Sequence
 
-sys.path.insert(0, str(Path(__file__).parent))
+# Append (don't prepend) so importing this module never lets scripts/ shadow
+# src/ for shared module names (scripts/memory_worker.py is a thin wrapper
+# without the classes src/memory_worker.py exposes). When run as a script,
+# Python already puts this directory first on sys.path.
+_SCRIPT_DIR = str(Path(__file__).parent)
+if _SCRIPT_DIR not in sys.path:
+    sys.path.append(_SCRIPT_DIR)
 from obsidian_bridge import (
     build_project_markers,
     read_text_with_timeout,

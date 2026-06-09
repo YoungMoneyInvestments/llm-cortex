@@ -24,7 +24,12 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional
 
-sys.path.insert(0, str(Path(__file__).parent))
+# Append (don't prepend) so importing this module never lets scripts/ shadow
+# src/ for shared module names (e.g. memory_worker). When run as a script,
+# Python already puts this directory first on sys.path.
+_SCRIPT_DIR = str(Path(__file__).parent)
+if _SCRIPT_DIR not in sys.path:
+    sys.path.append(_SCRIPT_DIR)
 from obsidian_bridge import read_text_with_timeout, resolve_vault_folder
 from working_memory import WorkingMemory
 
