@@ -166,8 +166,12 @@ Fact — generated at `{generated_at}`.
     REPORT_PATH.write_text(content, encoding="utf-8")
     print(f"wrote {REPORT_PATH}")
     if issues:
+        # Issues are reported in the log line and the report's Issues section.
+        # Exit 0 anyway: the job itself succeeded (report written). Nonzero is
+        # reserved for real crashes (unhandled exceptions -> SystemExit != 0),
+        # so launchd last-exit-status stays meaningful.
         print("issues: " + "; ".join(issues))
-        return 1
+        return 0
     print("issues: none")
     return 0
 
