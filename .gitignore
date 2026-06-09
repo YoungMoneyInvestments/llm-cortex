@@ -45,9 +45,6 @@ auth-profiles.json
 htmlcov/
 .pytest_cache/
 
-[removed]
-[removed]
-[removed]
 .gitnexus
 
 # Claude Code + agent runtime artifacts
