@@ -22,13 +22,19 @@ import statistics
 from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
+import os
 from zoneinfo import ZoneInfo
 
 import psycopg2
 
 ALERTS = Path("/Users/cameronbennion/Projects/llm-cortex/.playwright-cli/tv_alerts_clean.ndjson")
-DB = dict(host="100.67.112.3", port=5432, database="tradingcore",
-          user="trading_user", password="TradingCore2025!")
+def db_config():
+    password = os.environ.get("TRADINGCORE_POSTGRES_PASSWORD") or os.environ.get("POSTGRES_PASSWORD")
+    if not password:
+        raise RuntimeError("Set TRADINGCORE_POSTGRES_PASSWORD or POSTGRES_PASSWORD for TradingCore.")
+    return dict(host="100.67.112.3", port=5432, database="tradingcore",
+                user="trading_user", password=password)
+
 
 CT = ZoneInfo("America/Chicago")
 COST_ROUND_TRIP = 0.00005   # 0.005% = 0.5 bp (typical futures RT w/ slippage)
@@ -132,7 +138,7 @@ def run():
         print(f"train: {len(train)} ({train[0]['ts'][:10]} .. {train[-1]['ts'][:10]})")
         print(f"test : {len(test)}  ({test[0]['ts'][:10]} .. {test[-1]['ts'][:10]})")
 
-    conn = psycopg2.connect(**DB); conn.autocommit = True
+    conn = psycopg2.connect(**db_config()); conn.autocommit = True
     cur = conn.cursor()
 
     holds_min = [15, 30, 60, 240, 1440]

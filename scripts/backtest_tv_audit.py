@@ -24,13 +24,19 @@ import statistics
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
+import os
 from zoneinfo import ZoneInfo
 
 import psycopg2
 
 ALERTS = Path("/Users/cameronbennion/Projects/llm-cortex/.playwright-cli/tv_alerts_clean.ndjson")
-DB = dict(host="100.67.112.3", port=5432, database="tradingcore",
-          user="trading_user", password="TradingCore2025!")
+def db_config():
+    password = os.environ.get("TRADINGCORE_POSTGRES_PASSWORD") or os.environ.get("POSTGRES_PASSWORD")
+    if not password:
+        raise RuntimeError("Set TRADINGCORE_POSTGRES_PASSWORD or POSTGRES_PASSWORD for TradingCore.")
+    return dict(host="100.67.112.3", port=5432, database="tradingcore",
+                user="trading_user", password=password)
+
 CT = ZoneInfo("America/Chicago")
 
 
@@ -148,7 +154,7 @@ def run():
     start = min(s[0] for s in sigs_all) - timedelta(days=2)
     end = max(s[0] for s in sigs_all) + timedelta(days=2)
 
-    conn = psycopg2.connect(**DB); conn.autocommit = True
+    conn = psycopg2.connect(**db_config()); conn.autocommit = True
     bars = preload(conn, ["ES", "NQ", "SPY"], start, end)
     conn.close()
 

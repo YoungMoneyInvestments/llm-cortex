@@ -21,12 +21,18 @@ import statistics
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 from pathlib import Path
+import os
 
 import psycopg2
 
 ALERTS = Path("/Users/cameronbennion/Projects/llm-cortex/.playwright-cli/tv_alerts_clean.ndjson")
-DB = dict(host="100.67.112.3", port=5432, database="tradingcore",
-          user="trading_user", password="TradingCore2025!")
+def db_config():
+    password = os.environ.get("TRADINGCORE_POSTGRES_PASSWORD") or os.environ.get("POSTGRES_PASSWORD")
+    if not password:
+        raise RuntimeError("Set TRADINGCORE_POSTGRES_PASSWORD or POSTGRES_PASSWORD for TradingCore.")
+    return dict(host="100.67.112.3", port=5432, database="tradingcore",
+                user="trading_user", password=password)
+
 
 
 def fmt_pct(x: float) -> str:
@@ -71,7 +77,7 @@ def run() -> None:
 
     holds_min = [5, 15, 30, 60, 240, 1440]
 
-    conn = psycopg2.connect(**DB)
+    conn = psycopg2.connect(**db_config())
     conn.autocommit = True
 
     # returns[strategy][direction][hold_min] = list of (ret, alpha, symbol, ts)
