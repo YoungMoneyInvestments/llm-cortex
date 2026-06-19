@@ -2,7 +2,7 @@
 """
 Incremental pgvector backfill for public.messaging_messages on Storage VPS.
 
-Adds 384-dim sentence-transformers/all-MiniLM-L6-v2 embeddings to every row
+Adds 1024-dim BAAI/bge-m3 embeddings to every row
 where content is non-empty and embedding IS NULL.  Safe to interrupt and re-run:
 rows already embedded are skipped (WHERE embedding IS NULL).
 
@@ -52,8 +52,8 @@ DB_NAME = os.environ.get("PGDATABASE", "cami_memory")
 DB_USER = os.environ.get("PGUSER", "trading_user")
 # PGPASSWORD is picked up automatically by psycopg2 / libpq
 
-EMBED_MODEL_NAME = "all-MiniLM-L6-v2"
-EMBED_DIM = 384
+EMBED_MODEL_NAME = os.environ.get("CORTEX_LOCAL_MODEL", "BAAI/bge-m3")
+EMBED_DIM = 1024
 
 BATCH_SIZE = 500       # rows fetched + updated per outer commit
 ENCODE_BATCH = 64      # sentences per forward pass through the model

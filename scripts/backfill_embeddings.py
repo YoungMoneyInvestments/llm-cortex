@@ -2,7 +2,7 @@
 """Backfill embeddings for documents missing them in cortex-vectors.db.
 
 Finds all documents with has_embedding=0 and generates embeddings using the
-configured provider (default: local sentence-transformers/all-MiniLM-L6-v2).
+configured provider (default: local BAAI/bge-m3, 1024 dims).
 
 Uses the UnifiedVectorStore's batch embedding for efficiency — multiple texts
 are encoded in a single forward pass on the GPU/CPU.

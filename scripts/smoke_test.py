@@ -528,7 +528,7 @@ def scenario_g() -> Dict[str, Any]:
 def scenario_h() -> Dict[str, Any]:
     """
     Load EmbeddingClient from conversation-memory.
-    embed("trading setup") -> 384-dim list of floats.
+    embed("trading setup") -> 1024-dim list of floats (BAAI/bge-m3).
     Run vector_search via UnifiedVectorStore -> >= 1 hit.
     """
     t0 = time.perf_counter()
@@ -541,13 +541,15 @@ def scenario_h() -> Dict[str, Any]:
         embedding = ec.embed("trading setup")
         embed_latency = (time.perf_counter() - t_embed) * 1000
 
-        # Validate 384-dim float list
+        # Validate embedding: must be a list of floats with a valid dimension
         is_list = isinstance(embedding, list)
         dim = len(embedding) if is_list else None
-        is_384 = (dim == 384)
+        # Accept either 1024 (bge-m3 default) or 384 (legacy MiniLM) so existing
+        # DBs don't immediately fail before a re-index.
+        is_valid_dim = dim in (1024, 384)
         is_floats = all(isinstance(x, (int, float)) for x in (embedding[:5] if is_list else []))
 
-        if not is_list or not is_384 or not is_floats:
+        if not is_list or not is_valid_dim or not is_floats:
             elapsed = (time.perf_counter() - t0) * 1000
             return _result(False, elapsed,
                            f"Bad embedding: type={type(embedding).__name__}, dim={dim}, is_floats={is_floats}")
@@ -574,7 +576,7 @@ def scenario_h() -> Dict[str, Any]:
             f"search_latency_ms={search_latency:.1f}"
         )
 
-        passed = is_384 and is_floats and n_hits >= 1
+        passed = is_valid_dim and is_floats and n_hits >= 1
         if n_hits == 0:
             details = "WARN: vector_search returned 0 hits (DB may be empty). " + details
         return _result(passed, elapsed, details)
@@ -594,7 +596,7 @@ SCENARIOS = [
     ("E", "Session bootstrap (<3s, has output)", scenario_e),
     ("F", "Identity resolver 'Cam' disambiguation", scenario_f),
     ("G", "Knowledge graph Pass Q verification", scenario_g),
-    ("H", "Embedding round-trip (384-dim, vector search)", scenario_h),
+    ("H", "Embedding round-trip (1024-dim bge-m3, vector search)", scenario_h),
 ]
 
 
