@@ -7,6 +7,12 @@ Exports:
 
 This keeps Cortex as the raw system of record while giving Obsidian a curated,
 human-readable layer that the existing bootstrap can already read back in.
+
+# Invoked by: manual CLI only (no in-process caller by design). Documented entry
+# points: README.md ("Promote recent project-relevant summaries...") and
+# docs/NAVIGATION.md ("Obsidian promote dry run"). Run as:
+#   python3 scripts/promote_to_obsidian.py --project-dir "$PWD" [--dry-run]
+# Not orphaned: absence of an in-repo import is intentional for a scripts/ CLI.
 """
 
 from __future__ import annotations
