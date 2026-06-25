@@ -13,6 +13,16 @@ import context_loader
 
 
 class ContextLoaderTests(unittest.TestCase):
+    def test_project_context_map_paths_exist_in_user_knowledge_vault(self) -> None:
+        """Cameron's active project map should not point agents at dead files."""
+        missing = []
+        for key, paths in context_loader.PROJECT_CONTEXT_MAP.items():
+            for rel in paths:
+                path = context_loader.KNOWLEDGE_ROOT / rel
+                if not path.exists():
+                    missing.append(f"{key}: {rel}")
+        self.assertEqual(missing, [])
+
     def test_obsidian_context_skips_timeouting_vault_reads(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             vault = Path(temp_dir) / "LLMCortex"

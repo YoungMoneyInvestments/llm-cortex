@@ -317,30 +317,6 @@ def get_key_files(repo: Path) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# GitNexus
-# ---------------------------------------------------------------------------
-def get_gitnexus_data(repo: Path) -> Optional[dict]:
-    """Parse GitNexus metadata from repo CLAUDE.md (first 10 lines)."""
-    claude_md = repo / "CLAUDE.md"
-    if not claude_md.exists():
-        return None
-    try:
-        lines = claude_md.read_text(encoding="utf-8", errors="replace").splitlines()
-        header = "\n".join(lines[:10])
-        pattern = r'indexed by GitNexus as \*\*(\S+)\*\* \((\d+) symbols, (\d+) relationships'
-        m = re.search(pattern, header)
-        if m:
-            return {
-                "name": m.group(1),
-                "symbols": int(m.group(2)),
-                "relationships": int(m.group(3)),
-            }
-    except Exception:
-        pass
-    return None
-
-
-# ---------------------------------------------------------------------------
 # Cross-references
 # ---------------------------------------------------------------------------
 def build_project_corpus(repos: List[Path]) -> set:
@@ -451,11 +427,6 @@ def render_frontmatter(data: dict) -> str:
     if remote_url:
         lines.append(f"remote_url: {remote_url}")
 
-    gitnexus = data.get("gitnexus")
-    if gitnexus:
-        lines.append(f"gitnexus_symbols: {gitnexus['symbols']}")
-        lines.append(f"gitnexus_relationships: {gitnexus['relationships']}")
-
     related = data.get("related_projects", [])
     if related:
         lines.append("related_projects:")
@@ -490,12 +461,6 @@ def render_body(data: dict) -> str:
     related = data.get("related_projects", [])
     related_str = ", ".join(related) if related else "None detected"
 
-    gitnexus = data.get("gitnexus")
-    if gitnexus:
-        gitnexus_str = f"- Symbols: {gitnexus['symbols']}\n- Relationships: {gitnexus['relationships']}"
-    else:
-        gitnexus_str = "Not indexed."
-
     today = data.get("generated_at", "")[:10]
 
     body = (
@@ -519,8 +484,10 @@ def render_body(data: dict) -> str:
         f"### Related Projects\n"
         f"{related_str}\n"
         f"\n"
-        f"### GitNexus\n"
-        f"{gitnexus_str}\n"
+        f"### Agent Memory\n"
+        f"- Primary: Obsidian vault at `~/Knowledge/`\n"
+        f"- Secondary: LLM Cortex memory tools when available\n"
+        f"- Implementation truth: repo files, call sites, and tests\n"
         f"\n"
         f"_Last updated: {today}_\n"
     )
@@ -709,7 +676,6 @@ def main() -> None:
             stack = detect_stack(repo)
             purpose = get_project_purpose(repo)
             key_files = get_key_files(repo)
-            gitnexus = get_gitnexus_data(repo)
             cross_refs = detect_cross_references(repo, corpus, repo.name)
 
             # Combined stack: languages first, then frameworks
@@ -725,7 +691,6 @@ def main() -> None:
                 "last_commit_date": git_meta["last_commit_date"],
                 "last_commit_message": git_meta["last_commit_message"],
                 "remote_url": git_meta["remote_url"],
-                "gitnexus": gitnexus,
                 "related_projects": cross_refs,
                 "key_files": key_files,
             }

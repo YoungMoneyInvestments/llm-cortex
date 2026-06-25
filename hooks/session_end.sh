@@ -12,6 +12,11 @@
 WORKER_PORT="${CORTEX_WORKER_PORT:-37778}"
 WORKER_URL="http://127.0.0.1:$WORKER_PORT"
 AUTH_KEY="${CORTEX_WORKER_API_KEY:-}"
+CURL="${CORTEX_CURL:-/usr/bin/curl}"
+JQ="${CORTEX_JQ:-$(command -v jq || true)}"
+if [ -z "$JQ" ]; then
+    JQ="/opt/homebrew/bin/jq"
+fi
 # Fall back to generated key file if env var is absent (DEF-6 compatibility)
 if [ -z "$AUTH_KEY" ] && [ -f "$HOME/.cortex/data/.worker_api_key" ]; then
     AUTH_KEY="$(cat "$HOME/.cortex/data/.worker_api_key" 2>/dev/null)"
@@ -21,11 +26,11 @@ fi
 INPUT_JSON=$(cat)
 
 # Skip if worker isn't running
-if ! curl -s --connect-timeout 1 "$WORKER_URL/api/health" > /dev/null 2>&1; then
+if ! "$CURL" -s --connect-timeout 1 "$WORKER_URL/api/health" > /dev/null 2>&1; then
     exit 0
 fi
 
-SESSION_ID=$(echo "$INPUT_JSON" | jq -r '.session_id // empty' 2>/dev/null)
+SESSION_ID=$(echo "$INPUT_JSON" | "$JQ" -r '.session_id // .sessionId // .session.id // empty' 2>/dev/null)
 
 if [ -z "$AUTH_KEY" ]; then
     echo "Warning: CORTEX_WORKER_API_KEY is not set; skipping Cortex session finalization." >&2
@@ -35,11 +40,11 @@ fi
 SID="${SESSION_ID:-$(date +%Y%m%d-%H%M%S)}"
 
 # End session
-curl -s --max-time 2 \
+"$CURL" -s --max-time 2 \
     -X POST "$WORKER_URL/api/sessions/end" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $AUTH_KEY" \
-    -d "$(jq -n --arg sid "$SID" '{session_id: $sid}')" \
+    -d "$("$JQ" -n --arg sid "$SID" '{session_id: $sid}')" \
     > /dev/null 2>&1 &
 
 exit 0

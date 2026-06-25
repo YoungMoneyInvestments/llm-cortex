@@ -13,6 +13,8 @@
 #   CORTEX_PID_FILE   — Worker PID file (default: ~/.cortex/worker.pid)
 #   CORTEX_WORKER_PORT — HTTP port (default: 37778)
 #   CORTEX_PYTHON     — Python interpreter (default: python3)
+#   CORTEX_ENV_FILE   — Optional 0600 env file for scoped secrets
+#   CORTEX_OPENAI_EMBEDDINGS_ALLOWED=1 — Explicit gate for billable OpenAI embeddings
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PYTHON="${CORTEX_PYTHON:-python3}"
@@ -24,6 +26,10 @@ PID_FILE="${CORTEX_PID_FILE:-$RUNTIME_HOME/worker.pid}"
 LOG_FILE="$LOG_DIR/memory-worker.log"
 WORKER_PORT="${CORTEX_WORKER_PORT:-37778}"
 WORKER_URL="http://127.0.0.1:$WORKER_PORT"
+DEFAULT_CORTEX_ENV_FILE="$HOME/.openclaw/.env"
+CORTEX_ENV_FILE="${CORTEX_ENV_FILE:-$DEFAULT_CORTEX_ENV_FILE}"
+CORTEX_EMBEDDING_PROVIDER="${CORTEX_EMBEDDING_PROVIDER:-local}"
+CORTEX_OPENAI_EMBEDDINGS_ALLOWED="${CORTEX_OPENAI_EMBEDDINGS_ALLOWED:-0}"
 
 mkdir -p "$(dirname "$PID_FILE")"
 mkdir -p "$(dirname "$LOG_FILE")"
@@ -53,6 +59,9 @@ start_worker() {
     cd "$SCRIPT_DIR"
     CORTEX_DATA_DIR="$DATA_DIR" CORTEX_LOG_DIR="$LOG_DIR" \
         CORTEX_PID_FILE="$PID_FILE" CORTEX_WORKER_PORT="$WORKER_PORT" \
+        CORTEX_ENV_FILE="$CORTEX_ENV_FILE" \
+        CORTEX_EMBEDDING_PROVIDER="$CORTEX_EMBEDDING_PROVIDER" \
+        CORTEX_OPENAI_EMBEDDINGS_ALLOWED="$CORTEX_OPENAI_EMBEDDINGS_ALLOWED" \
         nohup "$PYTHON" "$WORKER_SCRIPT" >> "$LOG_FILE" 2>&1 &
     local pid=$!
 

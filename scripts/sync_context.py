@@ -33,9 +33,15 @@ CONTEXT_DIR = Path(__file__).resolve().parent.parent / "context"
 HOME = Path.home()
 
 ADAPTER_TARGETS = {
-    "claude": HOME / ".claude" / "CLAUDE_CONTEXT.md",  # new file, not CLAUDE.md
+    # 2026-04-25: claude + codex adapters disabled. Their CLAUDE_CONTEXT.md /
+    # CONTEXT.md outputs were orphans (not auto-loaded by their respective
+    # tools) so the YAML-derived content was migrated inline into
+    # ~/.claude/CLAUDE.md and ~/.codex/AGENTS.md as static sections. To
+    # re-enable later, restore the paths below and consider switching to a
+    # marker-block merge into CLAUDE.md / AGENTS.md instead of separate files.
+    "claude": None,
     "cursor": None,  # project-level, handled per-project
-    "codex": HOME / ".codex" / "CONTEXT.md",
+    "codex": None,
     "cami": HOME / "Documents" / "shared-facts.md",
     "generic": HOME / "Projects" / "llm-cortex" / "context" / "shared-context.json",
 }

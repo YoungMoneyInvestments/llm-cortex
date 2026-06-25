@@ -14,7 +14,7 @@ CORTEX_AGENT_NAME=gemini        # Gemini CLI
 CORTEX_AGENT_NAME=cami          # Custom agent
 ```
 
-If not set, defaults to `main`.
+Hook scripts default to `claude-code` when `CORTEX_AGENT_NAME` is not set. MCP save tools default to `main` unless the MCP client passes `CORTEX_AGENT_NAME` in its environment. Set the variable explicitly for every client to avoid attribution collapse.
 
 ## Configuration by LLM
 
@@ -69,6 +69,39 @@ startup_timeout_sec = 20
 CORTEX_AGENT_NAME = "codex"
 ```
 
+If your Codex build supports lifecycle hooks, add Cortex write hooks in `~/.codex/hooks.json`:
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [{
+      "hooks": [{
+        "type": "command",
+        "command": "CORTEX_AGENT_NAME=codex /path/to/cortex/hooks/user_prompt_submit.sh",
+        "timeout": 3,
+        "async": true
+      }]
+    }],
+    "PostToolUse": [{
+      "hooks": [{
+        "type": "command",
+        "command": "CORTEX_AGENT_NAME=codex /path/to/cortex/hooks/post_tool_use.sh",
+        "timeout": 3,
+        "async": true
+      }]
+    }],
+    "SessionEnd": [{
+      "hooks": [{
+        "type": "command",
+        "command": "CORTEX_AGENT_NAME=codex /path/to/cortex/hooks/session_end.sh",
+        "timeout": 5,
+        "async": true
+      }]
+    }]
+  }
+}
+```
+
 ### Cursor IDE (`~/.cursor/mcp.json`)
 
 ```json
@@ -84,6 +117,26 @@ CORTEX_AGENT_NAME = "codex"
   }
 }
 ```
+
+Cursor currently uses Cortex through MCP tools. There is no verified Cursor lifecycle hook equivalent to Claude Code's `PostToolUse` / `UserPromptSubmit` / `SessionEnd` in this setup, so automatic observation capture is not assumed. Add a Cursor rule that tells the agent to search first and save durable facts with `cami_memory_save`; keep `CORTEX_AGENT_NAME=cursor` in the MCP env block.
+
+### Gemini CLI (`~/.gemini/settings.json`)
+
+```json
+{
+  "mcpServers": {
+    "cortex-memory": {
+      "command": "python3",
+      "args": ["/path/to/cortex/src/mcp_memory_server.py"],
+      "env": {
+        "CORTEX_AGENT_NAME": "gemini"
+      }
+    }
+  }
+}
+```
+
+Gemini currently uses Cortex through MCP tools. There is no verified Gemini lifecycle hook equivalent to Claude Code's hooks in this setup, so automatic observation capture is not assumed. Put the memory contract in `~/.gemini/GEMINI.md`: search first, use timeline/details only as needed, and save only durable decisions/resolved bugs/user corrections.
 
 ### Any LLM via REST API
 
