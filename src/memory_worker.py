@@ -76,10 +76,91 @@ RETENTION_FULL_DAYS = 7            # Keep everything
 RETENTION_TRIM_DAYS = 30           # Trim raw fields for high-signal
 
 HIGH_SIGNAL_TOOLS = frozenset({
-    "WebSearch", "WebFetch", "Write", "Edit", "Task",
+    "WebSearch", "WebFetch", "Write", "Edit", "MultiEdit", "Task", "Agent",
     "mcp__plugin_episodic-memory_episodic-memory__search",
     "mcp__plugin_episodic-memory_episodic-memory__read",
+    "mcp__cortex-memory__cami_memory_save",
 })
+
+LOW_SIGNAL_TOOLS = frozenset({
+    "Read", "Glob", "Grep", "LS", "Bash", "TaskOutput",
+    "ToolSearch", "TaskUpdate", "TaskCreate", "TodoWrite",
+})
+
+NOISE_TOOLS = frozenset({
+    "mcp__computer-use__screenshot",
+    "mcp__computer-use__wait",
+    "mcp__claude_ai_Google_Drive__copy_file",
+})
+
+NOISE_TOOL_PREFIXES = (
+    "mcp__plugin_context-mode_context-mode__ctx_",
+)
+
+IMPORTANT_BASH_RE = re.compile(
+    r"\b("
+    r"error|failed|failure|traceback|exception|fatal|warning|"
+    r"pytest|passed|skipped|coverage|"
+    r"git (status|commit|merge|push|pull|fetch)|"
+    r"restart|health|http/[0-9.]+|status_code|exit code"
+    r")\b",
+    re.IGNORECASE,
+)
+
+SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s\"']+"), r"\1[REDACTED]"),
+    (re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{16,}"), r"\1[REDACTED]"),
+    (re.compile(r"(?i)(api[_-]?key|token|secret|password|passwd|pwd|oauth[_-]?token|refresh[_-]?token)(\s*[:=]\s*)[^\s\"',}]+"), r"\1\2[REDACTED]"),
+    (re.compile(r"(?i)(api[_-]?key|token|secret|password|passwd|pwd|oauth[_-]?token|refresh[_-]?token)(['\"]\s*:\s*['\"])[^'\"]+(['\"])"), r"\1\2[REDACTED]\3"),
+    (re.compile(r"sk-[A-Za-z0-9_-]{12,}"), "sk-[REDACTED]"),
+    (re.compile(r"gh[pousr]_[A-Za-z0-9_]{20,}"), "gh[REDACTED]"),
+    (re.compile(r"SESSION=([A-Za-z0-9*._-]{12,})"), "SESSION=[REDACTED]"),
+)
+
+
+def redact_sensitive(text: Optional[str]) -> Optional[str]:
+    """Redact credentials before storage, summaries, vectors, or details."""
+    if text is None:
+        return None
+    redacted = text
+    for pattern, replacement in SECRET_PATTERNS:
+        redacted = pattern.sub(replacement, redacted)
+    return redacted
+
+
+def classify_observation(
+    source: str,
+    tool_name: Optional[str],
+    raw_input: Optional[str],
+    raw_output: Optional[str],
+) -> str:
+    """Classify observation routing: episodic, breadcrumb, or noise."""
+    raw_input = raw_input or ""
+    raw_output = raw_output or ""
+    tool = tool_name or ""
+
+    if source == "user_prompt":
+        if raw_input.startswith("<task-notification>"):
+            return "noise"
+        return "episodic"
+    if source == "session_end":
+        return "episodic"
+
+    if tool in NOISE_TOOLS or any(tool.startswith(prefix) for prefix in NOISE_TOOL_PREFIXES):
+        return "noise"
+    if tool == "ToolSearch" and "select:" in raw_input:
+        return "noise"
+    if tool == "Bash" and IMPORTANT_BASH_RE.search(f"{raw_input}\n{raw_output}"):
+        return "episodic"
+    if tool in HIGH_SIGNAL_TOOLS:
+        return "episodic"
+    if tool in LOW_SIGNAL_TOOLS:
+        return "breadcrumb"
+    return "episodic"
+
+
+def should_vector_sync(memory_type: Optional[str]) -> bool:
+    return memory_type not in {"noise", "breadcrumb"}
 
 # ── API Authentication config ──────────────────────────────────────────
 # Path where a generated key is persisted so the MCP server and context_loader
@@ -641,6 +722,7 @@ def _detect_topic_boundaries(observations: list[dict]) -> list[list[dict]]:
     current_chunk: list[dict] = []
     prev_ts: Optional[float] = None
     prev_category: Optional[str] = None
+    prev_session_id: Optional[str] = None
 
     for obs in observations:
         # Parse timestamp to epoch float for gap calculation
@@ -656,7 +738,10 @@ def _detect_topic_boundaries(observations: list[dict]) -> list[list[dict]]:
 
         # Decide whether to start a new chunk
         start_new = False
-        if len(current_chunk) >= _MEMCELL_MAX_SIZE:
+        session_id = obs.get("session_id")
+        if prev_session_id is not None and session_id != prev_session_id:
+            start_new = True
+        elif len(current_chunk) >= _MEMCELL_MAX_SIZE:
             start_new = True
         elif prev_ts is not None and ts_epoch is not None:
             gap = ts_epoch - prev_ts
@@ -675,6 +760,7 @@ def _detect_topic_boundaries(observations: list[dict]) -> list[list[dict]]:
         current_chunk.append(obs)
         prev_ts = ts_epoch if ts_epoch is not None else prev_ts
         prev_category = category
+        prev_session_id = session_id
 
     if current_chunk:
         chunks.append(current_chunk)
@@ -781,7 +867,7 @@ async def process_pending_observations():
             async with db_lock:
                 rows = db.execute(
                     "SELECT id, session_id, timestamp, source, tool_name, agent, "
-                    "raw_input, raw_output "
+                    "raw_input, raw_output, memory_type "
                     "FROM observations WHERE status = 'pending' ORDER BY id LIMIT 20"
                 ).fetchall()
 
@@ -921,8 +1007,15 @@ async def process_pending_observations():
                         tool_name = obs.get("tool_name")
                         # find the sqlite3.Row matching this obs_id
                         matching_row = next((r for r in rows if r["id"] == obs_id), None)
-                        if matching_row is not None:
+                        if matching_row is not None and should_vector_sync(matching_row["memory_type"]):
                             await _sync_to_vector_store(obs_id, chunk_summary, matching_row)
+                        elif matching_row is not None:
+                            async with db_lock:
+                                db.execute(
+                                    "UPDATE observations SET vector_synced = -1 WHERE id = ?",
+                                    (obs_id,),
+                                )
+                                db.commit()
 
                         if (
                             NER_ENABLED
@@ -1159,7 +1252,7 @@ class AICompressor:
 
             # Auto-refresh if within 5 min of expiry or already expired
             expires_at = profile.get("expires_at", 0)
-            if expires_at and time.time() > expires_at - 300:
+            if expires_at and time.time() >= expires_at - 300:
                 refresh_token = profile.get("refresh_token")
                 client_id = profile.get("client_id", "9d1c250a-e61b-44d9-88ed-5944d1962f5e")
                 if refresh_token:
@@ -2011,9 +2104,6 @@ async def _extract_and_link_entities(
 # ── Retention manager ──────────────────────────────────────────────────
 
 
-LOW_SIGNAL_TOOLS = frozenset({"Read", "Glob", "Grep", "Bash", "TaskOutput"})
-
-
 class RetentionManager:
     """Tiered retention: delete low-signal rows, trim raw fields on old high-signal."""
 
@@ -2460,12 +2550,23 @@ async def _generate_session_summary(session_id: str):
                 (session_id,),
             ).fetchone()
 
-        if not rows:
-            logger.info(f"Session {session_id[:8]}... has no processed observations, skipping summary")
-            return
-
         user_prompt = session_row["user_prompt"] if session_row else None
         agent = session_row["agent"] if session_row else "main"
+        if not rows:
+            overall_summary = f"[{agent}] Session ended with no processed observations."
+            async with db_lock:
+                db.execute(
+                    "INSERT INTO session_summaries (session_id, summary, key_decisions, entities_mentioned) "
+                    "VALUES (?, ?, ?, ?)",
+                    (session_id, overall_summary, "[]", "[]"),
+                )
+                db.execute(
+                    "UPDATE sessions SET summary = ?, status = 'summarized' WHERE id = ?",
+                    (overall_summary, session_id),
+                )
+                db.commit()
+            logger.info(f"Session {session_id[:8]}... summarized (empty, 0 observations)")
+            return
 
         # Try AI summarization
         ai_summary = None
@@ -2928,19 +3029,54 @@ async def receive_observation(req: ObservationRequest):
         )
 
     now = datetime.now(timezone.utc).isoformat()
+    quota_exceeded = False
+    quota_detail = ""
+    raw_input = redact_sensitive(req.truncated_input())
+    raw_output = redact_sensitive(req.truncated_output())
+    memory_type = classify_observation(req.source, req.tool_name, raw_input, raw_output)
+    summary = None
+    status = "pending"
+    processed_at = None
+    vector_synced = 0
+
+    if memory_type in {"noise", "breadcrumb"}:
+        summary = _generate_summary_rule_based(
+            source=req.source,
+            tool_name=req.tool_name,
+            agent=req.agent,
+            raw_input=raw_input,
+            raw_output=raw_output,
+        )
+        status = "processed"
+        processed_at = now
+        vector_synced = -1
 
     async with db_lock:
         if quota_manager is not None:
             quota_ok, used_tokens, budget = quota_manager.consume(
-                tier_value, req.truncated_input(), req.truncated_output()
+                tier_value, raw_input, raw_output
             )
             if not quota_ok:
-                raise HTTPException(
-                    status_code=429,
-                    detail=(
-                        f"Daily token quota exceeded for {tier_value}: "
-                        f"{used_tokens}/{budget} estimated tokens consumed"
-                    ),
+                quota_exceeded = True
+                quota_detail = (
+                    f"Daily token quota exceeded for {tier_value}: "
+                    f"{used_tokens}/{budget} estimated tokens consumed"
+                )
+                if summary is None:
+                    summary = _generate_summary_rule_based(
+                        source=req.source,
+                        tool_name=req.tool_name,
+                        agent=req.agent,
+                        raw_input=raw_input,
+                        raw_output=raw_output,
+                    )
+                logger.warning(
+                    "quota_exceeded_storing_rule_based session=%s agent=%s tier=%s used=%s budget=%s",
+                    req.session_id[:8],
+                    req.agent,
+                    tier_value,
+                    used_tokens,
+                    budget,
                 )
 
         # Auto-create a session row if it doesn't exist yet.
@@ -2957,16 +3093,22 @@ async def receive_observation(req: ObservationRequest):
 
         db.execute(
             "INSERT INTO observations (session_id, timestamp, source, tool_name, "
-            "agent, raw_input, raw_output, subscription_tier) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "agent, raw_input, raw_output, summary, status, vector_synced, subscription_tier, processed_at, memory_type) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 req.session_id,
                 now,
                 req.source,
                 req.tool_name,
                 req.agent,
-                req.truncated_input(),
-                req.truncated_output(),
+                raw_input,
+                raw_output,
+                summary,
+                status,
+                vector_synced,
                 tier_value,
+                processed_at,
+                memory_type,
             ),
         )
 
@@ -2982,6 +3124,8 @@ async def receive_observation(req: ObservationRequest):
         f"Observation received: session={req.session_id[:8]}... "
         f"source={req.source} tool={req.tool_name} tier={tier_value}"
     )
+    if quota_exceeded:
+        return {"status": "stored_rule_based", "detail": quota_detail}
     return {"status": "queued"}
 
 
@@ -3266,6 +3410,12 @@ async def get_stats():
         ).fetchone()["c"]
         stats["vector_synced"] = db.execute(
             "SELECT COUNT(*) as c FROM observations WHERE vector_synced = 1"
+        ).fetchone()["c"]
+        stats["vector_skipped"] = db.execute(
+            "SELECT COUNT(*) as c FROM observations WHERE vector_synced = -1"
+        ).fetchone()["c"]
+        stats["vector_unsynced"] = db.execute(
+            "SELECT COUNT(*) as c FROM observations WHERE vector_synced = 0"
         ).fetchone()["c"]
         stats["total_sessions"] = db.execute(
             "SELECT COUNT(*) as c FROM sessions"

@@ -9,6 +9,9 @@ from pathlib import Path
 import runpy
 
 
+root = Path(__file__).resolve().parents[1]
+
 if __name__ == "__main__":
-    root = Path(__file__).resolve().parents[1]
     runpy.run_path(str(root / "src" / "mcp_memory_server.py"), run_name="__main__")
+else:
+    globals().update(runpy.run_path(str(root / "src" / "mcp_memory_server.py")))

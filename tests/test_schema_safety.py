@@ -146,10 +146,29 @@ def test_load_openai_key_uses_generic_env_file_override(monkeypatch, tmp_path):
     assert unified_vector_store._load_openai_key() == "test-key"
 
 
+def test_openai_client_requires_explicit_billing_gate(monkeypatch, tmp_path):
+    env_file = tmp_path / "cortex.env"
+    env_file.write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("CORTEX_ENV_FILE", str(env_file))
+    monkeypatch.delenv("CORTEX_OPENAI_EMBEDDINGS_ALLOWED", raising=False)
+
+    unified_vector_store = import_fresh("unified_vector_store")
+    store = unified_vector_store.UnifiedVectorStore(db_path=tmp_path / "vectors.db")
+
+    with pytest.raises(RuntimeError) as exc_info:
+        store._get_openai()
+
+    assert "CORTEX_OPENAI_EMBEDDINGS_ALLOWED=1" in str(exc_info.value)
+
+
 def test_openai_key_error_message_mentions_generic_configuration(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("CORTEX_ENV_FILE", raising=False)
+    monkeypatch.setenv("CORTEX_OPENAI_EMBEDDINGS_ALLOWED", "1")
 
     unified_vector_store = import_fresh("unified_vector_store")
     store = unified_vector_store.UnifiedVectorStore(db_path=tmp_path / "vectors.db")

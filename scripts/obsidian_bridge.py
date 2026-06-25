@@ -9,11 +9,12 @@ from typing import Iterable, Optional
 
 
 DEFAULT_OBSIDIAN_VAULT = (
-    Path.home() / "Library" / "Mobile Documents" / "iCloud~md~obsidian" / "Documents" / "Cameron"
+    Path.home() / "Knowledge" / "project-bridge"
 )
 
 # Checked in order — first match wins.
 PROJECT_VAULT_MAP: list[tuple[str, str]] = [
+    ("brokerbridge-retail", "BrokerBridge"),
     ("brokerbridge-retail-hermes", "BrokerBridge"),
     ("broker-bridge-retail", "BrokerBridge"),
     ("MCP-Servers/brokerbridge", "BrokerBridgeMCP"),

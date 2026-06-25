@@ -45,6 +45,10 @@ auth-profiles.json
 htmlcov/
 .pytest_cache/
 
+[removed]
+[removed]
+[removed]
+
 .gitnexus
 
 # Claude Code + agent runtime artifacts
@@ -54,6 +58,7 @@ htmlcov/
 .claude/ralph-state.json
 .agent/
 adversarial-loop.log
+.playwright-cli/
 
 # Local context runtime
 context/
